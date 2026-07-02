@@ -1,4 +1,4 @@
-# Framekit
+# [WIP] Framekit
 
 Framekit is a TypeScript meta-framework inspired by Frappe. It lets you build metadata-driven business applications with DocTypes, modules, permissions, workflows, hooks, generated APIs, customization, audit trails, outbox events, realtime publishing, a Desk UI, and portable Nitro deployment.
 
