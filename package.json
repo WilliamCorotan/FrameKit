@@ -1,0 +1,24 @@
+{
+  "name": "framekit",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "description": "A Nitro-powered TypeScript meta-framework inspired by Frappe.",
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "dev": "pnpm --filter @framekit/example-crm dev",
+    "dev:desk": "pnpm --filter @framekit/desk dev",
+    "lint": "tsc -p tsconfig.check.json --noEmit",
+    "test": "vitest run",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "audit:all": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@vitejs/plugin-react": "^5.1.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.3",
+    "vitest": "^4.1.9"
+  }
+}

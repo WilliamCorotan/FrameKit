@@ -1,0 +1,23 @@
+{
+  "name": "@framekit/example-crm",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "nitro build",
+    "outbox:dispatch": "tsx src/dispatch-outbox.ts",
+    "dev": "nitro dev --host 0.0.0.0",
+    "preview": "node .output/server/index.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@framekit/auth": "workspace:*",
+    "@framekit/core": "workspace:*",
+    "@framekit/db": "workspace:*",
+    "@framekit/jobs": "workspace:*",
+    "@framekit/nitro": "workspace:*",
+    "@framekit/realtime": "workspace:*",
+    "@framekit/runtime": "workspace:*",
+    "nitro": "^3.0.260610-beta"
+  }
+}
