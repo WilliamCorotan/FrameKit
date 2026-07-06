@@ -87,6 +87,9 @@ importers:
       '@framekit/core':
         specifier: workspace:*
         version: link:../core
+      '@framekit/db':
+        specifier: workspace:*
+        version: link:../db
       '@framekit/runtime':
         specifier: workspace:*
         version: link:../runtime
