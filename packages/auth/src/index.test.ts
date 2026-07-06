@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "./index.js";
+import {
+  createOidcProvider,
+  hashPassword,
+  InMemoryApiTokenStore,
+  InMemoryAuthAuditStore,
+  InMemoryAuthIdentityLinkStore,
+  InMemoryRoleStore,
+  InMemoryUserStore,
+  PasswordAuthService
+} from "./index.js";
 
 describe("PasswordAuthService", () => {
   it("logs in and verifies signed sessions", async () => {
@@ -199,6 +208,112 @@ describe("PasswordAuthService", () => {
 
     expect(events.map((event) => event.action)).toEqual(expect.arrayContaining(["login.failed", "provider_login.succeeded", "session.refreshed"]));
     expect(events.find((event) => event.action === "provider_login.succeeded")).toMatchObject({ actorUserId: "u1", success: true });
+  });
+
+  it("requires explicit provider identity links when configured", async () => {
+    const identityLinks = new InMemoryAuthIdentityLinkStore([]);
+    const store = new InMemoryUserStore([
+      {
+        id: "u1",
+        tenantId: "t1",
+        email: "admin@example.com",
+        name: "Admin",
+        passwordHash: await hashPassword("correct horse battery staple"),
+        roles: ["administrator"],
+        permissions: ["*"]
+      }
+    ]);
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      userStore: store,
+      identityLinks,
+      identityLinkingPolicy: { mode: "linked" },
+      providers: [
+        {
+          id: "test",
+          authenticate: async ({ tenantId }) => ({ providerId: "test", subject: "external-admin", tenantId, email: "admin@example.com" })
+        }
+      ]
+    });
+
+    await expect(auth.loginWithProvider("test", "provider-token", "t1")).rejects.toMatchObject({ code: "PROVIDER_USER_NOT_FOUND" });
+    await auth.linkProviderIdentity({ tenantId: "t1", providerId: "test", subject: "external-admin", userId: "u1", email: "admin@example.com" });
+    await expect(auth.loginWithProvider("test", "provider-token", "t1")).resolves.toMatchObject({ context: { userId: "u1" } });
+  });
+
+  it("can explicitly auto-link provider identities by matching email", async () => {
+    const identityLinks = new InMemoryAuthIdentityLinkStore([]);
+    const store = new InMemoryUserStore([
+      {
+        id: "u1",
+        tenantId: "t1",
+        email: "admin@example.com",
+        name: "Admin",
+        passwordHash: await hashPassword("correct horse battery staple"),
+        roles: ["administrator"],
+        permissions: ["*"]
+      }
+    ]);
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      userStore: store,
+      identityLinks,
+      identityLinkingPolicy: { mode: "email", autoLink: true },
+      providers: [
+        {
+          id: "test",
+          authenticate: async ({ tenantId }) => ({ providerId: "test", subject: "external-admin", tenantId, email: "ADMIN@example.com" })
+        }
+      ]
+    });
+
+    const session = await auth.loginWithProvider("test", "provider-token", "t1");
+    const link = await identityLinks.find("t1", "test", "external-admin");
+
+    expect(session.context.userId).toBe("u1");
+    expect(link).toMatchObject({ userId: "u1", email: "admin@example.com" });
+  });
+
+  it("authenticates OIDC identities through token introspection", async () => {
+    const requests: Array<{ url: string; body: string }> = [];
+    const provider = createOidcProvider({
+      id: "oidc",
+      issuer: "https://issuer.example",
+      clientId: "framekit",
+      introspectionEndpoint: "https://issuer.example/oauth/introspect",
+      fetch: async (input, init) => {
+        requests.push({ url: String(input), body: String(init?.body) });
+        return new Response(JSON.stringify({
+          active: true,
+          iss: "https://issuer.example",
+          aud: "framekit",
+          sub: "subject-1",
+          email: "admin@example.com",
+          name: "Admin"
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+    });
+    const store = new InMemoryUserStore([
+      {
+        id: "u1",
+        tenantId: "t1",
+        email: "admin@example.com",
+        name: "Admin",
+        passwordHash: await hashPassword("correct horse battery staple"),
+        roles: ["administrator"],
+        permissions: ["*"]
+      }
+    ]);
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      userStore: store,
+      providers: [provider]
+    });
+
+    const session = await auth.loginWithProvider("oidc", "access-token", "t1");
+
+    expect(session.context.userId).toBe("u1");
+    expect(requests).toEqual([{ url: "https://issuer.example/oauth/introspect", body: "token=access-token&client_id=framekit" }]);
   });
 
   it("manages tenant users and roles", async () => {

@@ -67,6 +67,55 @@ describe("createNitroHandler", () => {
     });
   });
 
+  it("supports cookie-backed signed sessions while preserving bearer auth", async () => {
+    const runtime = createRuntime(defineApp({ name: "Cookie Auth", modules: [] }));
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      userStore: new InMemoryUserStore([
+        {
+          tenantId: "default",
+          id: "admin",
+          email: "admin@example.com",
+          name: "Admin",
+          passwordHash: await hashPassword("admin12345"),
+          roles: ["administrator"],
+          permissions: ["*"]
+        }
+      ])
+    });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { auth, authCookie: { name: "fk_session", secure: false } }));
+    const fetch = toWebHandler(h3);
+
+    const login = await fetch(new Request("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-tenant-id": "default" },
+      body: JSON.stringify({ email: "admin@example.com", password: "admin12345" })
+    }));
+    const cookie = login.headers.getSetCookie()[0];
+    const loginBody = await login.json() as { token: string };
+    expect(cookie).toBeDefined();
+    expect(cookie).toContain("fk_session=");
+
+    const cookieHeaders = { cookie: cookie!.split(";")[0]! };
+    const me = await json<{ context: { userId: string } }>(fetch, "/api/auth/me", { headers: cookieHeaders });
+    expect(me.context.userId).toBe("admin");
+    await expect(json(fetch, "/api/auth/me", { headers: { authorization: `Bearer ${loginBody.token}` } })).resolves.toMatchObject({ context: { userId: "admin" } });
+
+    const refresh = await fetch(new Request("http://localhost/api/auth/refresh", { method: "POST", headers: cookieHeaders }));
+    const refreshedCookie = refresh.headers.getSetCookie()[0];
+    expect(refreshedCookie).toBeDefined();
+    expect(refreshedCookie).toContain("fk_session=");
+    expect(refreshedCookie).not.toBe(cookie);
+
+    const logout = await fetch(new Request("http://localhost/api/auth/logout", {
+      method: "POST",
+      headers: { cookie: refreshedCookie!.split(";")[0]! }
+    }));
+    expect(logout.status).toBe(204);
+    expect(logout.headers.getSetCookie()[0]).toContain("Max-Age=0");
+  });
+
   it("smokes auth, documents, admin APIs, customization, outbox, migrations, realtime, and OpenAPI", async () => {
     const customer = defineDocType({
       name: "customer",

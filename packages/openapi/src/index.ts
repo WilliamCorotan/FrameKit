@@ -660,6 +660,11 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         bearerAuth: {
           type: "http",
           scheme: "bearer"
+        },
+        cookieAuth: {
+          type: "apiKey",
+          in: "cookie",
+          name: "framekit_session"
         }
       },
       parameters: {
@@ -669,7 +674,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         Permissions: headerParam("x-permissions")
       }
     },
-    security: [{ bearerAuth: [] }]
+    security: [{ bearerAuth: [] }, { cookieAuth: [] }]
   };
 }
 
