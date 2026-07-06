@@ -218,20 +218,20 @@ function App() {
   if (!token) {
     return (
       <main className="login-shell">
-        <section className="login-panel">
+        <section className="login-panel" aria-labelledby="login-title">
           <div className="mark"><Boxes size={24} /> Framekit</div>
           <p className="eyebrow">Desk sign in</p>
-          <h1>Metadata operations console</h1>
+          <h1 id="login-title">Metadata operations console</h1>
           <label className="field">
             <span>Email</span>
-            <input value={email} onChange={(event) => setEmail(event.target.value)} />
+            <input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} />
           </label>
           <label className="field">
             <span>Password</span>
-            <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+            <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} />
           </label>
           <button className="primary wide" onClick={() => void login()}><KeyRound size={16} /> Sign in</button>
-          <p className="status">{status}</p>
+          <p className="status" role="status">{status}</p>
         </section>
       </main>
     );
@@ -242,7 +242,7 @@ function App() {
       <aside className="rail">
         <div className="mark"><Boxes size={22} /> Framekit</div>
         <div className="version">{metadata?.name ?? "Metadata Desk"} · {metadata?.version ?? "0.1.0"}</div>
-        <nav>
+        <nav aria-label="Desk sections">
           {doctypes.map((doctype) => (
             <button key={doctype.name} className={section === "documents" && doctype.name === active?.name ? "active" : ""} onClick={() => { setSection("documents"); setActiveDocType(doctype.name); }}>
               <Database size={17} />
@@ -260,7 +260,7 @@ function App() {
         </nav>
       </aside>
 
-      <section className="workbench">
+      <section className="workbench" aria-label="Desk workbench">
         {section === "users" || section === "roles" || section === "tokens" ? <AdminPanel section={section} token={token} status={status} setStatus={setStatus} /> : null}
         {section === "audit" || section === "outbox" || section === "diagnostics" || section === "customization" ? <OperationsPanel section={section} token={token} doctypes={doctypes} status={status} setStatus={setStatus} /> : null}
         {section === "documents" ? (
@@ -406,7 +406,7 @@ function AdminPanel({ section, token, status, setStatus }: { section: "users" | 
           <p className="eyebrow">Administration</p>
           <h1>{title}</h1>
         </div>
-        <button className="primary" onClick={() => void refresh()}><RefreshCw size={16} /> Refresh</button>
+        <button className="primary" onClick={() => void refresh()} aria-label={`Refresh ${title}`}><RefreshCw size={16} /> Refresh</button>
       </header>
       <div className="admin-grid">
         <section className="editor">
@@ -505,7 +505,7 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
           <p className="eyebrow">Operations</p>
           <h1>{title}</h1>
         </div>
-        <button className="primary" onClick={() => void refresh()}><RefreshCw size={16} /> Refresh</button>
+        <button className="primary" onClick={() => void refresh()} aria-label={`Refresh ${title}`}><RefreshCw size={16} /> Refresh</button>
       </header>
 
       {section === "customization" ? (
