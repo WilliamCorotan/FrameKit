@@ -2,14 +2,23 @@
   "name": "@framekit/db",
   "version": "0.1.0",
   "type": "module",
-  "main": "./src/index.ts",
-  "types": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "development": {
+        "types": "./src/index.ts",
+        "default": "./src/index.ts"
+      },
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json --noEmit",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "pnpm build"
   },
   "dependencies": {
     "@framekit/auth": "workspace:*",
@@ -17,5 +26,30 @@
     "@framekit/runtime": "workspace:*",
     "drizzle-orm": "^0.45.2",
     "postgres": "^3.4.7"
-  }
+  },
+  "description": "Framekit Postgres and Drizzle persistence adapters.",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "sideEffects": false,
+  "keywords": [
+    "framekit",
+    "typescript",
+    "meta-framework",
+    "db"
+  ],
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/WilliamCorotan/FrameKit.git",
+    "directory": "packages/db"
+  },
+  "bugs": {
+    "url": "https://github.com/WilliamCorotan/FrameKit/issues"
+  },
+  "homepage": "https://github.com/WilliamCorotan/FrameKit#readme"
 }
