@@ -57,6 +57,8 @@ pnpm --filter @framekit/example-crm outbox:dispatch
 pnpm --filter @framekit/cli framekit create-app alpha-suite
 pnpm --filter @framekit/cli framekit new-module sales
 pnpm --filter @framekit/cli framekit new-doctype sales-order
+pnpm --filter @framekit/cli framekit generate-sdk examples/crm/src/app.ts
+pnpm --filter @framekit/cli framekit generate-migration examples/crm/src/app.ts examples/crm/src/app.ts
 ```
 
 ## API Overview
@@ -65,8 +67,14 @@ System and contracts:
 
 ```txt
 GET  /health
+GET  /health/dependencies
 GET  /api/meta
 GET  /api/diagnostics
+GET  /api/migrations
+POST /api/migrations/plan
+POST /api/migrations/apply
+GET  /api/realtime/events
+GET  /api/realtime/stream
 GET  /api/openapi.json
 ```
 
@@ -75,6 +83,23 @@ Auth:
 ```txt
 POST /api/auth/login
 GET  /api/auth/me
+POST /api/auth/refresh
+POST /api/auth/logout
+POST /api/auth/password/change
+POST /api/auth/providers/{id}/login
+GET  /api/auth/audit
+GET  /api/auth/users
+POST /api/auth/users
+PATCH /api/auth/users/{id}
+DELETE /api/auth/users/{id}
+POST /api/auth/users/{id}/password
+GET  /api/auth/roles
+POST /api/auth/roles
+PATCH /api/auth/roles/{id}
+DELETE /api/auth/roles/{id}
+GET  /api/auth/tokens
+POST /api/auth/tokens
+DELETE /api/auth/tokens/{id}
 ```
 
 Documents:
@@ -151,15 +176,15 @@ export const deal = defineDocType({
 | Package | Purpose |
 | --- | --- |
 | `@framekit/core` | Pure metadata definitions: DocTypes, modules, apps, permissions, workflows, views. |
-| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime. |
-| `@framekit/auth` | Password hashing, signed sessions, user store contract, auth context. |
-| `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs. |
+| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, and migration planning. |
+| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, and provider login ports. |
+| `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs, operations headers, rate limiting, telemetry hooks, and health checks. |
 | `@framekit/openapi` | OpenAPI 3.1 generator from Framekit metadata. |
 | `@framekit/db` | Postgres adapters for documents, users, audit, outbox, custom fields, views, naming series. |
 | `@framekit/jobs` | Queue port, BullMQ adapter, outbox dispatcher, scheduled job registry. |
 | `@framekit/realtime` | Event bus contract and in-memory publisher/subscriber. |
-| `@framekit/sdk` | HTTP client for auth, metadata, documents, audit, outbox, customization, and views. |
-| `@framekit/cli` | App/module/DocType scaffolding commands. |
+| `@framekit/sdk` | HTTP client for auth, metadata, documents, audit, outbox, customization, views, migrations, realtime, and admin APIs. |
+| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and generated migration artifacts. |
 | `@framekit/desk` | React Desk UI generated from metadata. |
 
 ## Repository Layout
@@ -233,17 +258,15 @@ The scaffold includes:
 Every iteration should pass:
 
 ```bash
-pnpm typecheck
-pnpm test
-pnpm build
+pnpm audit:all
 ```
 
 Current verification status:
 
-- Typecheck passes.
-- Test suite passes: 6 files, 18 tests.
+- Full audit passes: lint, typecheck, tests, and build.
+- Test suite passes: 9 files, 44 tests.
 - Production build passes for packages, Desk, and CRM example.
-- Built API smoke has covered auth, OpenAPI, diagnostics, document creation, naming series, custom fields, views, audit, and outbox.
+- In-process Nitro smoke covers auth lifecycle, provider login, OpenAPI, diagnostics, document CRUD, uniqueness, filters, cursor/projection, auth admin, password reset/change, customization, migrations, outbox, realtime history, and security/operations headers.
 
 ## Architecture
 
@@ -260,15 +283,7 @@ See [docs/architecture.md](docs/architecture.md).
 
 ## Roadmap Status
 
-The current framework MVP roadmap is implemented:
-
-- Phase 1: Authentication and sessions.
-- Phase 2: Durable framework records.
-- Phase 3: Customization and schema evolution foundation.
-- Phase 4: Automation, jobs, outbox, and realtime foundation.
-- Phase 5: Developer experience and release hardening.
-
-See [docs/roadmap.md](docs/roadmap.md).
+The current local framework core is largely implemented. Remaining release-candidate work is tracked in [docs/maturity-roadmap.md](docs/maturity-roadmap.md) and GitHub Issues.
 
 ## License
 
