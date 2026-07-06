@@ -10,6 +10,8 @@
     "dev": "pnpm --filter @framekit/example-crm dev",
     "dev:desk": "pnpm --filter @framekit/desk dev",
     "lint": "tsc -p tsconfig.check.json --noEmit",
+    "release:candidate": "node scripts/release-candidate.mjs",
+    "release:candidate:check": "node scripts/release-candidate.mjs --check",
     "test": "vitest run",
     "typecheck": "pnpm -r --if-present typecheck",
     "audit:all": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
