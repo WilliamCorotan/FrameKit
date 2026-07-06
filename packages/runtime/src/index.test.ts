@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
-import { createRuntime } from "./index.js";
+import { createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -421,8 +421,20 @@ describe("runtime document service", () => {
       expect.objectContaining({ kind: "add_index", doctype: "customer", field: "region", destructive: false })
     ]));
     expect(plan.changes[0]?.rollback).toMatchObject({ kind: "remove_field", doctype: "customer", field: "region" });
+    expect(createExecutableMigrationArtifact(plan)).toMatchObject({
+      id: "migration-1",
+      up: expect.arrayContaining([expect.objectContaining({ kind: "add_field", field: "region" })]),
+      down: expect.arrayContaining([expect.objectContaining({ kind: "remove_field", field: "region" })])
+    });
     await expect(runtime.applyMigration(tenant, { ...plan, changes: [] })).rejects.toMatchObject({ code: "MIGRATION_CHECKSUM_MISMATCH" });
     await expect(runtime.migrationHistory(tenant)).resolves.toEqual([applied]);
+
+    const rollback = await createRollbackMigrationPlan(applied, { id: "migration-1-down", createdAt: "2026-07-06T00:00:00.000Z" });
+    expect(rollback).toMatchObject({
+      id: "migration-1-down",
+      changes: expect.arrayContaining([expect.objectContaining({ kind: "remove_field", field: "region" })])
+    });
+    await expect(runtime.rollbackMigration(tenant, applied, { id: "migration-1-down", allowDestructive: true })).resolves.toMatchObject({ id: "migration-1-down" });
   });
 
   it("generates predictable naming series", async () => {

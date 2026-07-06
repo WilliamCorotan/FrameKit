@@ -12,12 +12,17 @@ import {
   type CustomizationStore,
   type DocumentRepository,
   type ListOptions,
+  type MigrationChange,
+  type MigrationPlan,
   type MigrationRecord,
+  type MigrationRollback,
   type MigrationStore,
   type NamingSeriesStore,
   type OutboxEvent,
   type OutboxStore,
-  type RepositoryDiagnostics
+  type RepositoryDiagnostics,
+  createRollbackMigrationPlan,
+  validateMigrationPlan
 } from "@framekit/runtime";
 
 export const framekitDocuments = pgTable(
@@ -657,10 +662,12 @@ export class PostgresNamingSeriesStore implements NamingSeriesStore {
 }
 
 export class PostgresMigrationStore implements MigrationStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
   }
 
   async migrate(): Promise<void> {
@@ -691,6 +698,43 @@ export class PostgresMigrationStore implements MigrationStore {
       appliedAt: new Date(migration.appliedAt)
     });
     return migration;
+  }
+
+  async applyPlan(tenant: TenantContext, plan: MigrationPlan, options: { allowDestructive?: boolean; appliedAt?: string } = {}): Promise<MigrationRecord> {
+    await validateExecutableMigration(plan, options);
+    const statements = executableStatements(createPostgresMigrationStatements(plan));
+    const appliedAt = options.appliedAt ?? new Date().toISOString();
+    const record: MigrationRecord = { ...plan, tenantId: tenant.tenantId, appliedAt };
+    await this.sql.begin(async (sql) => {
+      for (const statement of statements) {
+        await sql.unsafe(statement);
+      }
+      await sql`
+        insert into framekit_migrations (tenant_id, id, app_name, changes, checksum, created_at, applied_at)
+        values (${record.tenantId}, ${record.id}, ${record.appName}, ${JSON.stringify(record.changes)}::jsonb, ${record.checksum}, ${new Date(record.createdAt)}, ${new Date(record.appliedAt)})
+      `;
+    });
+    return record;
+  }
+
+  async rollback(tenant: TenantContext, migration: MigrationRecord, options: { allowDestructive?: boolean; id?: string; appliedAt?: string } = {}): Promise<MigrationRecord> {
+    const plan = await createRollbackMigrationPlan(migration, {
+      id: options.id,
+      createdAt: options.appliedAt ?? new Date().toISOString()
+    });
+    await validateExecutableMigration(plan, options);
+    const statements = executableStatements(createPostgresMigrationStatements(migration, { direction: "down" }));
+    const record: MigrationRecord = { ...plan, tenantId: tenant.tenantId, appliedAt: options.appliedAt ?? new Date().toISOString() };
+    await this.sql.begin(async (sql) => {
+      for (const statement of statements) {
+        await sql.unsafe(statement);
+      }
+      await sql`
+        insert into framekit_migrations (tenant_id, id, app_name, changes, checksum, created_at, applied_at)
+        values (${record.tenantId}, ${record.id}, ${record.appName}, ${JSON.stringify(record.changes)}::jsonb, ${record.checksum}, ${new Date(record.createdAt)}, ${new Date(record.appliedAt)})
+      `;
+    });
+    return record;
   }
 }
 
@@ -875,6 +919,107 @@ create table if not exists framekit_migrations (
 alter table framekit_migrations add column if not exists checksum text not null default '';
 create index if not exists framekit_migrations_lookup on framekit_migrations (tenant_id, applied_at desc);
 `;
+}
+
+export function createPostgresMigrationSql(plan: MigrationPlan, options: { direction?: "up" | "down" } = {}): string {
+  return `${createPostgresMigrationStatements(plan, options).join("\n")}\n`;
+}
+
+export function createPostgresRollbackSql(migration: MigrationRecord): string {
+  return createPostgresMigrationSql(migration, { direction: "down" });
+}
+
+export function createPostgresMigrationStatements(plan: MigrationPlan, options: { direction?: "up" | "down" } = {}): string[] {
+  const changes = options.direction === "down"
+    ? plan.changes.slice().reverse().map((change) => change.rollback ?? rollbackFromChange(change))
+    : plan.changes;
+  return changes.flatMap((change) => statementsForChange(plan.tenantId, change));
+}
+
+async function validateExecutableMigration(plan: MigrationPlan, options: { allowDestructive?: boolean }): Promise<void> {
+  await validateMigrationPlan(plan);
+  const destructive = plan.changes.filter((change) => change.destructive);
+  if (destructive.length > 0 && !options.allowDestructive) {
+    throw new FramekitError("DESTRUCTIVE_MIGRATION", "Migration contains destructive changes.", 409, destructive);
+  }
+}
+
+function statementsForChange(tenantId: string, change: MigrationChange | MigrationRollback): string[] {
+  switch (change.kind) {
+    case "add_field": {
+      const field = change.to && typeof change.to === "object" ? change.to as { default?: unknown } : undefined;
+      if (field && "default" in field) {
+        return [
+          `update framekit_documents set data = jsonb_set(data, '{${jsonPathSegment(change.field)}}', ${sqlLiteralJson(field.default)}::jsonb, true) where tenant_id = ${sqlLiteral(tenantId)} and doctype = ${sqlLiteral(change.doctype)} and not (data ? ${sqlLiteral(change.field)});`
+        ];
+      }
+      return [`-- add_field ${change.doctype}.${change.field}: no DDL required for JSONB document data`];
+    }
+    case "remove_field":
+      return [
+        `update framekit_documents set data = data - ${sqlLiteral(change.field)} where tenant_id = ${sqlLiteral(tenantId)} and doctype = ${sqlLiteral(change.doctype)} and data ? ${sqlLiteral(change.field)};`
+      ];
+    case "change_field_type":
+      return [`-- change_field_type ${change.doctype}.${change.field}: no safe automatic JSONB cast generated`];
+    case "add_index":
+      return [`create index if not exists ${indexIdentifier(change, "idx")} on framekit_documents (tenant_id, doctype, ${indexExpressions(change.field).join(", ")}) where doctype = ${sqlLiteral(change.doctype)};`];
+    case "remove_index":
+      return [`drop index if exists ${indexIdentifier(change, "idx")};`];
+    case "add_unique_constraint":
+      return [`create unique index if not exists ${indexIdentifier(change, "uniq")} on framekit_documents (tenant_id, doctype, (data ->> ${sqlLiteral(change.field)})) where doctype = ${sqlLiteral(change.doctype)} and data ? ${sqlLiteral(change.field)};`];
+    case "remove_unique_constraint":
+      return [`drop index if exists ${indexIdentifier(change, "uniq")};`];
+  }
+}
+
+function executableStatements(statements: string[]): string[] {
+  return statements.filter((statement) => !statement.trimStart().startsWith("--"));
+}
+
+function rollbackFromChange(change: MigrationChange): MigrationRollback {
+  if (change.rollback) {
+    return change.rollback;
+  }
+  switch (change.kind) {
+    case "add_field":
+      return { kind: "remove_field", doctype: change.doctype, field: change.field, destructive: true, from: change.to };
+    case "remove_field":
+      return { kind: "add_field", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+    case "change_field_type":
+      return { kind: "change_field_type", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
+    case "add_index":
+      return { kind: "remove_index", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
+    case "remove_index":
+      return { kind: "add_index", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+    case "add_unique_constraint":
+      return { kind: "remove_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
+    case "remove_unique_constraint":
+      return { kind: "add_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+  }
+}
+
+function indexIdentifier(change: Pick<MigrationChange, "doctype" | "field">, suffix: "idx" | "uniq"): string {
+  return `framekit_documents_${identifierPart(change.doctype)}_${identifierPart(change.field)}_${suffix}`;
+}
+
+function identifierPart(value: string): string {
+  return value.replaceAll(/[^a-zA-Z0-9_]+/g, "_").replaceAll(/^_+|_+$/g, "").toLowerCase();
+}
+
+function indexExpressions(fields: string): string[] {
+  return fields.split(",").map((field) => `(data ->> ${sqlLiteral(field)})`);
+}
+
+function jsonPathSegment(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"");
+}
+
+function sqlLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+function sqlLiteralJson(value: unknown): string {
+  return sqlLiteral(JSON.stringify(value));
 }
 
 function rowToRecord(row: typeof framekitDocuments.$inferSelect): DocumentRecord {

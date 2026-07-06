@@ -138,6 +138,11 @@ export type MigrationRecord = MigrationPlan & {
   appliedAt: string;
 };
 
+export type ExecutableMigrationArtifact = MigrationPlan & {
+  up: MigrationChange[];
+  down: MigrationRollback[];
+};
+
 export type MigrationStore = {
   list(tenant: TenantContext): Promise<MigrationRecord[]>;
   record(tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord>;
@@ -327,13 +332,7 @@ export class FramekitRuntime {
   }
 
   async applyMigration(tenant: TenantContext, plan: MigrationPlan, options: { allowDestructive?: boolean } = {}): Promise<MigrationRecord> {
-    const expectedChecksum = await migrationChecksum(plan);
-    if (plan.checksum !== expectedChecksum) {
-      throw new FramekitError("MIGRATION_CHECKSUM_MISMATCH", "Migration checksum does not match the planned changes.", 409, {
-        expected: expectedChecksum,
-        actual: plan.checksum
-      });
-    }
+    await validateMigrationPlan(plan);
     const destructive = plan.changes.filter((change) => change.destructive);
     if (destructive.length > 0 && !options.allowDestructive) {
       throw new FramekitError("DESTRUCTIVE_MIGRATION", "Migration contains destructive changes.", 409, destructive);
@@ -344,6 +343,14 @@ export class FramekitRuntime {
       appliedAt: this.now().toISOString()
     };
     return this.migrations.record(tenant, record);
+  }
+
+  async rollbackMigration(tenant: TenantContext, migration: MigrationRecord, options: { allowDestructive?: boolean; id?: string } = {}): Promise<MigrationRecord> {
+    const plan = await createRollbackMigrationPlan(migration, {
+      id: options.id ?? `${migration.id}-rollback`,
+      createdAt: this.now().toISOString()
+    });
+    return this.applyMigration(tenant, plan, options);
   }
 
   async customFields(tenant: TenantContext): Promise<CustomFieldDefinition[]> {
@@ -931,6 +938,43 @@ export async function migrationChecksum(plan: Pick<MigrationPlan, "tenantId" | "
   return base64Url(new Uint8Array(digest));
 }
 
+export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> {
+  const expectedChecksum = await migrationChecksum(plan);
+  if (plan.checksum !== expectedChecksum) {
+    throw new FramekitError("MIGRATION_CHECKSUM_MISMATCH", "Migration checksum does not match the planned changes.", 409, {
+      expected: expectedChecksum,
+      actual: plan.checksum
+    });
+  }
+}
+
+export function createExecutableMigrationArtifact(plan: MigrationPlan): ExecutableMigrationArtifact {
+  return {
+    ...plan,
+    changes: plan.changes.map(cloneMigrationChange),
+    up: plan.changes.map(cloneMigrationChange),
+    down: plan.changes.slice().reverse().map((change) => ({ ...(change.rollback ?? rollbackFor(change)) }))
+  };
+}
+
+export async function createRollbackMigrationPlan(
+  migration: MigrationRecord,
+  options: { id?: string; createdAt?: string } = {}
+): Promise<MigrationPlan> {
+  await validateMigrationPlan(migration);
+  const plan = {
+    id: options.id ?? `${migration.id}-rollback`,
+    tenantId: migration.tenantId,
+    appName: migration.appName,
+    createdAt: options.createdAt ?? new Date().toISOString(),
+    changes: migration.changes.slice().reverse().map((change) => ({
+      ...(change.rollback ?? rollbackFor(change)),
+      rollback: withoutRollback(change)
+    }))
+  };
+  return { ...plan, checksum: await migrationChecksum(plan) };
+}
+
 function base64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) {
@@ -956,8 +1000,20 @@ function indexKey(fields: string[]): string {
 function cloneMigrationRecord(record: MigrationRecord): MigrationRecord {
   return {
     ...record,
-    changes: record.changes.map((change) => ({ ...change }))
+    changes: record.changes.map(cloneMigrationChange)
   };
+}
+
+function cloneMigrationChange(change: MigrationChange): MigrationChange {
+  return {
+    ...change,
+    rollback: change.rollback ? { ...change.rollback } : undefined
+  };
+}
+
+function withoutRollback(change: MigrationChange): MigrationRollback {
+  const { rollback: _rollback, ...rest } = change;
+  return rest;
 }
 
 function coerceFieldValue(doctype: string, field: string, type: string, value: unknown, options?: string[]): unknown {

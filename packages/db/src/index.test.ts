@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { migrationChecksum, type MigrationPlan } from "@framekit/runtime";
 import {
   createApiTokenTableSql,
   createAuditTableSql,
@@ -7,6 +8,8 @@ import {
   createMigrationTableSql,
   createNamingSeriesTableSql,
   createOutboxTableSql,
+  createPostgresMigrationSql,
+  createPostgresMigrationStatements,
   createRoleTableSql,
   createSessionRevocationTableSql,
   createUserTableSql,
@@ -33,4 +36,61 @@ describe("db migration sql", () => {
     expect(createMigrationTableSql()).toContain("framekit_migrations");
     expect(createMigrationTableSql()).toContain("checksum");
   });
+
+  it("generates executable SQL for JSON document migration plans", async () => {
+    const plan = await migrationPlanFixture();
+    const sql = createPostgresMigrationSql(plan);
+
+    expect(sql).toContain("jsonb_set");
+    expect(sql).toContain("create index if not exists framekit_documents_customer_region_idx");
+    expect(sql).toContain("create unique index if not exists framekit_documents_customer_region_uniq");
+    expect(sql).toContain("tenant_id = 'tenant_1'");
+  });
+
+  it("generates rollback statements from rollback metadata", async () => {
+    const plan = await migrationPlanFixture();
+    const statements = createPostgresMigrationStatements(plan, { direction: "down" });
+
+    expect(statements).toEqual(expect.arrayContaining([
+      "drop index if exists framekit_documents_customer_region_idx;",
+      "drop index if exists framekit_documents_customer_region_uniq;"
+    ]));
+    expect(statements.some((statement) => statement.includes("data = data - 'region'"))).toBe(true);
+  });
 });
+
+async function migrationPlanFixture(): Promise<MigrationPlan> {
+  const plan = {
+    id: "migration-1",
+    tenantId: "tenant_1",
+    appName: "CRM",
+    createdAt: "2026-07-06T00:00:00.000Z",
+    changes: [
+      {
+        kind: "add_field" as const,
+        doctype: "customer",
+        field: "region",
+        destructive: false,
+        to: { name: "region", label: "Region", type: "text", default: "APAC" },
+        rollback: { kind: "remove_field" as const, doctype: "customer", field: "region", destructive: true }
+      },
+      {
+        kind: "add_unique_constraint" as const,
+        doctype: "customer",
+        field: "region",
+        destructive: false,
+        to: "region",
+        rollback: { kind: "remove_unique_constraint" as const, doctype: "customer", field: "region", destructive: false, from: "region" }
+      },
+      {
+        kind: "add_index" as const,
+        doctype: "customer",
+        field: "region",
+        destructive: false,
+        to: ["region"],
+        rollback: { kind: "remove_index" as const, doctype: "customer", field: "region", destructive: false, from: ["region"] }
+      }
+    ]
+  };
+  return { ...plan, checksum: await migrationChecksum(plan) };
+}
