@@ -7,6 +7,29 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: framekit
+          POSTGRES_PASSWORD: framekit
+          POSTGRES_DB: framekit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U framekit -d framekit"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -19,4 +42,9 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+      - run: pnpm test:services
+        env:
+          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit
+          REDIS_URL: redis://localhost:6379
       - run: pnpm build
+      - run: pnpm smoke:crm:built
