@@ -57,6 +57,87 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         doctypes: { type: "array", items: { type: "object", additionalProperties: true } },
         warnings: { type: "array", items: { type: "string" } }
       }
+    },
+    AuthUser: {
+      type: "object",
+      required: ["id", "tenantId", "email", "name", "roles", "permissions"],
+      properties: {
+        id: { type: "string" },
+        tenantId: { type: "string" },
+        email: { type: "string", format: "email" },
+        name: { type: "string" },
+        roles: { type: "array", items: { type: "string" } },
+        permissions: { type: "array", items: { type: "string" } },
+        disabledAt: { type: "string", format: "date-time" },
+        lockedUntil: { type: "string", format: "date-time" }
+      }
+    },
+    AuthRole: {
+      type: "object",
+      required: ["tenantId", "id", "name", "permissions"],
+      properties: {
+        tenantId: { type: "string" },
+        id: { type: "string" },
+        name: { type: "string" },
+        permissions: { type: "array", items: { type: "string" } },
+        createdAt: { type: "string", format: "date-time" },
+        updatedAt: { type: "string", format: "date-time" }
+      }
+    },
+    ApiToken: {
+      type: "object",
+      required: ["tenantId", "id", "name", "roles", "permissions", "createdAt"],
+      properties: {
+        tenantId: { type: "string" },
+        id: { type: "string" },
+        name: { type: "string" },
+        userId: { type: "string" },
+        roles: { type: "array", items: { type: "string" } },
+        permissions: { type: "array", items: { type: "string" } },
+        createdAt: { type: "string", format: "date-time" },
+        expiresAt: { type: "string", format: "date-time" },
+        revokedAt: { type: "string", format: "date-time" }
+      }
+    },
+    CreatedApiToken: {
+      type: "object",
+      required: ["tenantId", "id", "name", "roles", "permissions", "createdAt", "token"],
+      properties: {
+        tenantId: { type: "string" },
+        id: { type: "string" },
+        name: { type: "string" },
+        userId: { type: "string" },
+        roles: { type: "array", items: { type: "string" } },
+        permissions: { type: "array", items: { type: "string" } },
+        createdAt: { type: "string", format: "date-time" },
+        expiresAt: { type: "string", format: "date-time" },
+        token: { type: "string" }
+      }
+    },
+    AuthSession: {
+      type: "object",
+      required: ["token", "sessionId", "user", "context", "expiresAt"],
+      properties: {
+        token: { type: "string" },
+        sessionId: { type: "string" },
+        user: { type: "object", additionalProperties: true },
+        context: { type: "object", additionalProperties: true },
+        expiresAt: { type: "string", format: "date-time" }
+      }
+    },
+    AuthAuditEvent: {
+      type: "object",
+      required: ["id", "tenantId", "action", "success", "createdAt"],
+      properties: {
+        id: { type: "string" },
+        tenantId: { type: "string" },
+        actorUserId: { type: "string" },
+        targetUserId: { type: "string" },
+        action: { type: "string" },
+        success: { type: "boolean" },
+        createdAt: { type: "string", format: "date-time" },
+        details: { type: "object", additionalProperties: true }
+      }
     }
   };
   const paths: Record<string, Record<string, Operation>> = {
@@ -82,6 +163,72 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         summary: "Read runtime diagnostics",
         tags: ["System"],
         responses: okResponse(ref("FramekitDiagnostics"))
+      }
+    },
+    [`${basePath}/migrations`]: {
+      get: {
+        operationId: "listMigrations",
+        summary: "List applied migration records",
+        tags: ["System"],
+        responses: okResponse({ type: "array", items: { type: "object", additionalProperties: true } })
+      }
+    },
+    [`${basePath}/realtime/events`]: {
+      get: {
+        operationId: "listRealtimeEvents",
+        summary: "List recent realtime document events",
+        tags: ["System"],
+        parameters: [queryParam("limit", "integer")],
+        responses: okResponse({ type: "array", items: { type: "object", additionalProperties: true } })
+      }
+    },
+    [`${basePath}/realtime/stream`]: {
+      get: {
+        operationId: "streamRealtimeEvents",
+        summary: "Stream realtime document events using server-sent events",
+        tags: ["System"],
+        responses: {
+          "200": {
+            description: "Realtime event stream",
+            content: {
+              "text/event-stream": {
+                schema: { type: "string" }
+              }
+            }
+          },
+          ...errorResponses()
+        }
+      }
+    },
+    [`${basePath}/migrations/plan`]: {
+      post: {
+        operationId: "planMigration",
+        summary: "Plan metadata migration changes",
+        tags: ["System"],
+        requestBody: jsonBody({
+          type: "object",
+          required: ["app"],
+          properties: {
+            app: { type: "object", additionalProperties: true }
+          }
+        }, true),
+        responses: okResponse({ type: "object", additionalProperties: true })
+      }
+    },
+    [`${basePath}/migrations/apply`]: {
+      post: {
+        operationId: "applyMigration",
+        summary: "Record an applied migration plan",
+        tags: ["System"],
+        requestBody: jsonBody({
+          type: "object",
+          required: ["plan"],
+          properties: {
+            plan: { type: "object", additionalProperties: true },
+            allowDestructive: { type: "boolean" }
+          }
+        }, true),
+        responses: okResponse({ type: "object", additionalProperties: true })
       }
     },
     [`${basePath}/audit`]: {
@@ -225,16 +372,23 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
             password: { type: "string", format: "password" }
           }
         }, true),
-        responses: okResponse({
+        responses: okResponse(ref("AuthSession"))
+      }
+    },
+    [`${basePath}/auth/providers/{id}/login`]: {
+      post: {
+        operationId: "loginWithProvider",
+        summary: "Create a signed session token from an external auth provider",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        requestBody: jsonBody({
           type: "object",
-          required: ["token", "user", "context", "expiresAt"],
+          required: ["token"],
           properties: {
-            token: { type: "string" },
-            user: { type: "object", additionalProperties: true },
-            context: { type: "object", additionalProperties: true },
-            expiresAt: { type: "string", format: "date-time" }
+            token: { type: "string" }
           }
-        })
+        }, true),
+        responses: okResponse(ref("AuthSession"))
       }
     },
     [`${basePath}/auth/me`]: {
@@ -251,6 +405,161 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
             expiresAt: { type: "string", format: "date-time" }
           }
         })
+      }
+    },
+    [`${basePath}/auth/refresh`]: {
+      post: {
+        operationId: "refreshSession",
+        summary: "Rotate the current signed session token",
+        tags: ["Auth"],
+        responses: okResponse(ref("AuthSession"))
+      }
+    },
+    [`${basePath}/auth/logout`]: {
+      post: {
+        operationId: "logout",
+        summary: "Revoke the current signed session token",
+        tags: ["Auth"],
+        responses: { "204": { description: "Logged out" }, ...errorResponses() }
+      }
+    },
+    [`${basePath}/auth/password/change`]: {
+      post: {
+        operationId: "changePassword",
+        summary: "Change the current user's password",
+        tags: ["Auth"],
+        requestBody: jsonBody({
+          type: "object",
+          required: ["currentPassword", "newPassword"],
+          properties: {
+            currentPassword: { type: "string", format: "password" },
+            newPassword: { type: "string", format: "password" }
+          }
+        }, true),
+        responses: { "204": { description: "Password changed" }, ...errorResponses() }
+      }
+    },
+    [`${basePath}/auth/audit`]: {
+      get: {
+        operationId: "listAuthAuditEvents",
+        summary: "List authentication audit events",
+        tags: ["Auth"],
+        responses: okResponse({ type: "array", items: ref("AuthAuditEvent") })
+      }
+    },
+    [`${basePath}/auth/users`]: {
+      get: {
+        operationId: "listAuthUsers",
+        summary: "List tenant users",
+        tags: ["Auth"],
+        responses: okResponse({ type: "array", items: ref("AuthUser") })
+      },
+      post: {
+        operationId: "createAuthUser",
+        summary: "Create a tenant user",
+        tags: ["Auth"],
+        requestBody: jsonBody(userWriteSchema(true), true),
+        responses: createdResponse(ref("AuthUser"))
+      }
+    },
+    [`${basePath}/auth/users/{id}`]: {
+      patch: {
+        operationId: "updateAuthUser",
+        summary: "Update a tenant user",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        requestBody: jsonBody(userWriteSchema(false), true),
+        responses: okResponse(ref("AuthUser"))
+      },
+      delete: {
+        operationId: "deleteAuthUser",
+        summary: "Delete a tenant user",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        responses: { "204": { description: "Deleted" }, ...errorResponses() }
+      }
+    },
+    [`${basePath}/auth/users/{id}/password`]: {
+      post: {
+        operationId: "resetUserPassword",
+        summary: "Reset a tenant user's password",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        requestBody: jsonBody({
+          type: "object",
+          required: ["newPassword"],
+          properties: {
+            newPassword: { type: "string", format: "password" }
+          }
+        }, true),
+        responses: { "204": { description: "Password reset" }, ...errorResponses() }
+      }
+    },
+    [`${basePath}/auth/roles`]: {
+      get: {
+        operationId: "listAuthRoles",
+        summary: "List tenant roles",
+        tags: ["Auth"],
+        responses: okResponse({ type: "array", items: ref("AuthRole") })
+      },
+      post: {
+        operationId: "createAuthRole",
+        summary: "Create or update a tenant role",
+        tags: ["Auth"],
+        requestBody: jsonBody(roleWriteSchema(true), true),
+        responses: createdResponse(ref("AuthRole"))
+      }
+    },
+    [`${basePath}/auth/roles/{id}`]: {
+      patch: {
+        operationId: "updateAuthRole",
+        summary: "Update a tenant role",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        requestBody: jsonBody(roleWriteSchema(false), true),
+        responses: okResponse(ref("AuthRole"))
+      },
+      delete: {
+        operationId: "deleteAuthRole",
+        summary: "Delete a tenant role",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        responses: { "204": { description: "Deleted" }, ...errorResponses() }
+      }
+    },
+    [`${basePath}/auth/tokens`]: {
+      get: {
+        operationId: "listApiTokens",
+        summary: "List tenant API tokens",
+        tags: ["Auth"],
+        responses: okResponse({ type: "array", items: ref("ApiToken") })
+      },
+      post: {
+        operationId: "createApiToken",
+        summary: "Create an API token",
+        tags: ["Auth"],
+        requestBody: jsonBody({
+          type: "object",
+          required: ["name", "roles", "permissions"],
+          properties: {
+            id: { type: "string" },
+            name: { type: "string" },
+            userId: { type: "string" },
+            roles: { type: "array", items: { type: "string" } },
+            permissions: { type: "array", items: { type: "string" } },
+            expiresAt: { type: "string", format: "date-time" }
+          }
+        }, true),
+        responses: createdResponse(ref("CreatedApiToken"))
+      }
+    },
+    [`${basePath}/auth/tokens/{id}`]: {
+      delete: {
+        operationId: "revokeApiToken",
+        summary: "Revoke an API token",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        responses: okResponse(ref("ApiToken"))
       }
     }
   };
@@ -272,7 +581,12 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         tags: [doctype.label],
         parameters: [
           queryParam("search", "string"),
-          queryParam("limit", "integer")
+          queryParam("limit", "integer"),
+          queryParam("offset", "integer"),
+          queryParam("cursor", "string"),
+          queryParam("fields", "string"),
+          queryParam("filters", "string"),
+          queryParam("sort", "string")
         ],
         responses: okResponse({ type: "array", items: ref(recordName) })
       },
@@ -398,6 +712,35 @@ function fieldSchema(field: FieldDefinition): JsonSchema {
     default:
       return { type: "string", description };
   }
+}
+
+function userWriteSchema(creating: boolean): JsonSchema {
+  return {
+    type: "object",
+    required: ["email", "name", "roles", "permissions", ...(creating ? ["password"] : [])],
+    properties: {
+      id: { type: "string" },
+      email: { type: "string", format: "email" },
+      name: { type: "string" },
+      password: { type: "string", format: "password" },
+      roles: { type: "array", items: { type: "string" } },
+      permissions: { type: "array", items: { type: "string" } },
+      disabledAt: { type: "string", format: "date-time" },
+      lockedUntil: { type: "string", format: "date-time" }
+    }
+  };
+}
+
+function roleWriteSchema(creating: boolean): JsonSchema {
+  return {
+    type: "object",
+    required: ["name", "permissions", ...(creating ? ["id"] : [])],
+    properties: {
+      id: { type: "string" },
+      name: { type: "string" },
+      permissions: { type: "array", items: { type: "string" } }
+    }
+  };
 }
 
 function documentRecordSchema(dataSchema: JsonSchema): JsonSchema {

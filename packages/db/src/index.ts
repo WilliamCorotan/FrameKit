@@ -2,10 +2,23 @@ import { and, eq, sql as drizzleSql } from "drizzle-orm";
 import { integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres, { type Sql } from "postgres";
-import type { AuthUser, UserStore } from "@framekit/auth";
+import type { ApiTokenRecord, ApiTokenStore, AuthRole, AuthUser, RoleStore, SessionRevocationStore, UserStore } from "@framekit/auth";
 import type { CustomFieldDefinition, DocTypeDefinition, DocumentRecord, TenantContext, ViewDefinition } from "@framekit/core";
 import { FramekitError } from "@framekit/core";
-import type { AuditEvent, AuditStore, CustomizationStore, DocumentRepository, ListOptions, NamingSeriesStore, OutboxEvent, OutboxStore, RepositoryDiagnostics } from "@framekit/runtime";
+import {
+  applyListOptions,
+  type AuditEvent,
+  type AuditStore,
+  type CustomizationStore,
+  type DocumentRepository,
+  type ListOptions,
+  type MigrationRecord,
+  type MigrationStore,
+  type NamingSeriesStore,
+  type OutboxEvent,
+  type OutboxStore,
+  type RepositoryDiagnostics
+} from "@framekit/runtime";
 
 export const framekitDocuments = pgTable(
   "framekit_documents",
@@ -31,6 +44,9 @@ export const framekitUsers = pgTable(
     passwordHash: text("password_hash").notNull(),
     roles: jsonb("roles").notNull().$type<string[]>(),
     permissions: jsonb("permissions").notNull().$type<string[]>(),
+    disabledAt: timestamp("disabled_at", { withTimezone: true }),
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
+    failedLoginAttempts: integer("failed_login_attempts").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull()
   },
@@ -39,6 +55,45 @@ export const framekitUsers = pgTable(
     uniqueIndex("framekit_users_email").on(table.tenantId, table.email)
   ]
 );
+
+export const framekitRoles = pgTable(
+  "framekit_roles",
+  {
+    tenantId: text("tenant_id").notNull(),
+    id: text("id").notNull(),
+    name: text("name").notNull(),
+    permissions: jsonb("permissions").notNull().$type<string[]>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull()
+  },
+  (table) => [uniqueIndex("framekit_roles_identity").on(table.tenantId, table.id)]
+);
+
+export const framekitApiTokens = pgTable(
+  "framekit_api_tokens",
+  {
+    tenantId: text("tenant_id").notNull(),
+    id: text("id").notNull(),
+    name: text("name").notNull(),
+    tokenHash: text("token_hash").notNull(),
+    userId: text("user_id"),
+    roles: jsonb("roles").notNull().$type<string[]>(),
+    permissions: jsonb("permissions").notNull().$type<string[]>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true })
+  },
+  (table) => [
+    uniqueIndex("framekit_api_tokens_identity").on(table.tenantId, table.id),
+    uniqueIndex("framekit_api_tokens_hash").on(table.tokenHash)
+  ]
+);
+
+export const framekitSessionRevocations = pgTable("framekit_session_revocations", {
+  sessionId: text("session_id").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }).notNull()
+});
 
 export const framekitAuditEvents = pgTable("framekit_audit_events", {
   tenantId: text("tenant_id").notNull(),
@@ -93,6 +148,20 @@ export const framekitNamingSeries = pgTable(
   (table) => [uniqueIndex("framekit_naming_series_identity").on(table.tenantId, table.prefix)]
 );
 
+export const framekitMigrations = pgTable(
+  "framekit_migrations",
+  {
+    tenantId: text("tenant_id").notNull(),
+    id: text("id").notNull(),
+    appName: text("app_name").notNull(),
+    changes: jsonb("changes").notNull().$type<MigrationRecord["changes"]>(),
+    checksum: text("checksum").notNull().default(""),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+    appliedAt: timestamp("applied_at", { withTimezone: true }).notNull()
+  },
+  (table) => [uniqueIndex("framekit_migrations_identity").on(table.tenantId, table.id)]
+);
+
 export type PostgresRepositoryOptions = {
   connectionString: string;
   max?: number;
@@ -121,10 +190,8 @@ export class PostgresDocumentRepository implements DocumentRepository {
     const rows = await this.db
       .select()
       .from(framekitDocuments)
-      .where(and(eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name)))
-      .limit(options.limit ?? 100);
-    const records = rows.map(rowToRecord);
-    return options.search ? records.filter((record) => JSON.stringify(record.data).toLowerCase().includes(options.search!.toLowerCase())) : records;
+      .where(and(eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name)));
+    return applyListOptions(rows.map(rowToRecord), options);
   }
 
   async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
@@ -183,6 +250,11 @@ export class PostgresUserStore implements UserStore {
     await this.db.execute(drizzleSql.raw(createUserTableSql()));
   }
 
+  async list(tenantId: string): Promise<AuthUser[]> {
+    const rows = await this.db.select().from(framekitUsers).where(eq(framekitUsers.tenantId, tenantId));
+    return rows.map(rowToUser).sort((a, b) => a.email.localeCompare(b.email));
+  }
+
   async upsert(user: AuthUser): Promise<AuthUser> {
     const now = new Date();
     const values = {
@@ -193,6 +265,9 @@ export class PostgresUserStore implements UserStore {
       passwordHash: user.passwordHash,
       roles: user.roles,
       permissions: user.permissions,
+      disabledAt: user.disabledAt ? new Date(user.disabledAt) : null,
+      lockedUntil: user.lockedUntil ? new Date(user.lockedUntil) : null,
+      failedLoginAttempts: user.failedLoginAttempts ?? 0,
       createdAt: now,
       updatedAt: now
     };
@@ -207,14 +282,20 @@ export class PostgresUserStore implements UserStore {
           passwordHash: values.passwordHash,
           roles: values.roles,
           permissions: values.permissions,
+          disabledAt: values.disabledAt,
+          lockedUntil: values.lockedUntil,
+          failedLoginAttempts: values.failedLoginAttempts,
           updatedAt: now
         }
       });
     return user;
   }
 
-  async findByEmail(email: string): Promise<AuthUser | undefined> {
-    const rows = await this.db.select().from(framekitUsers).where(eq(framekitUsers.email, email.toLowerCase())).limit(1);
+  async findByEmail(email: string, tenantId?: string): Promise<AuthUser | undefined> {
+    const where = tenantId
+      ? and(eq(framekitUsers.tenantId, tenantId), eq(framekitUsers.email, email.toLowerCase()))
+      : eq(framekitUsers.email, email.toLowerCase());
+    const rows = await this.db.select().from(framekitUsers).where(where).limit(1);
     return rows[0] ? rowToUser(rows[0]) : undefined;
   }
 
@@ -225,6 +306,145 @@ export class PostgresUserStore implements UserStore {
       .where(and(eq(framekitUsers.tenantId, tenantId), eq(framekitUsers.id, userId)))
       .limit(1);
     return rows[0] ? rowToUser(rows[0]) : undefined;
+  }
+
+  async delete(tenantId: string, userId: string): Promise<void> {
+    await this.db.delete(framekitUsers).where(and(eq(framekitUsers.tenantId, tenantId), eq(framekitUsers.id, userId)));
+  }
+}
+
+export class PostgresRoleStore implements RoleStore {
+  private readonly db: PostgresJsDatabase;
+
+  constructor(options: PostgresRepositoryOptions) {
+    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+  }
+
+  async migrate(): Promise<void> {
+    await this.db.execute(drizzleSql.raw(createRoleTableSql()));
+  }
+
+  async list(tenantId: string): Promise<AuthRole[]> {
+    const rows = await this.db.select().from(framekitRoles).where(eq(framekitRoles.tenantId, tenantId));
+    return rows.map(rowToRole).sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  async upsert(role: AuthRole): Promise<AuthRole> {
+    const now = new Date();
+    const values = {
+      tenantId: role.tenantId,
+      id: role.id,
+      name: role.name,
+      permissions: role.permissions,
+      createdAt: role.createdAt ? new Date(role.createdAt) : now,
+      updatedAt: now
+    };
+    await this.db
+      .insert(framekitRoles)
+      .values(values)
+      .onConflictDoUpdate({
+        target: [framekitRoles.tenantId, framekitRoles.id],
+        set: {
+          name: values.name,
+          permissions: values.permissions,
+          updatedAt: now
+        }
+      });
+    return { ...role, createdAt: values.createdAt.toISOString(), updatedAt: values.updatedAt.toISOString() };
+  }
+
+  async delete(tenantId: string, roleId: string): Promise<void> {
+    await this.db.delete(framekitRoles).where(and(eq(framekitRoles.tenantId, tenantId), eq(framekitRoles.id, roleId)));
+  }
+}
+
+export class PostgresApiTokenStore implements ApiTokenStore {
+  private readonly db: PostgresJsDatabase;
+
+  constructor(options: PostgresRepositoryOptions) {
+    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+  }
+
+  async migrate(): Promise<void> {
+    await this.db.execute(drizzleSql.raw(createApiTokenTableSql()));
+  }
+
+  async list(tenantId: string): Promise<ApiTokenRecord[]> {
+    const rows = await this.db.select().from(framekitApiTokens).where(eq(framekitApiTokens.tenantId, tenantId));
+    return rows.map(rowToApiToken).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async findByTokenHash(tokenHash: string): Promise<ApiTokenRecord | undefined> {
+    const rows = await this.db.select().from(framekitApiTokens).where(eq(framekitApiTokens.tokenHash, tokenHash)).limit(1);
+    return rows[0] ? rowToApiToken(rows[0]) : undefined;
+  }
+
+  async create(token: ApiTokenRecord): Promise<ApiTokenRecord> {
+    await this.db.insert(framekitApiTokens).values({
+      tenantId: token.tenantId,
+      id: token.id,
+      name: token.name,
+      tokenHash: token.tokenHash,
+      userId: token.userId,
+      roles: token.roles,
+      permissions: token.permissions,
+      createdAt: new Date(token.createdAt),
+      expiresAt: token.expiresAt ? new Date(token.expiresAt) : null,
+      revokedAt: token.revokedAt ? new Date(token.revokedAt) : null
+    });
+    return token;
+  }
+
+  async revoke(tenantId: string, tokenId: string, revokedAt: string): Promise<ApiTokenRecord> {
+    const rows = await this.db
+      .update(framekitApiTokens)
+      .set({ revokedAt: new Date(revokedAt) })
+      .where(and(eq(framekitApiTokens.tenantId, tenantId), eq(framekitApiTokens.id, tokenId)))
+      .returning();
+    if (!rows[0]) {
+      throw new FramekitError("API_TOKEN_NOT_FOUND", `No API token with id "${tokenId}"`, 404);
+    }
+    return rowToApiToken(rows[0]);
+  }
+}
+
+export class PostgresSessionRevocationStore implements SessionRevocationStore {
+  private readonly db: PostgresJsDatabase;
+
+  constructor(options: PostgresRepositoryOptions) {
+    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+  }
+
+  async migrate(): Promise<void> {
+    await this.db.execute(drizzleSql.raw(createSessionRevocationTableSql()));
+  }
+
+  async revoke(sessionId: string, expiresAt: string): Promise<void> {
+    const revokedAt = new Date();
+    const expiresAtDate = new Date(expiresAt);
+    const existing = await this.db
+      .select()
+      .from(framekitSessionRevocations)
+      .where(eq(framekitSessionRevocations.sessionId, sessionId))
+      .limit(1);
+    if (existing[0]) {
+      await this.db
+        .update(framekitSessionRevocations)
+        .set({ expiresAt: expiresAtDate, revokedAt })
+        .where(eq(framekitSessionRevocations.sessionId, sessionId));
+      return;
+    }
+    await this.db.insert(framekitSessionRevocations).values({ sessionId, expiresAt: expiresAtDate, revokedAt });
+  }
+
+  async isRevoked(sessionId: string): Promise<boolean> {
+    const rows = await this.db
+      .select()
+      .from(framekitSessionRevocations)
+      .where(eq(framekitSessionRevocations.sessionId, sessionId))
+      .limit(1);
+    const row = rows[0];
+    return Boolean(row && row.expiresAt.getTime() > Date.now());
   }
 }
 
@@ -436,6 +656,44 @@ export class PostgresNamingSeriesStore implements NamingSeriesStore {
   }
 }
 
+export class PostgresMigrationStore implements MigrationStore {
+  private readonly db: PostgresJsDatabase;
+
+  constructor(options: PostgresRepositoryOptions) {
+    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+  }
+
+  async migrate(): Promise<void> {
+    await this.db.execute(drizzleSql.raw(createMigrationTableSql()));
+  }
+
+  describe(): RepositoryDiagnostics {
+    return {
+      kind: "postgres",
+      durable: true,
+      features: ["migration-history", "migration"]
+    };
+  }
+
+  async list(tenant: TenantContext): Promise<MigrationRecord[]> {
+    const rows = await this.db.select().from(framekitMigrations).where(eq(framekitMigrations.tenantId, tenant.tenantId));
+    return rows.map(rowToMigration).sort((a, b) => b.appliedAt.localeCompare(a.appliedAt));
+  }
+
+  async record(_tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord> {
+    await this.db.insert(framekitMigrations).values({
+      tenantId: migration.tenantId,
+      id: migration.id,
+      appName: migration.appName,
+      changes: migration.changes,
+      checksum: migration.checksum,
+      createdAt: new Date(migration.createdAt),
+      appliedAt: new Date(migration.appliedAt)
+    });
+    return migration;
+  }
+}
+
 export function createDocumentTableSql(): string {
   return `
 create table if not exists framekit_documents (
@@ -462,12 +720,65 @@ create table if not exists framekit_users (
   password_hash text not null,
   roles jsonb not null,
   permissions jsonb not null,
+  disabled_at timestamptz,
+  locked_until timestamptz,
+  failed_login_attempts integer not null default 0,
   created_at timestamptz not null,
   updated_at timestamptz not null,
   constraint framekit_users_identity unique (tenant_id, id),
   constraint framekit_users_email unique (tenant_id, email)
 );
+alter table framekit_users add column if not exists disabled_at timestamptz;
+alter table framekit_users add column if not exists locked_until timestamptz;
+alter table framekit_users add column if not exists failed_login_attempts integer not null default 0;
 create index if not exists framekit_users_lookup on framekit_users (tenant_id, email);
+`;
+}
+
+export function createRoleTableSql(): string {
+  return `
+create table if not exists framekit_roles (
+  tenant_id text not null,
+  id text not null,
+  name text not null,
+  permissions jsonb not null,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  constraint framekit_roles_identity unique (tenant_id, id)
+);
+create index if not exists framekit_roles_lookup on framekit_roles (tenant_id, name);
+`;
+}
+
+export function createApiTokenTableSql(): string {
+  return `
+create table if not exists framekit_api_tokens (
+  tenant_id text not null,
+  id text not null,
+  name text not null,
+  token_hash text not null,
+  user_id text,
+  roles jsonb not null,
+  permissions jsonb not null,
+  created_at timestamptz not null,
+  expires_at timestamptz,
+  revoked_at timestamptz,
+  constraint framekit_api_tokens_identity unique (tenant_id, id),
+  constraint framekit_api_tokens_hash unique (token_hash)
+);
+create index if not exists framekit_api_tokens_lookup on framekit_api_tokens (tenant_id, created_at desc);
+`;
+}
+
+export function createSessionRevocationTableSql(): string {
+  return `
+create table if not exists framekit_session_revocations (
+  session_id text not null,
+  expires_at timestamptz not null,
+  revoked_at timestamptz not null
+);
+create unique index if not exists framekit_session_revocations_identity on framekit_session_revocations (session_id);
+create index if not exists framekit_session_revocations_expiry on framekit_session_revocations (expires_at);
 `;
 }
 
@@ -549,6 +860,23 @@ create table if not exists framekit_naming_series (
 `;
 }
 
+export function createMigrationTableSql(): string {
+  return `
+create table if not exists framekit_migrations (
+  tenant_id text not null,
+  id text not null,
+  app_name text not null,
+  changes jsonb not null,
+  checksum text not null default '',
+  created_at timestamptz not null,
+  applied_at timestamptz not null,
+  constraint framekit_migrations_identity unique (tenant_id, id)
+);
+alter table framekit_migrations add column if not exists checksum text not null default '';
+create index if not exists framekit_migrations_lookup on framekit_migrations (tenant_id, applied_at desc);
+`;
+}
+
 function rowToRecord(row: typeof framekitDocuments.$inferSelect): DocumentRecord {
   return {
     tenantId: row.tenantId,
@@ -569,7 +897,48 @@ function rowToUser(row: typeof framekitUsers.$inferSelect): AuthUser {
     name: row.name,
     passwordHash: row.passwordHash,
     roles: row.roles,
-    permissions: row.permissions
+    permissions: row.permissions,
+    disabledAt: row.disabledAt?.toISOString(),
+    lockedUntil: row.lockedUntil?.toISOString(),
+    failedLoginAttempts: row.failedLoginAttempts
+  };
+}
+
+function rowToRole(row: typeof framekitRoles.$inferSelect): AuthRole {
+  return {
+    tenantId: row.tenantId,
+    id: row.id,
+    name: row.name,
+    permissions: row.permissions,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString()
+  };
+}
+
+function rowToApiToken(row: typeof framekitApiTokens.$inferSelect): ApiTokenRecord {
+  return {
+    tenantId: row.tenantId,
+    id: row.id,
+    name: row.name,
+    tokenHash: row.tokenHash,
+    userId: row.userId ?? undefined,
+    roles: row.roles,
+    permissions: row.permissions,
+    createdAt: row.createdAt.toISOString(),
+    expiresAt: row.expiresAt?.toISOString(),
+    revokedAt: row.revokedAt?.toISOString()
+  };
+}
+
+function rowToMigration(row: typeof framekitMigrations.$inferSelect): MigrationRecord {
+  return {
+    tenantId: row.tenantId,
+    id: row.id,
+    appName: row.appName,
+    changes: row.changes,
+    checksum: row.checksum,
+    createdAt: row.createdAt.toISOString(),
+    appliedAt: row.appliedAt.toISOString()
   };
 }
 

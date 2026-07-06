@@ -18,8 +18,32 @@ import {
 
 export type ListOptions = {
   limit?: number;
+  offset?: number;
+  cursor?: string;
+  fields?: string[];
   search?: string;
+  filters?: Record<string, FilterValue>;
+  sort?: {
+    field: string;
+    direction?: "asc" | "desc";
+  };
 };
+
+export type FilterPrimitive = string | number | boolean | null;
+
+export type FilterOperator = {
+  eq?: FilterPrimitive;
+  ne?: FilterPrimitive;
+  in?: FilterPrimitive[];
+  contains?: string;
+  gt?: number | string;
+  gte?: number | string;
+  lt?: number | string;
+  lte?: number | string;
+  isNull?: boolean;
+};
+
+export type FilterValue = FilterPrimitive | FilterPrimitive[] | FilterOperator;
 
 export type DocumentRepository = {
   list(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentRecord[]>;
@@ -89,6 +113,37 @@ export type NamingSeriesStore = {
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
+export type MigrationChange = {
+  kind: "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint";
+  doctype: string;
+  field: string;
+  destructive: boolean;
+  from?: unknown;
+  to?: unknown;
+  rollback?: MigrationRollback;
+};
+
+export type MigrationRollback = Omit<MigrationChange, "rollback">;
+
+export type MigrationPlan = {
+  id: string;
+  tenantId: string;
+  appName: string;
+  createdAt: string;
+  changes: MigrationChange[];
+  checksum: string;
+};
+
+export type MigrationRecord = MigrationPlan & {
+  appliedAt: string;
+};
+
+export type MigrationStore = {
+  list(tenant: TenantContext): Promise<MigrationRecord[]>;
+  record(tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord>;
+  describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
+};
+
 export type RuntimeRealtimeEvent = {
   channel: string;
   type: string;
@@ -97,6 +152,8 @@ export type RuntimeRealtimeEvent = {
 
 export type RealtimePublisher = {
   publish(event: RuntimeRealtimeEvent): Promise<void> | void;
+  list?(channel: string, options?: { limit?: number }): Promise<RuntimeRealtimeEvent[]> | RuntimeRealtimeEvent[];
+  subscribe?(channel: string, listener: (event: RuntimeRealtimeEvent) => void): () => void;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
@@ -106,6 +163,7 @@ export type RuntimeOptions = {
   outbox?: OutboxStore;
   customization?: CustomizationStore;
   namingSeries?: NamingSeriesStore;
+  migrations?: MigrationStore;
   realtime?: RealtimePublisher;
   idGenerator?: () => string;
   now?: () => Date;
@@ -118,6 +176,7 @@ export class FramekitRuntime {
   private readonly outbox: OutboxStore;
   private readonly customization: CustomizationStore;
   private readonly namingSeries: NamingSeriesStore;
+  private readonly migrations: MigrationStore;
   private readonly realtime: RealtimePublisher;
   private readonly idGenerator: () => string;
   private readonly now: () => Date;
@@ -129,6 +188,7 @@ export class FramekitRuntime {
     this.outbox = options.outbox ?? new InMemoryOutboxStore();
     this.customization = options.customization ?? new InMemoryCustomizationStore();
     this.namingSeries = options.namingSeries ?? new InMemoryNamingSeriesStore();
+    this.migrations = options.migrations ?? new InMemoryMigrationStore();
     this.realtime = options.realtime ?? new NoopRealtimePublisher();
     this.idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
     this.now = options.now ?? (() => new Date());
@@ -149,6 +209,7 @@ export class FramekitRuntime {
     const outbox = this.outbox.describe ? await this.outbox.describe() : { kind: "unknown", durable: false, features: [] };
     const customization = this.customization.describe ? await this.customization.describe() : { kind: "unknown", durable: false, features: [] };
     const namingSeries = this.namingSeries.describe ? await this.namingSeries.describe() : { kind: "unknown", durable: false, features: [] };
+    const migrations = this.migrations.describe ? await this.migrations.describe() : { kind: "unknown", durable: false, features: [] };
     const realtime = this.realtime.describe ? await this.realtime.describe() : { kind: "unknown", durable: false, features: [] };
     const doctypes = this.app.modules.flatMap((module) => module.doctypes);
     return {
@@ -161,6 +222,7 @@ export class FramekitRuntime {
       outbox,
       customization,
       namingSeries,
+      migrations,
       realtime,
       modules: this.app.modules.map((module) => ({
         id: module.id,
@@ -178,6 +240,110 @@ export class FramekitRuntime {
       })),
       warnings: createRuntimeWarnings(repository, audit, outbox, customization, namingSeries, doctypes)
     };
+  }
+
+  async migrationHistory(tenant: TenantContext): Promise<MigrationRecord[]> {
+    return this.migrations.list(tenant);
+  }
+
+  async realtimeEvents(tenant: TenantContext, options: { limit?: number } = {}): Promise<RuntimeRealtimeEvent[]> {
+    if (!this.realtime.list) {
+      return [];
+    }
+    return this.realtime.list(`tenant:${tenant.tenantId}:documents`, options);
+  }
+
+  subscribeRealtime(tenant: TenantContext, listener: (event: RuntimeRealtimeEvent) => void): () => void {
+    if (!this.realtime.subscribe) {
+      throw new FramekitError("REALTIME_STREAM_UNAVAILABLE", "Realtime streaming is not available for this app.", 501);
+    }
+    return this.realtime.subscribe(`tenant:${tenant.tenantId}:documents`, listener);
+  }
+
+  async planMigration(tenant: TenantContext, nextApp: AppDefinition): Promise<MigrationPlan> {
+    const parsed = defineApp(nextApp);
+    const changes: MigrationChange[] = [];
+    for (const nextDocType of parsed.modules.flatMap((module) => module.doctypes)) {
+      const currentDocType = this.app.modules.flatMap((module) => module.doctypes).find((doctype) => doctype.name === nextDocType.name);
+      if (!currentDocType) {
+        for (const field of nextDocType.fields) {
+          changes.push(migrationChange({ kind: "add_field", doctype: nextDocType.name, field: field.name, destructive: false, to: field }));
+          if (field.unique) {
+            changes.push(migrationChange({ kind: "add_unique_constraint", doctype: nextDocType.name, field: field.name, destructive: false, to: field.name }));
+          }
+        }
+        for (const index of nextDocType.indexes) {
+          changes.push(migrationChange({ kind: "add_index", doctype: nextDocType.name, field: indexKey(index), destructive: false, to: index }));
+        }
+        continue;
+      }
+      for (const field of nextDocType.fields) {
+        const currentField = currentDocType.fields.find((candidate) => candidate.name === field.name);
+        if (!currentField) {
+          changes.push(migrationChange({ kind: "add_field", doctype: nextDocType.name, field: field.name, destructive: false, to: field }));
+          if (field.unique) {
+            changes.push(migrationChange({ kind: "add_unique_constraint", doctype: nextDocType.name, field: field.name, destructive: false, to: field.name }));
+          }
+        } else if (currentField.type !== field.type) {
+          changes.push(migrationChange({ kind: "change_field_type", doctype: nextDocType.name, field: field.name, destructive: true, from: currentField.type, to: field.type }));
+        } else if (currentField.unique !== field.unique) {
+          changes.push(migrationChange({
+            kind: field.unique ? "add_unique_constraint" : "remove_unique_constraint",
+            doctype: nextDocType.name,
+            field: field.name,
+            destructive: false,
+            from: currentField.unique,
+            to: field.unique
+          }));
+        }
+      }
+      for (const field of currentDocType.fields) {
+        if (!nextDocType.fields.some((candidate) => candidate.name === field.name)) {
+          changes.push(migrationChange({ kind: "remove_field", doctype: nextDocType.name, field: field.name, destructive: true, from: field }));
+          if (field.unique) {
+            changes.push(migrationChange({ kind: "remove_unique_constraint", doctype: nextDocType.name, field: field.name, destructive: false, from: field.name }));
+          }
+        }
+      }
+      for (const index of nextDocType.indexes) {
+        if (!currentDocType.indexes.some((candidate) => indexKey(candidate) === indexKey(index))) {
+          changes.push(migrationChange({ kind: "add_index", doctype: nextDocType.name, field: indexKey(index), destructive: false, to: index }));
+        }
+      }
+      for (const index of currentDocType.indexes) {
+        if (!nextDocType.indexes.some((candidate) => indexKey(candidate) === indexKey(index))) {
+          changes.push(migrationChange({ kind: "remove_index", doctype: nextDocType.name, field: indexKey(index), destructive: false, from: index }));
+        }
+      }
+    }
+    const plan = {
+      id: this.idGenerator(),
+      tenantId: tenant.tenantId,
+      appName: parsed.name,
+      createdAt: this.now().toISOString(),
+      changes
+    };
+    return { ...plan, checksum: await migrationChecksum(plan) };
+  }
+
+  async applyMigration(tenant: TenantContext, plan: MigrationPlan, options: { allowDestructive?: boolean } = {}): Promise<MigrationRecord> {
+    const expectedChecksum = await migrationChecksum(plan);
+    if (plan.checksum !== expectedChecksum) {
+      throw new FramekitError("MIGRATION_CHECKSUM_MISMATCH", "Migration checksum does not match the planned changes.", 409, {
+        expected: expectedChecksum,
+        actual: plan.checksum
+      });
+    }
+    const destructive = plan.changes.filter((change) => change.destructive);
+    if (destructive.length > 0 && !options.allowDestructive) {
+      throw new FramekitError("DESTRUCTIVE_MIGRATION", "Migration contains destructive changes.", 409, destructive);
+    }
+    const record: MigrationRecord = {
+      ...plan,
+      tenantId: tenant.tenantId,
+      appliedAt: this.now().toISOString()
+    };
+    return this.migrations.record(tenant, record);
   }
 
   async customFields(tenant: TenantContext): Promise<CustomFieldDefinition[]> {
@@ -238,6 +404,7 @@ export class FramekitRuntime {
   async list(tenant: TenantContext, doctypeName: string, options?: ListOptions): Promise<DocumentRecord[]> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "read");
+    this.assertListOptions(doctype, options);
     return this.repository.list(tenant, doctype, options);
   }
 
@@ -256,6 +423,8 @@ export class FramekitRuntime {
     assertPermission(tenant, doctype, "create");
     const data = this.prepareInput(doctype, input, true);
     await this.runHooks("beforeValidate", tenant, doctype, undefined, data);
+    await this.assertLinksExist(tenant, doctype, data);
+    await this.assertUniqueFields(tenant, doctype, data);
     const state = doctype.workflow?.initialState;
     const timestamp = this.now().toISOString();
     const document: DocumentRecord = {
@@ -281,6 +450,8 @@ export class FramekitRuntime {
     assertPermission(tenant, doctype, "update");
     const existing = await this.get(tenant, doctypeName, id);
     const data = this.prepareInput(doctype, { ...existing.data, ...input }, false);
+    await this.assertLinksExist(tenant, doctype, data);
+    await this.assertUniqueFields(tenant, doctype, data, id);
     const updated: DocumentRecord = { ...existing, data, updatedAt: this.now().toISOString() };
     await this.runHooks("beforeUpdate", tenant, doctype, updated, data);
     const saved = await this.repository.update(tenant, doctype, updated);
@@ -355,6 +526,64 @@ export class FramekitRuntime {
       }
     }
     return output;
+  }
+
+  private assertListOptions(doctype: DocTypeDefinition, options: ListOptions = {}): void {
+    const validFields = new Set(doctype.fields.map((field) => field.name));
+    for (const [field, filter] of Object.entries(options.filters ?? {})) {
+      if (!validFields.has(field)) {
+        throw new FramekitError("UNKNOWN_FILTER_FIELD", `Unknown filter field "${field}" for ${doctype.name}`, 422);
+      }
+      assertFilterShape(doctype.name, field, filter);
+    }
+    if (options.sort && options.sort.field !== "id" && options.sort.field !== "createdAt" && options.sort.field !== "updatedAt" && !validFields.has(options.sort.field)) {
+      throw new FramekitError("UNKNOWN_SORT_FIELD", `Unknown sort field "${options.sort.field}" for ${doctype.name}`, 422);
+    }
+    const unknownProjectionFields = (options.fields ?? []).filter((field) => !validFields.has(field));
+    if (unknownProjectionFields.length > 0) {
+      throw new FramekitError("UNKNOWN_PROJECTION_FIELD", `Unknown projection fields for ${doctype.name}: ${unknownProjectionFields.join(", ")}`, 422);
+    }
+  }
+
+  private async assertLinksExist(tenant: TenantContext, doctype: DocTypeDefinition, data: DocumentData): Promise<void> {
+    for (const field of doctype.fields.filter((candidate) => candidate.type === "link" && candidate.linkTo)) {
+      const value = data[field.name];
+      if (value === undefined || value === null || value === "") {
+        continue;
+      }
+      const linkedDocType = await this.getEffectiveDocType(tenant, field.linkTo!);
+      const linked = await this.repository.get(tenant, linkedDocType, String(value));
+      if (!linked) {
+        throw new FramekitError("LINK_NOT_FOUND", `${doctype.name}.${field.name} references missing ${linkedDocType.name} "${String(value)}"`, 422, {
+          doctype: doctype.name,
+          field: field.name,
+          linkTo: linkedDocType.name,
+          value
+        });
+      }
+    }
+  }
+
+  private async assertUniqueFields(tenant: TenantContext, doctype: DocTypeDefinition, data: DocumentData, currentId?: string): Promise<void> {
+    for (const field of doctype.fields.filter((candidate) => candidate.unique)) {
+      const value = data[field.name];
+      if (value === undefined || value === null || value === "") {
+        continue;
+      }
+      const matches = await this.repository.list(tenant, doctype, {
+        filters: { [field.name]: { eq: filterPrimitive(value) } },
+        limit: 2
+      });
+      const conflict = matches.find((record) => record.id !== currentId);
+      if (conflict) {
+        throw new FramekitError("UNIQUE_CONSTRAINT_FAILED", `${doctype.name}.${field.name} must be unique`, 409, {
+          doctype: doctype.name,
+          field: field.name,
+          value,
+          conflictId: conflict.id
+        });
+      }
+    }
   }
 
   private async getEffectiveDocType(tenant: TenantContext, doctypeName: string): Promise<DocTypeDefinition> {
@@ -466,8 +695,7 @@ export class InMemoryDocumentRepository implements DocumentRepository {
 
   async list(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentRecord[]> {
     const records = [...this.records.values()].filter((record) => record.tenantId === tenant.tenantId && record.doctype === doctype.name);
-    const searched = options.search ? records.filter((record) => JSON.stringify(record.data).toLowerCase().includes(options.search!.toLowerCase())) : records;
-    return searched.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).slice(0, options.limit ?? 100);
+    return applyListOptions(records, options);
   }
 
   async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
@@ -623,6 +851,28 @@ export class InMemoryNamingSeriesStore implements NamingSeriesStore {
   }
 }
 
+export class InMemoryMigrationStore implements MigrationStore {
+  private readonly records: MigrationRecord[] = [];
+
+  describe(): RepositoryDiagnostics {
+    return {
+      kind: "memory",
+      durable: false,
+      features: ["migration-history"]
+    };
+  }
+
+  async list(tenant: TenantContext): Promise<MigrationRecord[]> {
+    return this.records.filter((record) => record.tenantId === tenant.tenantId).map(cloneMigrationRecord);
+  }
+
+  async record(tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord> {
+    const saved = { ...migration, tenantId: tenant.tenantId, changes: migration.changes.map((change) => ({ ...change })) };
+    this.records.push(saved);
+    return cloneMigrationRecord(saved);
+  }
+}
+
 export class NoopRealtimePublisher implements RealtimePublisher {
   describe(): RepositoryDiagnostics {
     return {
@@ -635,6 +885,10 @@ export class NoopRealtimePublisher implements RealtimePublisher {
   publish(): void {
     return undefined;
   }
+
+  list(): RuntimeRealtimeEvent[] {
+    return [];
+  }
 }
 
 export function createRuntime(app: AppDefinition, options?: RuntimeOptions): FramekitRuntime {
@@ -643,6 +897,67 @@ export function createRuntime(app: AppDefinition, options?: RuntimeOptions): Fra
 
 function keyFor(tenantId: string, doctype: string, id: string): string {
   return `${tenantId}:${doctype}:${id}`;
+}
+
+function migrationChange(change: Omit<MigrationChange, "rollback">): MigrationChange {
+  return { ...change, rollback: rollbackFor(change) };
+}
+
+function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollback {
+  switch (change.kind) {
+    case "add_field":
+      return { kind: "remove_field", doctype: change.doctype, field: change.field, destructive: true, from: change.to };
+    case "remove_field":
+      return { kind: "add_field", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+    case "change_field_type":
+      return { kind: "change_field_type", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
+    case "add_index":
+      return { kind: "remove_index", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
+    case "remove_index":
+      return { kind: "add_index", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+    case "add_unique_constraint":
+      return { kind: "remove_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
+    case "remove_unique_constraint":
+      return { kind: "add_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+  }
+}
+
+export async function migrationChecksum(plan: Pick<MigrationPlan, "tenantId" | "appName" | "changes">): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableJson({
+    tenantId: plan.tenantId,
+    appName: plan.appName,
+    changes: plan.changes
+  })));
+  return base64Url(new Uint8Array(digest));
+}
+
+function base64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableJson).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function indexKey(fields: string[]): string {
+  return fields.join(",");
+}
+
+function cloneMigrationRecord(record: MigrationRecord): MigrationRecord {
+  return {
+    ...record,
+    changes: record.changes.map((change) => ({ ...change }))
+  };
 }
 
 function coerceFieldValue(doctype: string, field: string, type: string, value: unknown, options?: string[]): unknown {
@@ -670,6 +985,149 @@ function coerceFieldValue(doctype: string, field: string, type: string, value: u
     default:
       return String(value);
   }
+}
+
+export function applyFilters(records: DocumentRecord[], filters: Record<string, FilterValue> = {}): DocumentRecord[] {
+  const entries = Object.entries(filters).filter(([, value]) => value !== undefined && value !== null && value !== "");
+  if (entries.length === 0) {
+    return records;
+  }
+  return records.filter((record) =>
+    entries.every(([field, expected]) => {
+      const actual = record.data[field];
+      return matchesFilter(actual, expected);
+    })
+  );
+}
+
+export function applyListOptions(records: DocumentRecord[], options: ListOptions = {}): DocumentRecord[] {
+  const searched = options.search ? records.filter((record) => JSON.stringify(record.data).toLowerCase().includes(options.search!.toLowerCase())) : records;
+  const sorted = sortRecords(applyFilters(searched, options.filters), options.sort);
+  const cursorOffset = options.cursor ? cursorIndex(sorted, options.cursor) : 0;
+  const offset = cursorOffset + (options.offset ?? 0);
+  const page = sorted.slice(offset, offset + (options.limit ?? 100));
+  return projectRecords(page, options.fields);
+}
+
+function cursorIndex(records: DocumentRecord[], cursor: string): number {
+  const index = records.findIndex((record) => record.id === cursor);
+  return index >= 0 ? index + 1 : records.length;
+}
+
+function projectRecords(records: DocumentRecord[], fields?: string[]): DocumentRecord[] {
+  if (!fields) {
+    return records.map((record) => ({ ...record, data: { ...record.data } }));
+  }
+  return records.map((record) => {
+    const data: DocumentData = {};
+    for (const field of fields) {
+      if (Object.prototype.hasOwnProperty.call(record.data, field)) {
+        data[field] = record.data[field];
+      }
+    }
+    return { ...record, data };
+  });
+}
+
+function matchesFilter(actual: unknown, expected: FilterValue): boolean {
+  if (isFilterOperator(expected)) {
+    if ("isNull" in expected && expected.isNull !== undefined) {
+      const isNull = actual === undefined || actual === null || actual === "";
+      if (isNull !== expected.isNull) {
+        return false;
+      }
+    }
+    if ("eq" in expected && !sameValue(actual, expected.eq)) {
+      return false;
+    }
+    if ("ne" in expected && sameValue(actual, expected.ne)) {
+      return false;
+    }
+    if ("in" in expected && expected.in && !expected.in.some((item) => sameValue(actual, item))) {
+      return false;
+    }
+    if ("contains" in expected && expected.contains !== undefined && !String(actual ?? "").toLowerCase().includes(expected.contains.toLowerCase())) {
+      return false;
+    }
+    if ("gt" in expected && expected.gt !== undefined && !(compareValues(actual, expected.gt) > 0)) {
+      return false;
+    }
+    if ("gte" in expected && expected.gte !== undefined && !(compareValues(actual, expected.gte) >= 0)) {
+      return false;
+    }
+    if ("lt" in expected && expected.lt !== undefined && !(compareValues(actual, expected.lt) < 0)) {
+      return false;
+    }
+    if ("lte" in expected && expected.lte !== undefined && !(compareValues(actual, expected.lte) <= 0)) {
+      return false;
+    }
+    return true;
+  }
+  if (Array.isArray(expected)) {
+    return expected.some((item) => sameValue(actual, item));
+  }
+  return sameValue(actual, expected);
+}
+
+function assertFilterShape(doctype: string, field: string, filter: FilterValue): void {
+  if (!isFilterOperator(filter)) {
+    return;
+  }
+  const allowed = new Set(["eq", "ne", "in", "contains", "gt", "gte", "lt", "lte", "isNull"]);
+  const unknown = Object.keys(filter).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) {
+    throw new FramekitError("UNKNOWN_FILTER_OPERATOR", `Unknown filter operator for ${doctype}.${field}: ${unknown.join(", ")}`, 422);
+  }
+  if (filter.in !== undefined && !Array.isArray(filter.in)) {
+    throw new FramekitError("INVALID_FILTER", `${doctype}.${field}.in must be an array`, 422);
+  }
+}
+
+function isFilterOperator(value: unknown): value is FilterOperator {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return String(left) === String(right);
+}
+
+function compareValues(left: unknown, right: unknown): number {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
+    return leftNumber - rightNumber;
+  }
+  return String(left ?? "").localeCompare(String(right ?? ""), undefined, { numeric: true });
+}
+
+function filterPrimitive(value: unknown): FilterPrimitive {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean" || value === null) {
+    return value;
+  }
+  return String(value);
+}
+
+export function sortRecords(records: DocumentRecord[], sort: ListOptions["sort"] = { field: "updatedAt", direction: "desc" }): DocumentRecord[] {
+  const direction = sort.direction === "asc" ? 1 : -1;
+  return [...records].sort((left, right) => {
+    const leftValue = sortableValue(left, sort.field);
+    const rightValue = sortableValue(right, sort.field);
+    return direction * leftValue.localeCompare(rightValue, undefined, { numeric: true });
+  });
+}
+
+function sortableValue(record: DocumentRecord, field: string): string {
+  if (field === "id") {
+    return record.id;
+  }
+  if (field === "createdAt") {
+    return record.createdAt;
+  }
+  if (field === "updatedAt") {
+    return record.updatedAt;
+  }
+  const value = record.data[field];
+  return value === undefined || value === null ? "" : String(value);
 }
 
 function createRuntimeWarnings(

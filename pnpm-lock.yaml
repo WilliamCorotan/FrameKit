@@ -84,6 +84,15 @@ importers:
 
   packages/cli:
     dependencies:
+      '@framekit/core':
+        specifier: workspace:*
+        version: link:../core
+      '@framekit/runtime':
+        specifier: workspace:*
+        version: link:../runtime
+      '@framekit/sdk':
+        specifier: workspace:*
+        version: link:../sdk
       tsx:
         specifier: ^4.22.4
         version: 4.22.4

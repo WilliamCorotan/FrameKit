@@ -1,21 +1,33 @@
-export type RealtimeEvent<TPayload = unknown> = {
+export type RealtimeEvent<TPayload = Record<string, unknown>> = {
   channel: string;
   type: string;
   payload: TPayload;
 };
 
 export type EventBus = {
-  publish<TPayload>(event: RealtimeEvent<TPayload>): Promise<void>;
+  publish<TPayload extends Record<string, unknown>>(event: RealtimeEvent<TPayload>): Promise<void>;
   subscribe(channel: string, listener: (event: RealtimeEvent) => void): () => void;
 };
 
 export class InMemoryEventBus implements EventBus {
   private readonly listeners = new Map<string, Set<(event: RealtimeEvent) => void>>();
+  private readonly events: RealtimeEvent[] = [];
 
-  async publish<TPayload>(event: RealtimeEvent<TPayload>): Promise<void> {
+  async publish<TPayload extends Record<string, unknown>>(event: RealtimeEvent<TPayload>): Promise<void> {
+    this.events.push(event);
+    if (this.events.length > 1_000) {
+      this.events.splice(0, this.events.length - 1_000);
+    }
     for (const listener of this.listeners.get(event.channel) ?? []) {
       listener(event);
     }
+  }
+
+  list(channel: string, options: { limit?: number } = {}): RealtimeEvent[] {
+    return this.events
+      .filter((event) => event.channel === channel)
+      .slice(-(options.limit ?? 100))
+      .reverse();
   }
 
   subscribe(channel: string, listener: (event: RealtimeEvent) => void): () => void {
@@ -29,7 +41,7 @@ export class InMemoryEventBus implements EventBus {
     return {
       kind: "memory",
       durable: false,
-      features: ["publish", "subscribe"]
+      features: ["publish", "subscribe", "history"]
     };
   }
 }

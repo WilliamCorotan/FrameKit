@@ -2,32 +2,93 @@ import { defineEventHandler, getQuery, getRouterParam, readBody, setResponseStat
 import { bearerToken, type PasswordAuthService } from "@framekit/auth";
 import { FramekitError, type TenantContext } from "@framekit/core";
 import { createOpenApiDocument } from "@framekit/openapi";
-import type { FramekitRuntime } from "@framekit/runtime";
+import type { FilterValue, FramekitRuntime } from "@framekit/runtime";
 
 export type NitroAdapterOptions = {
   basePath?: string;
   serverUrl?: string;
   auth?: PasswordAuthService;
+  logger?: NitroRequestLogger;
+  metrics?: NitroMetricsSink;
+  rateLimit?: NitroRateLimitOptions | NitroRateLimiter | false;
+  healthChecks?: Record<string, NitroHealthCheck>;
 };
+
+export type NitroRequestTelemetry = {
+  requestId: string;
+  method: string;
+  path: string;
+  statusCode: number;
+  durationMs: number;
+};
+
+export type NitroRequestLogger = {
+  info(event: NitroRequestTelemetry): void | Promise<void>;
+  error?(event: NitroRequestTelemetry & { error: unknown }): void | Promise<void>;
+};
+
+export type NitroMetricsSink = {
+  observeRequest(event: NitroRequestTelemetry): void | Promise<void>;
+};
+
+export type NitroRateLimitOptions = {
+  windowMs: number;
+  max: number;
+  key?: (request: Request) => string;
+};
+
+export type NitroRateLimiter = {
+  allow(input: { key: string; request: Request; method: string; path: string }): boolean | Promise<boolean>;
+};
+
+export type NitroHealthCheckResult = {
+  ok: boolean;
+  details?: unknown;
+};
+
+export type NitroHealthCheck = () => NitroHealthCheckResult | Promise<NitroHealthCheckResult>;
 
 export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapterOptions = {}): EventHandler {
   const basePath = options.basePath ?? "/api";
+  const rateLimiter = createRateLimiter(options.rateLimit);
 
   return defineEventHandler(async (event) => {
+    const startedAt = performance.now();
+    const requestId = event.req.headers.get("x-request-id") ?? crypto.randomUUID();
+    const path = event.url.pathname;
+    const method = event.req.method ?? "GET";
+    let statusCode = 200;
+    let thrown: unknown;
     try {
       event.res.headers.set("access-control-allow-origin", "*");
       event.res.headers.set("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
-      event.res.headers.set("access-control-allow-headers", "content-type,x-tenant-id,x-user-id,x-roles,x-permissions");
-      const path = event.url.pathname;
-      const method = event.req.method ?? "GET";
+      event.res.headers.set("access-control-allow-headers", "authorization,content-type,x-tenant-id,x-user-id,x-roles,x-permissions");
+      event.res.headers.set("x-request-id", requestId);
+      event.res.headers.set("x-content-type-options", "nosniff");
+      event.res.headers.set("referrer-policy", "no-referrer");
+      event.res.headers.set("x-frame-options", "DENY");
 
       if (method === "OPTIONS") {
+        statusCode = 204;
         setResponseStatus(event, 204);
         return null;
       }
 
+      if (rateLimiter && !(await rateLimiter.allow({ key: requestKey(event.req), request: event.req, method, path }))) {
+        statusCode = 429;
+        throw new FramekitError("RATE_LIMITED", "Too many requests.", 429);
+      }
+
       if (method === "GET" && path === "/health") {
         return { ok: true, app: runtime.app.name, version: runtime.app.version };
+      }
+      if (method === "GET" && path === "/health/dependencies") {
+        const health = await runHealthChecks(options.healthChecks ?? {});
+        if (!health.ok) {
+          statusCode = 503;
+          setResponseStatus(event, 503);
+        }
+        return health;
       }
       if (method === "GET" && path === basePath + "/meta") {
         return await runtime.metadata(await tenantFromRequest(event.req, options.auth));
@@ -40,7 +101,16 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         if (!body.email || !body.password) {
           throw new FramekitError("VALIDATION_FAILED", "Email and password are required.", 422);
         }
-        return await options.auth.login(body.email, body.password);
+        return await options.auth.login(body.email, body.password, event.req.headers.get("x-tenant-id") ?? "default");
+      }
+      const providerLogin = matchProviderLoginPath(path, basePath);
+      if (method === "POST" && providerLogin) {
+        const auth = requireAuth(options.auth);
+        const body = ((await readBody(event)) ?? {}) as { token?: string };
+        if (!body.token) {
+          throw new FramekitError("VALIDATION_FAILED", "token is required.", 422);
+        }
+        return await auth.loginWithProvider(providerLogin.providerId, body.token, event.req.headers.get("x-tenant-id") ?? "default");
       }
       if (method === "GET" && path === basePath + "/auth/me") {
         if (!options.auth) {
@@ -50,15 +120,209 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         if (!token) {
           throw new FramekitError("UNAUTHENTICATED", "Missing Bearer token.", 401);
         }
-        const session = await options.auth.verifyToken(token);
-        return {
-          user: session.user,
-          context: session.context,
-          expiresAt: session.expiresAt
-        };
+        const session = await options.auth.verifyBearerToken(token);
+        return "apiToken" in session
+          ? {
+              apiToken: session.apiToken,
+              user: session.user,
+              context: session.context
+            }
+          : {
+              sessionId: session.sessionId,
+              user: session.user,
+              context: session.context,
+              expiresAt: session.expiresAt
+            };
+      }
+      if (method === "POST" && path === basePath + "/auth/refresh") {
+        const auth = requireAuth(options.auth);
+        const token = bearerToken(event.req.headers.get("authorization"));
+        if (!token) {
+          throw new FramekitError("UNAUTHENTICATED", "Missing Bearer token.", 401);
+        }
+        return await auth.refreshSession(token);
+      }
+      if (method === "POST" && path === basePath + "/auth/logout") {
+        const auth = requireAuth(options.auth);
+        const token = bearerToken(event.req.headers.get("authorization"));
+        if (!token) {
+          throw new FramekitError("UNAUTHENTICATED", "Missing Bearer token.", 401);
+        }
+        await auth.revokeSession(token);
+        setResponseStatus(event, 204);
+        return null;
+      }
+      if (method === "POST" && path === basePath + "/auth/password/change") {
+        const auth = requireAuth(options.auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth);
+        const body = ((await readBody(event)) ?? {}) as { currentPassword?: string; newPassword?: string };
+        if (!body.currentPassword || !body.newPassword) {
+          throw new FramekitError("VALIDATION_FAILED", "currentPassword and newPassword are required.", 422);
+        }
+        await auth.changePassword(tenant.tenantId, tenant.userId, body.currentPassword, body.newPassword);
+        setResponseStatus(event, 204);
+        return null;
+      }
+      const passwordReset = matchUserPasswordPath(path, basePath);
+      if (method === "POST" && passwordReset) {
+        const auth = requireAuth(options.auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth);
+        assertAuthManager(tenant);
+        const body = ((await readBody(event)) ?? {}) as { newPassword?: string };
+        if (!body.newPassword) {
+          throw new FramekitError("VALIDATION_FAILED", "newPassword is required.", 422);
+        }
+        await auth.resetPassword(tenant.tenantId, passwordReset.userId, body.newPassword);
+        setResponseStatus(event, 204);
+        return null;
+      }
+      if (method === "GET" && path === basePath + "/auth/audit") {
+        const auth = requireAuth(options.auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth);
+        assertAuthManager(tenant);
+        return await auth.authAuditEvents(tenant.tenantId);
+      }
+      const authAction = matchAuthManagementPath(path, basePath);
+      if (authAction) {
+        const auth = requireAuth(options.auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth);
+        assertAuthManager(tenant);
+
+        if (authAction.resource === "users") {
+          if (method === "GET" && !authAction.id) {
+            return await auth.listUsers(tenant.tenantId);
+          }
+          if ((method === "POST" && !authAction.id) || ((method === "PATCH" || method === "PUT") && authAction.id)) {
+            const body = ((await readBody(event)) ?? {}) as Partial<{
+              id: string;
+              email: string;
+              name: string;
+              password: string;
+              roles: string[];
+              permissions: string[];
+              disabledAt: string;
+              lockedUntil: string;
+            }>;
+            if (!body.email || !body.name || !Array.isArray(body.roles) || !Array.isArray(body.permissions)) {
+              throw new FramekitError("VALIDATION_FAILED", "email, name, roles, and permissions are required.", 422);
+            }
+            const user = await auth.upsertUser({
+              tenantId: tenant.tenantId,
+              id: authAction.id ?? body.id,
+              email: body.email,
+              name: body.name,
+              password: body.password,
+              roles: body.roles,
+              permissions: body.permissions,
+              disabledAt: body.disabledAt,
+              lockedUntil: body.lockedUntil
+            });
+            if (method === "POST") {
+              setResponseStatus(event, 201);
+            }
+            return user;
+          }
+          if (method === "DELETE" && authAction.id) {
+            await auth.deleteUser(tenant.tenantId, authAction.id);
+            setResponseStatus(event, 204);
+            return null;
+          }
+        }
+
+        if (authAction.resource === "roles") {
+          if (method === "GET" && !authAction.id) {
+            return await auth.listRoles(tenant.tenantId);
+          }
+          if ((method === "POST" && !authAction.id) || ((method === "PATCH" || method === "PUT") && authAction.id)) {
+            const body = ((await readBody(event)) ?? {}) as Partial<{ id: string; name: string; permissions: string[] }>;
+            const id = authAction.id ?? body.id;
+            if (!id || !body.name || !Array.isArray(body.permissions)) {
+              throw new FramekitError("VALIDATION_FAILED", "id, name, and permissions are required.", 422);
+            }
+            const role = await auth.upsertRole({
+              tenantId: tenant.tenantId,
+              id,
+              name: body.name,
+              permissions: body.permissions
+            });
+            if (method === "POST") {
+              setResponseStatus(event, 201);
+            }
+            return role;
+          }
+          if (method === "DELETE" && authAction.id) {
+            await auth.deleteRole(tenant.tenantId, authAction.id);
+            setResponseStatus(event, 204);
+            return null;
+          }
+        }
+
+        if (authAction.resource === "tokens") {
+          if (method === "GET" && !authAction.id) {
+            return await auth.listApiTokens(tenant.tenantId);
+          }
+          if (method === "POST" && !authAction.id) {
+            const body = ((await readBody(event)) ?? {}) as Partial<{
+              id: string;
+              name: string;
+              userId: string;
+              roles: string[];
+              permissions: string[];
+              expiresAt: string;
+            }>;
+            if (!body.name || !Array.isArray(body.roles) || !Array.isArray(body.permissions)) {
+              throw new FramekitError("VALIDATION_FAILED", "name, roles, and permissions are required.", 422);
+            }
+            setResponseStatus(event, 201);
+            return await auth.createApiToken({
+              tenantId: tenant.tenantId,
+              id: body.id,
+              name: body.name,
+              userId: body.userId,
+              roles: body.roles,
+              permissions: body.permissions,
+              expiresAt: body.expiresAt
+            });
+          }
+          if (method === "DELETE" && authAction.id) {
+            const revoked = await auth.revokeApiToken(tenant.tenantId, authAction.id);
+            return revoked;
+          }
+        }
+
+        throw new FramekitError("METHOD_NOT_ALLOWED", "Method not allowed", 405);
       }
       if (method === "GET" && path === basePath + "/diagnostics") {
         return await runtime.diagnostics();
+      }
+      if (method === "GET" && path === basePath + "/migrations") {
+        return await runtime.migrationHistory(await tenantFromRequest(event.req, options.auth));
+      }
+      if (method === "GET" && path === basePath + "/realtime/events") {
+        const query = getQuery(event);
+        return await runtime.realtimeEvents(await tenantFromRequest(event.req, options.auth), {
+          limit: typeof query.limit === "string" ? Number(query.limit) : undefined
+        });
+      }
+      if (method === "GET" && path === basePath + "/realtime/stream") {
+        const tenant = await tenantFromRequest(event.req, options.auth);
+        return createRealtimeStream(runtime, tenant, event.req.signal);
+      }
+      if (method === "POST" && path === basePath + "/migrations/plan") {
+        const tenant = await tenantFromRequest(event.req, options.auth);
+        const body = ((await readBody(event)) ?? {}) as { app?: unknown };
+        if (!body.app || typeof body.app !== "object") {
+          throw new FramekitError("VALIDATION_FAILED", "app is required.", 422);
+        }
+        return await runtime.planMigration(tenant, body.app as never);
+      }
+      if (method === "POST" && path === basePath + "/migrations/apply") {
+        const tenant = await tenantFromRequest(event.req, options.auth);
+        const body = ((await readBody(event)) ?? {}) as { plan?: unknown; allowDestructive?: boolean };
+        if (!body.plan || typeof body.plan !== "object") {
+          throw new FramekitError("VALIDATION_FAILED", "plan is required.", 422);
+        }
+        return await runtime.applyMigration(tenant, body.plan as never, { allowDestructive: body.allowDestructive });
       }
       if (method === "GET" && path === basePath + "/audit") {
         const tenant = await tenantFromRequest(event.req, options.auth);
@@ -124,7 +388,12 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         const query = getQuery(event);
         return await runtime.list(tenant, match.doctype, {
           search: typeof query.search === "string" ? query.search : undefined,
-          limit: typeof query.limit === "string" ? Number(query.limit) : undefined
+          limit: typeof query.limit === "string" ? Number(query.limit) : undefined,
+          offset: typeof query.offset === "string" ? Number(query.offset) : undefined,
+          cursor: typeof query.cursor === "string" ? query.cursor : undefined,
+          fields: parseFields(query.fields),
+          filters: parseFilters(query.filters),
+          sort: parseSort(query.sort)
         });
       }
       if (method === "GET" && match.id) {
@@ -149,9 +418,25 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
 
       throw new FramekitError("METHOD_NOT_ALLOWED", "Method not allowed", 405);
     } catch (error) {
+      thrown = error;
       const response = toErrorResponse(error);
+      statusCode = response.statusCode;
       setResponseStatus(event, response.statusCode);
       return response.body;
+    } finally {
+      const telemetry = {
+        requestId,
+        method,
+        path,
+        statusCode,
+        durationMs: Math.round((performance.now() - startedAt) * 100) / 100
+      };
+      await options.metrics?.observeRequest(telemetry);
+      if (thrown && options.logger?.error) {
+        await options.logger.error({ ...telemetry, error: thrown });
+      } else {
+        await options.logger?.info(telemetry);
+      }
     }
   });
 }
@@ -190,14 +475,59 @@ function matchOutboxPath(path: string, basePath: string): { id: string; action: 
   return { id, action };
 }
 
+function matchAuthManagementPath(path: string, basePath: string): { resource: "users" | "roles" | "tokens"; id?: string } | undefined {
+  const prefix = `${basePath}/auth/`;
+  if (!path.startsWith(prefix)) {
+    return undefined;
+  }
+  const [resource, id] = path.slice(prefix.length).split("/").filter(Boolean);
+  if (resource !== "users" && resource !== "roles" && resource !== "tokens") {
+    return undefined;
+  }
+  return id ? { resource, id } : { resource };
+}
+
+function matchProviderLoginPath(path: string, basePath: string): { providerId: string } | undefined {
+  const prefix = `${basePath}/auth/providers/`;
+  if (!path.startsWith(prefix)) {
+    return undefined;
+  }
+  const [providerId, operation] = path.slice(prefix.length).split("/").filter(Boolean);
+  return providerId && operation === "login" ? { providerId } : undefined;
+}
+
+function matchUserPasswordPath(path: string, basePath: string): { userId: string } | undefined {
+  const prefix = `${basePath}/auth/users/`;
+  if (!path.startsWith(prefix)) {
+    return undefined;
+  }
+  const [userId, operation] = path.slice(prefix.length).split("/").filter(Boolean);
+  return userId && operation === "password" ? { userId } : undefined;
+}
+
 function isOutboxStatus(value: unknown): value is "pending" | "dispatched" | "failed" {
   return value === "pending" || value === "dispatched" || value === "failed";
+}
+
+function requireAuth(auth: PasswordAuthService | undefined): PasswordAuthService {
+  if (!auth) {
+    throw new FramekitError("AUTH_NOT_CONFIGURED", "Auth is not configured for this app.", 501);
+  }
+  return auth;
+}
+
+async function authenticatedTenantFromRequest(request: Request, auth: PasswordAuthService): Promise<TenantContext> {
+  const token = bearerToken(request.headers.get("authorization"));
+  if (!token) {
+    throw new FramekitError("UNAUTHENTICATED", "Missing Bearer token.", 401);
+  }
+  return (await auth.verifyBearerToken(token)).context;
 }
 
 async function tenantFromRequest(request: Request, auth?: PasswordAuthService): Promise<TenantContext> {
   const token = bearerToken(request.headers.get("authorization"));
   if (token && auth) {
-    const session = await auth.verifyToken(token);
+    const session = await auth.verifyBearerToken(token);
     return session.context;
   }
   return {
@@ -208,8 +538,146 @@ async function tenantFromRequest(request: Request, auth?: PasswordAuthService): 
   };
 }
 
+function assertAuthManager(tenant: TenantContext): void {
+  if (tenant.permissions.includes("*") || tenant.permissions.includes("framekit.auth.manage") || tenant.roles.includes("administrator")) {
+    return;
+  }
+  throw new FramekitError("FORBIDDEN", "Missing permission to manage authentication resources.", 403);
+}
+
 function splitHeader(value: string | null): string[] | undefined {
   return value ? value.split(",").map((part) => part.trim()).filter(Boolean) : undefined;
+}
+
+function createRateLimiter(option: NitroAdapterOptions["rateLimit"]): NitroRateLimiter | undefined {
+  if (!option) {
+    return undefined;
+  }
+  if ("allow" in option) {
+    return option;
+  }
+  const buckets = new Map<string, { count: number; resetsAt: number }>();
+  return {
+    allow({ request }) {
+      const key = option.key?.(request) ?? requestKey(request);
+      const now = Date.now();
+      const current = buckets.get(key);
+      if (!current || current.resetsAt <= now) {
+        buckets.set(key, { count: 1, resetsAt: now + option.windowMs });
+        return true;
+      }
+      current.count += 1;
+      return current.count <= option.max;
+    }
+  };
+}
+
+function requestKey(request: Request): string {
+  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || request.headers.get("x-real-ip") || "local";
+}
+
+async function runHealthChecks(checks: Record<string, NitroHealthCheck>) {
+  const entries = await Promise.all(Object.entries(checks).map(async ([name, check]) => {
+    try {
+      return [name, await check()] as const;
+    } catch (error) {
+      return [name, { ok: false, details: error instanceof Error ? error.message : String(error) }] as const;
+    }
+  }));
+  const dependencies = Object.fromEntries(entries);
+  return {
+    ok: Object.values(dependencies).every((result) => result.ok),
+    dependencies
+  };
+}
+
+function parseFilters(value: unknown): Record<string, FilterValue> | undefined {
+  if (typeof value !== "string" || value.trim() === "") {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value) as unknown;
+  } catch {
+    throw new FramekitError("VALIDATION_FAILED", "filters must be valid JSON.", 422);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new FramekitError("VALIDATION_FAILED", "filters must be a JSON object.", 422);
+  }
+  const filters: Record<string, FilterValue> = {};
+  for (const [field, filter] of Object.entries(parsed)) {
+    filters[field] = toFilterValue(filter);
+  }
+  return filters;
+}
+
+function parseSort(value: unknown): { field: string; direction?: "asc" | "desc" } | undefined {
+  if (typeof value !== "string" || value.trim() === "") {
+    return undefined;
+  }
+  const [field, rawDirection] = value.split(":");
+  const direction = rawDirection === "asc" || rawDirection === "desc" ? rawDirection : undefined;
+  if (!field || (direction && direction !== "asc" && direction !== "desc")) {
+    throw new FramekitError("VALIDATION_FAILED", "sort must be formatted as field:asc or field:desc.", 422);
+  }
+  if (rawDirection && !direction) {
+    throw new FramekitError("VALIDATION_FAILED", "sort must be formatted as field:asc or field:desc.", 422);
+  }
+  return direction ? { field, direction } : { field };
+}
+
+function parseFields(value: unknown): string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const raw = Array.isArray(value) ? value.join(",") : String(value);
+  const fields = raw.split(",").map((field) => field.trim()).filter(Boolean);
+  return fields.length > 0 ? [...new Set(fields)] : undefined;
+}
+
+function toFilterValue(value: unknown): FilterValue {
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      if (item === null || typeof item === "string" || typeof item === "number" || typeof item === "boolean") {
+        return item;
+      }
+      throw new FramekitError("VALIDATION_FAILED", "filter arrays may only contain primitive values.", 422);
+    });
+  }
+  if (value && typeof value === "object") {
+    return value as FilterValue;
+  }
+  throw new FramekitError("VALIDATION_FAILED", "filters may only contain primitive values, arrays, or operator objects.", 422);
+}
+
+function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal): Response {
+  const encoder = new TextEncoder();
+  let unsubscribe: (() => void) | undefined;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode("retry: 3000\n\n"));
+      unsubscribe = runtime.subscribeRealtime(tenant, (event) => {
+        controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event.payload)}\n\n`));
+      });
+      signal.addEventListener("abort", () => {
+        unsubscribe?.();
+        controller.close();
+      }, { once: true });
+    },
+    cancel() {
+      unsubscribe?.();
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive"
+    }
+  });
 }
 
 function toErrorResponse(error: unknown): { statusCode: number; body: { error: true; code: string; message: string; details?: unknown } } {

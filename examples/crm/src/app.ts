@@ -1,7 +1,18 @@
-import { hashPassword, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
+import { hashPassword, InMemoryApiTokenStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
 import { createRuntime } from "@framekit/runtime";
-import { PostgresAuditStore, PostgresCustomizationStore, PostgresDocumentRepository, PostgresNamingSeriesStore, PostgresOutboxStore, PostgresUserStore } from "@framekit/db";
+import {
+  PostgresApiTokenStore,
+  PostgresAuditStore,
+  PostgresCustomizationStore,
+  PostgresDocumentRepository,
+  PostgresMigrationStore,
+  PostgresNamingSeriesStore,
+  PostgresOutboxStore,
+  PostgresRoleStore,
+  PostgresSessionRevocationStore,
+  PostgresUserStore
+} from "@framekit/db";
 import { InMemoryEventBus } from "@framekit/realtime";
 
 export const customerDocType = defineDocType({
@@ -106,7 +117,11 @@ const audit = await createAuditStore();
 const outbox = await createOutboxStore();
 const customization = await createCustomizationStore();
 const namingSeries = await createNamingSeriesStore();
+const migrations = await createMigrationStore();
 const userStore = await createUserStore();
+const roleStore = await createRoleStore();
+const apiTokenStore = await createApiTokenStore();
+const sessionRevocations = await createSessionRevocationStore();
 export const eventBus = new InMemoryEventBus();
 export const runtime = createRuntime(app, {
   ...(repository ? { repository } : {}),
@@ -114,11 +129,15 @@ export const runtime = createRuntime(app, {
   ...(outbox ? { outbox } : {}),
   ...(customization ? { customization } : {}),
   ...(namingSeries ? { namingSeries } : {}),
+  ...(migrations ? { migrations } : {}),
   realtime: eventBus
 });
 export const auth = new PasswordAuthService({
   secret: process.env.FRAMEKIT_AUTH_SECRET ?? "development-secret-change-me",
-  userStore
+  userStore,
+  roleStore,
+  apiTokenStore,
+  sessionRevocations
 });
 
 const admin: TenantContext = {
@@ -214,6 +233,17 @@ async function createNamingSeriesStore() {
   return namingSeries;
 }
 
+async function createMigrationStore() {
+  if (!process.env.DATABASE_URL) {
+    return undefined;
+  }
+  const migrations = new PostgresMigrationStore({
+    connectionString: process.env.DATABASE_URL
+  });
+  await migrations.migrate();
+  return migrations;
+}
+
 async function createUserStore() {
   const admin = {
     id: "admin",
@@ -234,5 +264,45 @@ async function createUserStore() {
   if (!(await store.findByEmail(admin.email))) {
     await store.upsert(admin);
   }
+  return store;
+}
+
+async function createRoleStore() {
+  const administrator = {
+    id: "administrator",
+    tenantId: "default",
+    name: "Administrator",
+    permissions: ["*"]
+  };
+  if (!process.env.DATABASE_URL) {
+    return new InMemoryRoleStore([administrator]);
+  }
+  const store = new PostgresRoleStore({
+    connectionString: process.env.DATABASE_URL
+  });
+  await store.migrate();
+  await store.upsert(administrator);
+  return store;
+}
+
+async function createApiTokenStore() {
+  if (!process.env.DATABASE_URL) {
+    return new InMemoryApiTokenStore([]);
+  }
+  const store = new PostgresApiTokenStore({
+    connectionString: process.env.DATABASE_URL
+  });
+  await store.migrate();
+  return store;
+}
+
+async function createSessionRevocationStore() {
+  if (!process.env.DATABASE_URL) {
+    return undefined;
+  }
+  const store = new PostgresSessionRevocationStore({
+    connectionString: process.env.DATABASE_URL
+  });
+  await store.migrate();
   return store;
 }
