@@ -13,6 +13,7 @@
     "release:candidate": "node scripts/release-candidate.mjs",
     "release:candidate:check": "node scripts/release-candidate.mjs --check",
     "test": "vitest run",
+    "test:desk:browser": "pnpm --filter @framekit/desk test:browser",
     "typecheck": "pnpm -r --if-present typecheck",
     "audit:all": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
   },
