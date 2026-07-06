@@ -63,7 +63,7 @@ pnpm --filter @framekit/cli framekit generate-migration examples/crm/src/app.ts 
 
 ## API Overview
 
-System and contracts:
+System, contracts, migrations, realtime, and operations:
 
 ```txt
 GET  /health
@@ -78,7 +78,9 @@ GET  /api/realtime/stream
 GET  /api/openapi.json
 ```
 
-Auth:
+`/health/dependencies` runs adapter-provided dependency checks, for example Postgres, Redis, queues, or downstream services.
+
+Auth lifecycle, provider login, audit, and admin APIs:
 
 ```txt
 POST /api/auth/login
@@ -91,11 +93,13 @@ GET  /api/auth/audit
 GET  /api/auth/users
 POST /api/auth/users
 PATCH /api/auth/users/{id}
+PUT  /api/auth/users/{id}
 DELETE /api/auth/users/{id}
 POST /api/auth/users/{id}/password
 GET  /api/auth/roles
 POST /api/auth/roles
 PATCH /api/auth/roles/{id}
+PUT  /api/auth/roles/{id}
 DELETE /api/auth/roles/{id}
 GET  /api/auth/tokens
 POST /api/auth/tokens
@@ -143,6 +147,53 @@ curl -s http://localhost:3000/api/doctypes/customer \
   -H "authorization: Bearer $TOKEN"
 ```
 
+SDK auth lifecycle and admin example:
+
+```ts
+import { createClient } from "@framekit/sdk";
+
+const client = createClient({ baseUrl: "http://localhost:3000" });
+
+await client.login("admin@example.com", "admin12345");
+await client.me();
+await client.refresh();
+
+await client.upsertRole({
+  id: "support",
+  name: "Support",
+  permissions: ["crm.customer.read"]
+});
+
+const apiToken = await client.createApiToken({
+  name: "CRM import",
+  roles: ["support"],
+  permissions: ["crm.customer.read"]
+});
+
+await client.authAudit();
+await client.logout();
+```
+
+Provider login uses the same session shape after an app registers an auth provider:
+
+```ts
+await client.loginWithProvider("oidc", "<provider-token>");
+```
+
+Migration workflow with SDK and CLI:
+
+```ts
+import { nextApp } from "./next-app";
+
+const plan = await client.planMigration(nextApp);
+await client.applyMigration(plan, { allowDestructive: false });
+```
+
+```bash
+pnpm --filter @framekit/cli framekit generate-sdk examples/crm/src/app.ts --out /tmp/crm-sdk.ts
+pnpm --filter @framekit/cli framekit generate-migration examples/crm/src/app.ts examples/crm/src/next-app.ts --out /tmp/crm-migration.ts
+```
+
 ## Core Concepts
 
 `DocType` is the primary metadata unit. It defines fields, permissions, naming, workflows, indexes, and views for a business document.
@@ -173,19 +224,19 @@ export const deal = defineDocType({
 
 ## Package Map
 
-| Package | Purpose |
-| --- | --- |
-| `@framekit/core` | Pure metadata definitions: DocTypes, modules, apps, permissions, workflows, views. |
-| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, and migration planning. |
-| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, and provider login ports. |
-| `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs, operations headers, rate limiting, telemetry hooks, and health checks. |
-| `@framekit/openapi` | OpenAPI 3.1 generator from Framekit metadata. |
-| `@framekit/db` | Postgres adapters for documents, users, audit, outbox, custom fields, views, naming series. |
-| `@framekit/jobs` | Queue port, BullMQ adapter, outbox dispatcher, scheduled job registry. |
-| `@framekit/realtime` | Event bus contract and in-memory publisher/subscriber. |
-| `@framekit/sdk` | HTTP client for auth, metadata, documents, audit, outbox, customization, views, migrations, realtime, and admin APIs. |
-| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and generated migration artifacts. |
-| `@framekit/desk` | React Desk UI generated from metadata. |
+| Package | Purpose | Verification status |
+| --- | --- | --- |
+| `@framekit/core` | Pure metadata definitions: DocTypes, modules, apps, permissions, workflows, views. | Unit covered. |
+| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, migration planning, checksums, destructive guards, and migration apply records. | Unit covered; service-backed verification tracked in [#2](https://github.com/WilliamCorotan/FrameKit/issues/2). |
+| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, user/role admin, and provider-independent login ports. | In-memory lifecycle covered; concrete OAuth/OIDC and cookie adapters tracked in [#4](https://github.com/WilliamCorotan/FrameKit/issues/4). |
+| `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs, auth/admin routes, operations headers, rate limiting, telemetry hooks, and health dependency checks. | In-process smoke covered; built-server smoke tracked in [#2](https://github.com/WilliamCorotan/FrameKit/issues/2). |
+| `@framekit/openapi` | OpenAPI 3.1 generator from Framekit metadata and framework routes. | Unit covered. |
+| `@framekit/db` | Postgres adapters for documents, users, roles, API tokens, session revocations, audit, outbox, custom fields, views, naming series, and migration history. | Unit covered; live Postgres verification tracked in [#2](https://github.com/WilliamCorotan/FrameKit/issues/2). |
+| `@framekit/jobs` | Queue port, BullMQ adapter, outbox dispatcher, scheduled job registry. | Unit covered; Redis/BullMQ verification tracked in [#2](https://github.com/WilliamCorotan/FrameKit/issues/2). |
+| `@framekit/realtime` | Event bus contract and in-memory publisher/subscriber for document events and SSE routes. | Unit and in-process smoke covered; durable replay remains future work. |
+| `@framekit/sdk` | HTTP client for auth lifecycle, provider login, metadata, documents, audit, outbox, customization, views, migrations, realtime, and admin APIs. | Unit covered; endpoint parity documented here. |
+| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and generated migration artifacts. | CLI smoke covered; executable replay/rollback tooling tracked in [#5](https://github.com/WilliamCorotan/FrameKit/issues/5). |
+| `@framekit/desk` | React Desk UI generated from metadata, auth/admin/operations/customization surfaces. | Build covered; browser verification tracked in [#3](https://github.com/WilliamCorotan/FrameKit/issues/3). |
 
 ## Repository Layout
 

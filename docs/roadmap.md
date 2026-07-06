@@ -43,7 +43,7 @@ Status: implemented
 Status: implemented
 
 - Support runtime custom fields, view metadata, naming series, and DocType migration planning.
-- Add migration preview/apply commands to the CLI.
+- Add runtime migration plan/apply APIs and CLI-generated migration artifacts.
 - Surface custom fields and list/form view configuration in Desk.
 
 ### Phase 4 - Automation, Jobs, And Realtime
@@ -112,5 +112,5 @@ Core and runtime remain inward modules. Nitro, Postgres, BullMQ, and Desk are ad
 ### 2026-07-02 - Phase 5 DX/Release Evaluation
 
 - Added CI workflow, deployment docs, and a real `framekit create-app` scaffold with Nitro routes, starter DocType, env example, and Dockerfile.
-- Typed SDK generation from OpenAPI remains a future enhancement; the current SDK exposes auth, metadata, audit, outbox, customization, views, and document operations.
+- CLI-generated SDK types are implemented; the runtime SDK exposes auth lifecycle, provider login, metadata, audit, outbox, customization, views, migrations, realtime, admin, and document operations.
 - Roadmap status: complete for the current framework MVP.
