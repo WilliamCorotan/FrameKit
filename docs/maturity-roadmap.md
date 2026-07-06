@@ -2,6 +2,29 @@
 
 Framekit now has the main framework skeleton in place: metadata, runtime services, Nitro APIs, auth/RBAC management, Postgres adapters, OpenAPI, SDK, CLI, jobs, realtime, Desk, and deployment proof. Most local framework-depth items are implemented; the remaining maturity work is service-backed verification, concrete third-party auth adapters, and package publication output hardening.
 
+## Overall Maturity
+
+- Local framework core: about 70% implemented.
+- Release-candidate maturity: about 60% implemented.
+- Primary blockers: external verification, concrete auth adapters, executable migration tooling, browser coverage, and publishable package outputs.
+
+## Modern Framework Component Matrix
+
+| Component | Estimate | In Place | Major Gaps |
+| --- | ---: | --- | --- |
+| Core metadata/domain model | 85% | DocTypes, modules, fields, permissions, workflows, hooks, indexes, views | More domain constraints and richer settings/config model |
+| Runtime application services | 85% | CRUD, validation, permissions, hooks, audit, outbox, realtime, customization, naming series | More transaction boundaries and cross-store consistency |
+| Data/query/persistence | 75% | In-memory and Postgres stores, filters, sorting, cursor, projection, unique/link enforcement | Service-backed tests, query pushdown, stronger relational/index semantics |
+| HTTP/API/OpenAPI | 85% | Nitro routes, auth/admin/system/document/customization APIs, OpenAPI 3.1 | Built-server smoke and versioned API compatibility policy |
+| Auth/IAM | 70% | Password auth, signed sessions, refresh/logout, revocation, lockout, API tokens, audit, provider port | Cookie sessions, concrete OAuth/OIDC adapters, MFA/invite flows |
+| Schema evolution | 65% | Plans, checksums, rollback metadata, destructive guard, CLI migration artifact | Actual DDL generation/execution, replay tooling, reversible apply/rollback commands |
+| Jobs/events/realtime | 65% | Outbox, BullMQ adapter, dispatch helpers, in-memory realtime, SSE | Redis integration tests, retry dashboards, durable realtime/event replay |
+| Desk/admin UI | 60% | Metadata-driven Desk, auth/admin/ops/customization screens | Browser verification, UX polish, accessibility, responsive QA |
+| SDK/CLI/devex | 70% | SDK client, generated SDK types, scaffolding, migration generation | Published templates, richer CLI workflows, typed endpoint coverage parity |
+| Ops/security/release | 55% | Request IDs, headers, rate limiting, health checks, deployment/release docs | Package `dist` output, publish metadata, release automation, production observability adapters |
+| Testing/CI | 55% | Unit tests, local Nitro smoke, build/typecheck audit | Postgres/Redis service matrix, built-server smoke, browser tests |
+| Docs/examples | 70% | README, architecture, deployment, roadmap, release policy, CRM example | More production recipes and SDK/CLI workflow examples |
+
 ## Phase 1 - Data Semantics
 
 Status: implemented
@@ -77,9 +100,9 @@ Exit criteria:
 
 ## Remaining External Work
 
-- Built-server CRM smoke test against `.output/server/index.mjs`.
-- Postgres-backed integration suite with a real database service.
-- Redis/BullMQ integration suite with a real Redis service.
-- Browser verification for Desk login, document CRUD, admin screens, operations screens, and responsive layouts.
-- Concrete OAuth/OIDC provider adapters on top of the provider login port.
-- Package publication output hardening: emitted `dist` artifacts, package `files`, publish config, and release automation.
+- Built-server CRM, Postgres, and Redis verification: [#2](https://github.com/WilliamCorotan/FrameKit/issues/2).
+- Browser verification and Desk UX hardening: [#3](https://github.com/WilliamCorotan/FrameKit/issues/3).
+- Concrete OAuth/OIDC and cookie session adapters: [#4](https://github.com/WilliamCorotan/FrameKit/issues/4).
+- Executable migration apply/replay/rollback tooling: [#5](https://github.com/WilliamCorotan/FrameKit/issues/5).
+- Package publication output hardening: [#6](https://github.com/WilliamCorotan/FrameKit/issues/6).
+- Public documentation sync and examples: [#7](https://github.com/WilliamCorotan/FrameKit/issues/7).
