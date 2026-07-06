@@ -338,4 +338,4 @@ The current local framework core is largely implemented. Remaining release-candi
 
 ## License
 
-No license has been selected yet.
+Framekit is licensed under the [Apache License 2.0](LICENSE).

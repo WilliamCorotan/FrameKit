@@ -42,7 +42,7 @@
     "meta-framework",
     "nitro"
   ],
-  "license": "UNLICENSED",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+ssh://git@github.com/WilliamCorotan/FrameKit.git",
