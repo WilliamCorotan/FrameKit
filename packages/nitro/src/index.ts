@@ -1,4 +1,4 @@
-import { defineEventHandler, getQuery, getRouterParam, readBody, setResponseStatus, type EventHandler } from "h3";
+import { defineEventHandler, getCookie, getQuery, getRouterParam, readBody, setCookie, setResponseStatus, type EventHandler, type H3Event } from "h3";
 import { bearerToken, type PasswordAuthService } from "@framekit/auth";
 import { FramekitError, type TenantContext } from "@framekit/core";
 import { createOpenApiDocument } from "@framekit/openapi";
@@ -12,6 +12,15 @@ export type NitroAdapterOptions = {
   metrics?: NitroMetricsSink;
   rateLimit?: NitroRateLimitOptions | NitroRateLimiter | false;
   healthChecks?: Record<string, NitroHealthCheck>;
+  authCookie?: NitroAuthCookieOptions | false;
+};
+
+export type NitroAuthCookieOptions = {
+  name?: string;
+  path?: string;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: "lax" | "strict" | "none";
 };
 
 export type NitroRequestTelemetry = {
@@ -51,6 +60,7 @@ export type NitroHealthCheck = () => NitroHealthCheckResult | Promise<NitroHealt
 export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapterOptions = {}): EventHandler {
   const basePath = options.basePath ?? "/api";
   const rateLimiter = createRateLimiter(options.rateLimit);
+  const authCookie = options.authCookie === false ? undefined : normalizeAuthCookieOptions(options.authCookie);
 
   return defineEventHandler(async (event) => {
     const startedAt = performance.now();
@@ -91,7 +101,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return health;
       }
       if (method === "GET" && path === basePath + "/meta") {
-        return await runtime.metadata(await tenantFromRequest(event.req, options.auth));
+        return await runtime.metadata(await tenantFromRequest(event.req, options.auth, authCookie));
       }
       if (method === "POST" && path === basePath + "/auth/login") {
         if (!options.auth) {
@@ -101,7 +111,9 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         if (!body.email || !body.password) {
           throw new FramekitError("VALIDATION_FAILED", "Email and password are required.", 422);
         }
-        return await options.auth.login(body.email, body.password, event.req.headers.get("x-tenant-id") ?? "default");
+        const session = await options.auth.login(body.email, body.password, event.req.headers.get("x-tenant-id") ?? "default");
+        setSessionCookie(event, session.token, session.expiresAt, authCookie);
+        return session;
       }
       const providerLogin = matchProviderLoginPath(path, basePath);
       if (method === "POST" && providerLogin) {
@@ -110,15 +122,17 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         if (!body.token) {
           throw new FramekitError("VALIDATION_FAILED", "token is required.", 422);
         }
-        return await auth.loginWithProvider(providerLogin.providerId, body.token, event.req.headers.get("x-tenant-id") ?? "default");
+        const session = await auth.loginWithProvider(providerLogin.providerId, body.token, event.req.headers.get("x-tenant-id") ?? "default");
+        setSessionCookie(event, session.token, session.expiresAt, authCookie);
+        return session;
       }
       if (method === "GET" && path === basePath + "/auth/me") {
         if (!options.auth) {
           throw new FramekitError("AUTH_NOT_CONFIGURED", "Auth is not configured for this app.", 501);
         }
-        const token = bearerToken(event.req.headers.get("authorization"));
+        const token = sessionTokenFromEvent(event, authCookie);
         if (!token) {
-          throw new FramekitError("UNAUTHENTICATED", "Missing Bearer token.", 401);
+          throw new FramekitError("UNAUTHENTICATED", "Missing session token.", 401);
         }
         const session = await options.auth.verifyBearerToken(token);
         return "apiToken" in session
@@ -136,25 +150,28 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       }
       if (method === "POST" && path === basePath + "/auth/refresh") {
         const auth = requireAuth(options.auth);
-        const token = bearerToken(event.req.headers.get("authorization"));
+        const token = sessionTokenFromEvent(event, authCookie);
         if (!token) {
-          throw new FramekitError("UNAUTHENTICATED", "Missing Bearer token.", 401);
+          throw new FramekitError("UNAUTHENTICATED", "Missing session token.", 401);
         }
-        return await auth.refreshSession(token);
+        const session = await auth.refreshSession(token);
+        setSessionCookie(event, session.token, session.expiresAt, authCookie);
+        return session;
       }
       if (method === "POST" && path === basePath + "/auth/logout") {
         const auth = requireAuth(options.auth);
-        const token = bearerToken(event.req.headers.get("authorization"));
+        const token = sessionTokenFromEvent(event, authCookie);
         if (!token) {
-          throw new FramekitError("UNAUTHENTICATED", "Missing Bearer token.", 401);
+          throw new FramekitError("UNAUTHENTICATED", "Missing session token.", 401);
         }
         await auth.revokeSession(token);
+        clearSessionCookie(event, authCookie);
         setResponseStatus(event, 204);
         return null;
       }
       if (method === "POST" && path === basePath + "/auth/password/change") {
         const auth = requireAuth(options.auth);
-        const tenant = await authenticatedTenantFromRequest(event.req, auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
         const body = ((await readBody(event)) ?? {}) as { currentPassword?: string; newPassword?: string };
         if (!body.currentPassword || !body.newPassword) {
           throw new FramekitError("VALIDATION_FAILED", "currentPassword and newPassword are required.", 422);
@@ -166,7 +183,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       const passwordReset = matchUserPasswordPath(path, basePath);
       if (method === "POST" && passwordReset) {
         const auth = requireAuth(options.auth);
-        const tenant = await authenticatedTenantFromRequest(event.req, auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
         assertAuthManager(tenant);
         const body = ((await readBody(event)) ?? {}) as { newPassword?: string };
         if (!body.newPassword) {
@@ -178,14 +195,14 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       }
       if (method === "GET" && path === basePath + "/auth/audit") {
         const auth = requireAuth(options.auth);
-        const tenant = await authenticatedTenantFromRequest(event.req, auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
         assertAuthManager(tenant);
         return await auth.authAuditEvents(tenant.tenantId);
       }
       const authAction = matchAuthManagementPath(path, basePath);
       if (authAction) {
         const auth = requireAuth(options.auth);
-        const tenant = await authenticatedTenantFromRequest(event.req, auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
         assertAuthManager(tenant);
 
         if (authAction.resource === "users") {
@@ -296,20 +313,20 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.diagnostics();
       }
       if (method === "GET" && path === basePath + "/migrations") {
-        return await runtime.migrationHistory(await tenantFromRequest(event.req, options.auth));
+        return await runtime.migrationHistory(await tenantFromRequest(event.req, options.auth, authCookie));
       }
       if (method === "GET" && path === basePath + "/realtime/events") {
         const query = getQuery(event);
-        return await runtime.realtimeEvents(await tenantFromRequest(event.req, options.auth), {
+        return await runtime.realtimeEvents(await tenantFromRequest(event.req, options.auth, authCookie), {
           limit: typeof query.limit === "string" ? Number(query.limit) : undefined
         });
       }
       if (method === "GET" && path === basePath + "/realtime/stream") {
-        const tenant = await tenantFromRequest(event.req, options.auth);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
         return createRealtimeStream(runtime, tenant, event.req.signal);
       }
       if (method === "POST" && path === basePath + "/migrations/plan") {
-        const tenant = await tenantFromRequest(event.req, options.auth);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
         const body = ((await readBody(event)) ?? {}) as { app?: unknown };
         if (!body.app || typeof body.app !== "object") {
           throw new FramekitError("VALIDATION_FAILED", "app is required.", 422);
@@ -317,7 +334,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.planMigration(tenant, body.app as never);
       }
       if (method === "POST" && path === basePath + "/migrations/apply") {
-        const tenant = await tenantFromRequest(event.req, options.auth);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
         const body = ((await readBody(event)) ?? {}) as { plan?: unknown; allowDestructive?: boolean };
         if (!body.plan || typeof body.plan !== "object") {
           throw new FramekitError("VALIDATION_FAILED", "plan is required.", 422);
@@ -325,14 +342,14 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.applyMigration(tenant, body.plan as never, { allowDestructive: body.allowDestructive });
       }
       if (method === "GET" && path === basePath + "/audit") {
-        const tenant = await tenantFromRequest(event.req, options.auth);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
         const query = getQuery(event);
         return await runtime.auditTrail(tenant, {
           limit: typeof query.limit === "string" ? Number(query.limit) : undefined
         });
       }
       if (method === "GET" && path === basePath + "/outbox") {
-        const tenant = await tenantFromRequest(event.req, options.auth);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
         const query = getQuery(event);
         return await runtime.outboxEvents(tenant, {
           limit: typeof query.limit === "string" ? Number(query.limit) : undefined,
@@ -341,7 +358,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       }
       const outboxAction = matchOutboxPath(path, basePath);
       if (method === "POST" && outboxAction) {
-        const tenant = await tenantFromRequest(event.req, options.auth);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
         if (outboxAction.action === "dispatch") {
           return await runtime.markOutboxDispatched(tenant, outboxAction.id);
         }
@@ -355,10 +372,10 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         });
       }
       if (method === "GET" && path === basePath + "/custom-fields") {
-        return await runtime.customFields(await tenantFromRequest(event.req, options.auth));
+        return await runtime.customFields(await tenantFromRequest(event.req, options.auth, authCookie));
       }
       if (method === "POST" && path === basePath + "/custom-fields") {
-        const tenant = await tenantFromRequest(event.req, options.auth);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
         const body = ((await readBody(event)) ?? {}) as { doctype?: string; field?: unknown };
         if (!body.doctype || !body.field) {
           throw new FramekitError("VALIDATION_FAILED", "doctype and field are required.", 422);
@@ -367,10 +384,10 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.addCustomField(tenant, { doctype: body.doctype, field: body.field });
       }
       if (method === "GET" && path === basePath + "/views") {
-        return await runtime.views(await tenantFromRequest(event.req, options.auth));
+        return await runtime.views(await tenantFromRequest(event.req, options.auth, authCookie));
       }
       if (method === "POST" && path === basePath + "/views") {
-        const tenant = await tenantFromRequest(event.req, options.auth);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
         const body = ((await readBody(event)) ?? {}) as { doctype?: string; type?: "list" | "form"; fields?: string[] };
         if (!body.doctype || (body.type !== "list" && body.type !== "form") || !Array.isArray(body.fields)) {
           throw new FramekitError("VALIDATION_FAILED", "doctype, type, and fields are required.", 422);
@@ -383,7 +400,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         throw new FramekitError("NOT_FOUND", "Route not found", 404);
       }
 
-      const tenant = await tenantFromRequest(event.req, options.auth);
+      const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
       if (method === "GET" && !match.id) {
         const query = getQuery(event);
         return await runtime.list(tenant, match.doctype, {
@@ -516,16 +533,16 @@ function requireAuth(auth: PasswordAuthService | undefined): PasswordAuthService
   return auth;
 }
 
-async function authenticatedTenantFromRequest(request: Request, auth: PasswordAuthService): Promise<TenantContext> {
-  const token = bearerToken(request.headers.get("authorization"));
+async function authenticatedTenantFromRequest(request: Request, auth: PasswordAuthService, cookie?: Required<NitroAuthCookieOptions>): Promise<TenantContext> {
+  const token = sessionTokenFromRequest(request, cookie);
   if (!token) {
-    throw new FramekitError("UNAUTHENTICATED", "Missing Bearer token.", 401);
+    throw new FramekitError("UNAUTHENTICATED", "Missing session token.", 401);
   }
   return (await auth.verifyBearerToken(token)).context;
 }
 
-async function tenantFromRequest(request: Request, auth?: PasswordAuthService): Promise<TenantContext> {
-  const token = bearerToken(request.headers.get("authorization"));
+async function tenantFromRequest(request: Request, auth?: PasswordAuthService, cookie?: Required<NitroAuthCookieOptions>): Promise<TenantContext> {
+  const token = sessionTokenFromRequest(request, cookie);
   if (token && auth) {
     const session = await auth.verifyBearerToken(token);
     return session.context;
@@ -536,6 +553,64 @@ async function tenantFromRequest(request: Request, auth?: PasswordAuthService): 
     roles: splitHeader(request.headers.get("x-roles")) ?? ["administrator"],
     permissions: splitHeader(request.headers.get("x-permissions")) ?? ["*"]
   };
+}
+
+function sessionTokenFromEvent(event: H3Event, cookie?: Required<NitroAuthCookieOptions>): string | undefined {
+  return bearerToken(event.req.headers.get("authorization")) ?? (cookie ? getCookie(event, cookie.name) : undefined);
+}
+
+function sessionTokenFromRequest(request: Request, cookie?: Required<NitroAuthCookieOptions>): string | undefined {
+  return bearerToken(request.headers.get("authorization")) ?? (cookie ? cookieValue(request.headers.get("cookie"), cookie.name) : undefined);
+}
+
+function normalizeAuthCookieOptions(options: NitroAuthCookieOptions | undefined): Required<NitroAuthCookieOptions> {
+  return {
+    name: options?.name ?? "framekit_session",
+    path: options?.path ?? "/",
+    httpOnly: options?.httpOnly ?? true,
+    secure: options?.secure ?? false,
+    sameSite: options?.sameSite ?? "lax"
+  };
+}
+
+function setSessionCookie(event: H3Event, token: string, expiresAt: string, cookie?: Required<NitroAuthCookieOptions>): void {
+  if (!cookie) {
+    return;
+  }
+  const maxAge = Math.max(0, Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000));
+  setCookie(event, cookie.name, token, {
+    httpOnly: cookie.httpOnly,
+    secure: cookie.secure,
+    sameSite: cookie.sameSite,
+    path: cookie.path,
+    maxAge
+  });
+}
+
+function clearSessionCookie(event: H3Event, cookie?: Required<NitroAuthCookieOptions>): void {
+  if (!cookie) {
+    return;
+  }
+  setCookie(event, cookie.name, "", {
+    httpOnly: cookie.httpOnly,
+    secure: cookie.secure,
+    sameSite: cookie.sameSite,
+    path: cookie.path,
+    maxAge: 0
+  });
+}
+
+function cookieValue(header: string | null, name: string): string | undefined {
+  if (!header) {
+    return undefined;
+  }
+  for (const part of header.split(";")) {
+    const [rawName, ...rawValue] = part.trim().split("=");
+    if (rawName === name) {
+      return decodeURIComponent(rawValue.join("="));
+    }
+  }
+  return undefined;
 }
 
 function assertAuthManager(tenant: TenantContext): void {

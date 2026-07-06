@@ -55,6 +55,8 @@ describe("createOpenApiDocument", () => {
     expect(doc.components.schemas.AuthSession).toBeDefined();
     expect(doc.components.schemas.AuthAuditEvent).toBeDefined();
     expect(doc.components.schemas.CreatedApiToken).toBeDefined();
+    expect(doc.components.securitySchemes.cookieAuth).toMatchObject({ type: "apiKey", in: "cookie", name: "framekit_session" });
+    expect(doc.security).toEqual([{ bearerAuth: [] }, { cookieAuth: [] }]);
     const dealInput = doc.components.schemas.DealInput;
     expect(dealInput).toBeDefined();
     expect(dealInput?.required).toContain("title");

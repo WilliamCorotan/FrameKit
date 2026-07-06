@@ -81,6 +81,30 @@ export type AuthIdentityProvider = {
   authenticate(input: { token: string; tenantId?: string }): Promise<AuthProviderIdentity>;
 };
 
+export type AuthIdentityLink = {
+  tenantId: string;
+  providerId: string;
+  subject: string;
+  userId: string;
+  email?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AuthIdentityLinkStore = {
+  find(tenantId: string, providerId: string, subject: string): Promise<AuthIdentityLink | undefined>;
+  upsert(link: AuthIdentityLink): Promise<AuthIdentityLink>;
+};
+
+export type AuthIdentityLinkingPolicy =
+  | {
+      mode: "email";
+      autoLink?: boolean;
+    }
+  | {
+      mode: "linked";
+    };
+
 export type UserStore = {
   list(tenantId: string): Promise<AuthUser[]>;
   findByEmail(email: string, tenantId?: string): Promise<AuthUser | undefined>;
@@ -115,6 +139,8 @@ export type PasswordAuthOptions = {
   sessionRevocations?: SessionRevocationStore;
   audit?: AuthAuditSink;
   providers?: AuthIdentityProvider[];
+  identityLinks?: AuthIdentityLinkStore;
+  identityLinkingPolicy?: AuthIdentityLinkingPolicy;
   sessionTtlSeconds?: number;
   maxFailedLoginAttempts?: number;
   lockoutSeconds?: number;
@@ -140,6 +166,8 @@ export class PasswordAuthService {
   private readonly sessionRevocations: SessionRevocationStore;
   private readonly audit: AuthAuditSink;
   private readonly providers: Map<string, AuthIdentityProvider>;
+  private readonly identityLinks: AuthIdentityLinkStore;
+  private readonly identityLinkingPolicy: AuthIdentityLinkingPolicy;
   private readonly maxFailedLoginAttempts: number;
   private readonly lockoutSeconds: number;
 
@@ -153,6 +181,8 @@ export class PasswordAuthService {
     this.sessionRevocations = options.sessionRevocations ?? new InMemorySessionRevocationStore();
     this.audit = options.audit ?? new NoopAuthAuditSink();
     this.providers = new Map((options.providers ?? []).map((provider) => [provider.id, provider]));
+    this.identityLinks = options.identityLinks ?? new InMemoryAuthIdentityLinkStore([]);
+    this.identityLinkingPolicy = options.identityLinkingPolicy ?? { mode: "email" };
     this.maxFailedLoginAttempts = options.maxFailedLoginAttempts ?? 5;
     this.lockoutSeconds = options.lockoutSeconds ?? 15 * 60;
   }
@@ -185,13 +215,19 @@ export class PasswordAuthService {
     }
     const identity = await provider.authenticate({ token, tenantId });
     const resolvedTenantId = identity.tenantId ?? tenantId;
-    const user = await this.options.userStore.findByEmail(normalizeEmail(identity.email), resolvedTenantId);
+    const user = await this.resolveProviderUser(identity, resolvedTenantId);
     if (!user) {
       await this.recordAuthAudit({
         tenantId: resolvedTenantId,
         action: "provider_login.failed",
         success: false,
-        details: { providerId, subject: identity.subject, email: normalizeEmail(identity.email), reason: "user_not_found" }
+        details: {
+          providerId,
+          subject: identity.subject,
+          email: normalizeEmail(identity.email),
+          policy: this.identityLinkingPolicy.mode,
+          reason: "user_not_found"
+        }
       });
       throw new FramekitError("PROVIDER_USER_NOT_FOUND", "Provider identity is not linked to a user.", 401);
     }
@@ -206,6 +242,32 @@ export class PasswordAuthService {
       details: { providerId, subject: identity.subject, sessionId: session.sessionId }
     });
     return session;
+  }
+
+  async linkProviderIdentity(input: { tenantId: string; providerId: string; subject: string; userId: string; email?: string }): Promise<AuthIdentityLink> {
+    const user = await this.options.userStore.findById(input.tenantId, input.userId);
+    if (!user) {
+      throw new FramekitError("USER_NOT_FOUND", `No user with id "${input.userId}"`, 404);
+    }
+    const now = new Date().toISOString();
+    const existing = await this.identityLinks.find(input.tenantId, input.providerId, input.subject);
+    const link = await this.identityLinks.upsert({
+      tenantId: input.tenantId,
+      providerId: input.providerId,
+      subject: input.subject,
+      userId: input.userId,
+      email: input.email ? normalizeEmail(input.email) : undefined,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    });
+    await this.recordAuthAudit({
+      tenantId: input.tenantId,
+      targetUserId: input.userId,
+      action: "provider_identity.linked",
+      success: true,
+      details: { providerId: input.providerId, subject: input.subject }
+    });
+    return link;
   }
 
   async verifyBearerToken(token: string): Promise<AuthSession | ApiTokenSession> {
@@ -472,6 +534,27 @@ export class PasswordAuthService {
     return [...new Set([...directPermissions, ...rolePermissions])].sort();
   }
 
+  private async resolveProviderUser(identity: AuthProviderIdentity, tenantId: string): Promise<AuthUser | undefined> {
+    const linked = await this.identityLinks.find(tenantId, identity.providerId, identity.subject);
+    if (linked) {
+      return this.options.userStore.findById(tenantId, linked.userId);
+    }
+    if (this.identityLinkingPolicy.mode === "linked") {
+      return undefined;
+    }
+    const user = await this.options.userStore.findByEmail(normalizeEmail(identity.email), tenantId);
+    if (user && this.identityLinkingPolicy.autoLink) {
+      await this.linkProviderIdentity({
+        tenantId,
+        providerId: identity.providerId,
+        subject: identity.subject,
+        userId: user.id,
+        email: identity.email
+      });
+    }
+    return user;
+  }
+
   private assertUserCanLogin(user: AuthUser): void {
     if (user.disabledAt) {
       throw new FramekitError("USER_DISABLED", "User account is disabled.", 403);
@@ -640,6 +723,30 @@ export class InMemorySessionRevocationStore implements SessionRevocationStore {
   }
 }
 
+export class InMemoryAuthIdentityLinkStore implements AuthIdentityLinkStore {
+  private readonly links: AuthIdentityLink[];
+
+  constructor(links: AuthIdentityLink[]) {
+    this.links = links.map(cloneIdentityLink);
+  }
+
+  async find(tenantId: string, providerId: string, subject: string): Promise<AuthIdentityLink | undefined> {
+    const link = this.links.find((candidate) => candidate.tenantId === tenantId && candidate.providerId === providerId && candidate.subject === subject);
+    return link ? cloneIdentityLink(link) : undefined;
+  }
+
+  async upsert(link: AuthIdentityLink): Promise<AuthIdentityLink> {
+    const saved = cloneIdentityLink(link);
+    const index = this.links.findIndex((candidate) => candidate.tenantId === link.tenantId && candidate.providerId === link.providerId && candidate.subject === link.subject);
+    if (index >= 0) {
+      this.links[index] = saved;
+    } else {
+      this.links.push(saved);
+    }
+    return cloneIdentityLink(saved);
+  }
+}
+
 export class InMemoryAuthAuditStore implements AuthAuditSink {
   private readonly events: AuthAuditEvent[] = [];
 
@@ -711,6 +818,65 @@ export type CreateApiTokenInput = {
   permissions: string[];
   expiresAt?: string;
 };
+
+export type OidcClaims = {
+  sub?: unknown;
+  email?: unknown;
+  name?: unknown;
+  preferred_username?: unknown;
+  tenantId?: unknown;
+  tid?: unknown;
+  iss?: unknown;
+  aud?: unknown;
+  active?: unknown;
+};
+
+export type OidcProviderOptions = {
+  id: string;
+  issuer?: string;
+  clientId?: string;
+  clientSecret?: string;
+  introspectionEndpoint?: string;
+  userInfoEndpoint?: string;
+  fetch?: typeof fetch;
+  verifyJwt?: (token: string, options: { issuer?: string; audience?: string }) => Promise<OidcClaims> | OidcClaims;
+  mapIdentity?: (claims: OidcClaims, input: { providerId: string; tenantId?: string }) => AuthProviderIdentity;
+};
+
+export function createOidcProvider(options: OidcProviderOptions): AuthIdentityProvider {
+  const fetcher = options.fetch ?? globalThis.fetch;
+  return {
+    id: options.id,
+    async authenticate({ token, tenantId }) {
+      const claims = await oidcClaimsFromToken(token, options, fetcher);
+      if (options.issuer && claims.iss && claims.iss !== options.issuer) {
+        throw new FramekitError("OIDC_ISSUER_MISMATCH", "OIDC token issuer did not match the configured issuer.", 401);
+      }
+      if (options.clientId && claims.aud) {
+        const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+        if (!audiences.includes(options.clientId)) {
+          throw new FramekitError("OIDC_AUDIENCE_MISMATCH", "OIDC token audience did not match the configured client id.", 401);
+        }
+      }
+      if (options.mapIdentity) {
+        return options.mapIdentity(claims, { providerId: options.id, tenantId });
+      }
+      const subject = stringClaim(claims.sub, "sub");
+      const email = typeof claims.email === "string" ? claims.email : typeof claims.preferred_username === "string" ? claims.preferred_username : undefined;
+      if (!email) {
+        throw new FramekitError("OIDC_EMAIL_MISSING", "OIDC identity did not include an email claim.", 401);
+      }
+      const providerTenantId = typeof claims.tenantId === "string" ? claims.tenantId : typeof claims.tid === "string" ? claims.tid : tenantId;
+      return {
+        providerId: options.id,
+        subject,
+        tenantId: providerTenantId,
+        email,
+        name: typeof claims.name === "string" ? claims.name : email
+      };
+    }
+  };
+}
 
 function publicUser(user: AuthUser): PublicAuthUser {
   const { passwordHash: _passwordHash, failedLoginAttempts: _failedLoginAttempts, ...rest } = user;
@@ -800,6 +966,55 @@ function cloneApiToken(token: ApiTokenRecord): ApiTokenRecord {
 
 function cloneOptionalApiToken(token: ApiTokenRecord | undefined): ApiTokenRecord | undefined {
   return token ? cloneApiToken(token) : undefined;
+}
+
+function cloneIdentityLink(link: AuthIdentityLink): AuthIdentityLink {
+  return { ...link };
+}
+
+async function oidcClaimsFromToken(token: string, options: OidcProviderOptions, fetcher: typeof fetch): Promise<OidcClaims> {
+  if (options.verifyJwt) {
+    return options.verifyJwt(token, { issuer: options.issuer, audience: options.clientId });
+  }
+  if (options.introspectionEndpoint) {
+    const body = new URLSearchParams({ token });
+    if (options.clientId) {
+      body.set("client_id", options.clientId);
+    }
+    if (options.clientSecret) {
+      body.set("client_secret", options.clientSecret);
+    }
+    const response = await fetcher(options.introspectionEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body
+    });
+    if (!response.ok) {
+      throw new FramekitError("OIDC_INTROSPECTION_FAILED", "OIDC token introspection failed.", 401);
+    }
+    const claims = await response.json() as OidcClaims;
+    if (claims.active === false) {
+      throw new FramekitError("OIDC_TOKEN_INACTIVE", "OIDC token is inactive.", 401);
+    }
+    return claims;
+  }
+  if (options.userInfoEndpoint) {
+    const response = await fetcher(options.userInfoEndpoint, {
+      headers: { authorization: `Bearer ${token}` }
+    });
+    if (!response.ok) {
+      throw new FramekitError("OIDC_USERINFO_FAILED", "OIDC userinfo request failed.", 401);
+    }
+    return await response.json() as OidcClaims;
+  }
+  throw new FramekitError("OIDC_VERIFIER_REQUIRED", "OIDC provider requires verifyJwt, introspectionEndpoint, or userInfoEndpoint.", 500);
+}
+
+function stringClaim(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new FramekitError("OIDC_CLAIM_MISSING", `OIDC identity did not include a ${name} claim.`, 401);
+  }
+  return value;
 }
 
 function base64UrlEncode(value: string): string {

@@ -52,6 +52,8 @@ export type FramekitClientOptions = {
   baseUrl: string;
   tenant?: Partial<TenantContext>;
   token?: string;
+  authMode?: "bearer" | "cookie";
+  credentials?: RequestCredentials;
 };
 
 export type ListDocumentsOptions = {
@@ -70,11 +72,15 @@ export type ListDocumentsOptions = {
 export class FramekitClient {
   private readonly baseUrl: string;
   private readonly tenant: Partial<TenantContext>;
+  private readonly authMode: "bearer" | "cookie";
+  private readonly credentials?: RequestCredentials;
   private token?: string;
 
   constructor(options: FramekitClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
     this.tenant = options.tenant ?? {};
+    this.authMode = options.authMode ?? "bearer";
+    this.credentials = options.credentials ?? (this.authMode === "cookie" ? "include" : undefined);
     this.token = options.token;
   }
 
@@ -101,6 +107,7 @@ export class FramekitClient {
   ): Promise<void> {
     const response = await fetch(this.baseUrl + "/api/realtime/stream", {
       headers: this.headers(),
+      credentials: this.credentials,
       signal: options.signal
     });
     if (!response.ok || !response.body) {
@@ -293,7 +300,8 @@ export class FramekitClient {
     return ofetch<T>(this.baseUrl + path, {
       method: options.method,
       body: options.body as Record<string, unknown> | undefined,
-      headers: this.headers(options.skipAuth)
+      headers: this.headers(options.skipAuth),
+      credentials: this.credentials
     });
   }
 
@@ -304,7 +312,7 @@ export class FramekitClient {
       "x-roles": (this.tenant.roles ?? ["administrator"]).join(","),
       "x-permissions": (this.tenant.permissions ?? ["*"]).join(",")
     };
-    if (this.token && !skipAuth) {
+    if (this.token && !skipAuth && this.authMode === "bearer") {
       headers.authorization = `Bearer ${this.token}`;
     }
     return headers;

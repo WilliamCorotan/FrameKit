@@ -63,4 +63,24 @@ describe("generateSdkTypes", () => {
 
     expect(events).toEqual([{ type: "customer.created", data: { id: "customer-1" } }]);
   });
+
+  it("includes credentials for cookie-backed auth helpers", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('event: customer.created\ndata: {"id":"customer-1"}\n\n'));
+            controller.close();
+          }
+        }),
+        { status: 200 }
+      )
+    );
+    const client = createClient({ baseUrl: "http://localhost:3000", authMode: "cookie" });
+
+    await client.streamRealtimeEvents(() => undefined);
+
+    expect(fetchMock).toHaveBeenCalledWith("http://localhost:3000/api/realtime/stream", expect.objectContaining({ credentials: "include" }));
+    expect(fetchMock.mock.calls[0]?.[1]?.headers).not.toMatchObject({ authorization: expect.any(String) });
+  });
 });
