@@ -13,6 +13,8 @@
 
 Each iteration must end with `pnpm typecheck`, `pnpm test`, `pnpm build`, built-server smoke checks, and a short decision on the next highest-value item.
 
+For the production-depth roadmap after the MVP phases below, see [maturity-roadmap.md](maturity-roadmap.md).
+
 ### Phase 1 - Authentication And Sessions
 
 Status: implemented

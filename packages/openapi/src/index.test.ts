@@ -34,8 +34,27 @@ describe("createOpenApiDocument", () => {
 
     expect(doc.openapi).toBe("3.1.0");
     expect(doc.paths["/api/auth/login"]).toBeDefined();
+    expect(doc.paths["/api/auth/refresh"]).toBeDefined();
+    expect(doc.paths["/api/auth/logout"]).toBeDefined();
+    expect(doc.paths["/api/auth/providers/{id}/login"]).toBeDefined();
+    expect(doc.paths["/api/auth/audit"]).toBeDefined();
+    expect(doc.paths["/api/auth/password/change"]).toBeDefined();
+    expect(doc.paths["/api/auth/users"]).toBeDefined();
+    expect(doc.paths["/api/auth/users/{id}/password"]).toBeDefined();
+    expect(doc.paths["/api/auth/roles"]).toBeDefined();
+    expect(doc.paths["/api/auth/tokens"]).toBeDefined();
+    expect(doc.paths["/api/migrations/plan"]).toBeDefined();
+    expect(doc.paths["/api/migrations/apply"]).toBeDefined();
+    expect(doc.paths["/api/realtime/stream"]).toBeDefined();
     expect(doc.paths["/api/doctypes/deal"]).toBeDefined();
     expect(doc.paths["/api/doctypes/deal/{id}/transition"]).toBeDefined();
+    const listDeal = doc.paths["/api/doctypes/deal"]?.get;
+    expect(JSON.stringify(listDeal?.parameters)).toContain("cursor");
+    expect(JSON.stringify(listDeal?.parameters)).toContain("fields");
+    expect(doc.components.schemas.AuthUser).toBeDefined();
+    expect(doc.components.schemas.AuthSession).toBeDefined();
+    expect(doc.components.schemas.AuthAuditEvent).toBeDefined();
+    expect(doc.components.schemas.CreatedApiToken).toBeDefined();
     const dealInput = doc.components.schemas.DealInput;
     expect(dealInput).toBeDefined();
     expect(dealInput?.required).toContain("title");

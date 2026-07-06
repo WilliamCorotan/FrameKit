@@ -1,33 +1,46 @@
 #!/usr/bin/env node
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { AppDefinition } from "@framekit/core";
+import { createRuntime } from "@framekit/runtime";
+import { generateSdkTypes } from "@framekit/sdk";
 
-const [, , command, name] = process.argv;
-
-async function main(): Promise<void> {
+export async function runCli(argv = process.argv.slice(2), io: { stdout?: Pick<NodeJS.WriteStream, "write">; log?: (message: string) => void } = {}): Promise<void> {
+  const [command, name, ...args] = argv;
+  const stdout = io.stdout ?? process.stdout;
+  const log = io.log ?? console.log;
   if (!command || command === "help") {
-    printHelp();
+    printHelp(log);
     return;
   }
   if (!name) {
     throw new Error(`Missing name for command "${command}"`);
   }
   if (command === "new-module") {
-    await newModule(name);
+    await newModule(name, log);
     return;
   }
   if (command === "new-doctype") {
-    await newDocType(name);
+    await newDocType(name, log);
     return;
   }
   if (command === "create-app") {
-    await createApp(name);
+    await createApp(name, log);
+    return;
+  }
+  if (command === "generate-sdk") {
+    await generateSdk(name, args, stdout, log);
+    return;
+  }
+  if (command === "generate-migration") {
+    await generateMigration(name, args, stdout, log);
     return;
   }
   throw new Error(`Unknown command "${command}"`);
 }
 
-async function newModule(rawName: string): Promise<void> {
+async function newModule(rawName: string, log: (message: string) => void): Promise<void> {
   const id = slug(rawName);
   const directory = join(process.cwd(), "modules", id);
   await mkdir(directory, { recursive: true });
@@ -35,10 +48,10 @@ async function newModule(rawName: string): Promise<void> {
     join(directory, "index.ts"),
     `import { defineModule } from "@framekit/core";\n\nexport const ${camel(id)}Module = defineModule({\n  id: "${id}",\n  name: "${title(id)}",\n  doctypes: []\n});\n`
   );
-  console.log(`Created module ${id}`);
+  log(`Created module ${id}`);
 }
 
-async function newDocType(rawName: string): Promise<void> {
+async function newDocType(rawName: string, log: (message: string) => void): Promise<void> {
   const id = slug(rawName);
   const directory = join(process.cwd(), "modules", "custom");
   await mkdir(directory, { recursive: true });
@@ -46,10 +59,10 @@ async function newDocType(rawName: string): Promise<void> {
     join(directory, `${id}.ts`),
     `import { defineDocType } from "@framekit/core";\n\nexport const ${camel(id)}DocType = defineDocType({\n  name: "${id.replaceAll("-", "_")}",\n  label: "${title(id)}",\n  fields: [\n    { name: "title", label: "Title", type: "text", required: true, inList: true }\n  ]\n});\n`
   );
-  console.log(`Created DocType ${id}`);
+  log(`Created DocType ${id}`);
 }
 
-async function createApp(rawName: string): Promise<void> {
+async function createApp(rawName: string, log: (message: string) => void): Promise<void> {
   const id = slug(rawName);
   await mkdir(join(id, "routes"), { recursive: true });
   await mkdir(join(id, "src"), { recursive: true });
@@ -96,11 +109,59 @@ async function createApp(rawName: string): Promise<void> {
     join(id, "Dockerfile"),
     `FROM node:24-alpine AS deps\nWORKDIR /app\nCOPY . .\nRUN corepack enable && corepack prepare pnpm@11.9.0 --activate && pnpm install --frozen-lockfile=false\n\nFROM deps AS build\nRUN pnpm build\n\nFROM node:24-alpine AS runner\nWORKDIR /app\nENV NODE_ENV=production\nCOPY --from=build /app/.output ./.output\nEXPOSE 3000\nCMD ["node", ".output/server/index.mjs"]\n`
   );
-  console.log(`Created Framekit app ${id}`);
+  log(`Created Framekit app ${id}`);
 }
 
-function printHelp(): void {
-  console.log(`framekit commands:\n  create-app <name>\n  new-module <name>\n  new-doctype <name>`);
+async function generateSdk(modulePath: string, args: string[], stdout: Pick<NodeJS.WriteStream, "write">, log: (message: string) => void): Promise<void> {
+  const app = await loadApp(modulePath);
+  const output = generateSdkTypes(app);
+  const outIndex = args.indexOf("--out");
+  if (outIndex >= 0) {
+    const outFile = args[outIndex + 1];
+    if (!outFile) {
+      throw new Error("Missing file after --out");
+    }
+    await writeFile(outFile, output);
+    log(`Generated SDK types ${outFile}`);
+    return;
+  }
+  stdout.write(output);
+}
+
+async function generateMigration(currentModulePath: string, args: string[], stdout: Pick<NodeJS.WriteStream, "write">, log: (message: string) => void): Promise<void> {
+  const nextModulePath = args[0];
+  if (!nextModulePath || nextModulePath.startsWith("--")) {
+    throw new Error("Missing next app module path for generate-migration");
+  }
+  const current = await loadApp(currentModulePath);
+  const next = await loadApp(nextModulePath);
+  const runtime = createRuntime(current);
+  const plan = await runtime.planMigration({ tenantId: "default", userId: "migration", roles: ["administrator"], permissions: ["*"] }, next);
+  const output = `// Generated by framekit generate-migration\nexport const migration = ${JSON.stringify(plan, null, 2)} as const;\n`;
+  const outIndex = args.indexOf("--out");
+  if (outIndex >= 0) {
+    const outFile = args[outIndex + 1];
+    if (!outFile) {
+      throw new Error("Missing file after --out");
+    }
+    await writeFile(outFile, output);
+    log(`Generated migration ${outFile}`);
+    return;
+  }
+  stdout.write(output);
+}
+
+async function loadApp(modulePath: string): Promise<AppDefinition> {
+  const imported = await import(pathToImportSpecifier(modulePath));
+  const app = imported.app ?? imported.default;
+  if (!app || typeof app !== "object") {
+    throw new Error(`No app export found in ${modulePath}`);
+  }
+  return app as AppDefinition;
+}
+
+function printHelp(log: (message: string) => void): void {
+  log(`framekit commands:\n  create-app <name>\n  new-module <name>\n  new-doctype <name>\n  generate-sdk <module-path> [--out file]\n  generate-migration <current-module-path> <next-module-path> [--out file]`);
 }
 
 function slug(value: string): string {
@@ -115,7 +176,19 @@ function title(value: string): string {
   return value.split("-").map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" ");
 }
 
-main().catch((error: unknown) => {
-  console.error(error instanceof Error ? error.message : error);
-  process.exitCode = 1;
-});
+function pathToImportSpecifier(value: string): string {
+  if (value.startsWith("file:")) {
+    return value;
+  }
+  if (value.startsWith(".") || value.startsWith("/") || value.endsWith(".ts") || value.endsWith(".js") || value.includes("/")) {
+    return pathToFileURL(isAbsolute(value) ? value : resolve(process.cwd(), value)).href;
+  }
+  return `./${value}`;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  runCli().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : error);
+    process.exitCode = 1;
+  });
+}

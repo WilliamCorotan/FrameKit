@@ -38,6 +38,7 @@ export type OutboxDispatchResult = {
   inspected: number;
   dispatched: number;
   failed: number;
+  skipped: number;
 };
 
 export type ScheduledJob = {
@@ -80,10 +81,44 @@ export async function dispatchOutboxEvents(
   const result: OutboxDispatchResult = {
     inspected: events.length,
     dispatched: 0,
-    failed: 0
+    failed: 0,
+    skipped: 0
   };
 
   for (const event of events) {
+    try {
+      await handler(event);
+      await runtime.markOutboxDispatched(tenant, event.id);
+      result.dispatched += 1;
+    } catch (error) {
+      await runtime.markOutboxFailed(tenant, event.id, error instanceof Error ? error.message : "Unknown dispatch failure");
+      result.failed += 1;
+    }
+  }
+
+  return result;
+}
+
+export async function retryFailedOutboxEvents(
+  runtime: FramekitRuntime,
+  tenant: TenantContext,
+  handler: OutboxDispatchHandler,
+  options: { limit?: number; maxAttempts?: number } = {}
+): Promise<OutboxDispatchResult> {
+  const events = await runtime.outboxEvents(tenant, { status: "failed", limit: options.limit ?? 100 });
+  const maxAttempts = options.maxAttempts ?? 3;
+  const result: OutboxDispatchResult = {
+    inspected: events.length,
+    dispatched: 0,
+    failed: 0,
+    skipped: 0
+  };
+
+  for (const event of events) {
+    if (event.attempts >= maxAttempts) {
+      result.skipped += 1;
+      continue;
+    }
     try {
       await handler(event);
       await runtime.markOutboxDispatched(tenant, event.id);

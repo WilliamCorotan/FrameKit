@@ -16,6 +16,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@framekit/core": "workspace:*",
+    "@framekit/runtime": "workspace:*",
+    "@framekit/sdk": "workspace:*",
     "tsx": "^4.22.4"
   }
 }
