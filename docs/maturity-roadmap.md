@@ -1,108 +1,112 @@
 # Framekit Maturity Roadmap
 
-Framekit now has the main framework skeleton in place: metadata, runtime services, Nitro APIs, auth/RBAC management, Postgres adapters, OpenAPI, SDK, CLI, jobs, realtime, Desk, and deployment proof. Most local framework-depth items are implemented; the remaining maturity work is service-backed verification, concrete third-party auth adapters, and package publication output hardening.
+Last reevaluated: 2026-07-21
 
-## Overall Maturity
+Framekit is an advanced-alpha, metadata-driven TypeScript business application framework. The framework skeleton is broad and credible: metadata, runtime services, Nitro APIs, authentication, Postgres adapters, migrations, jobs, realtime, OpenAPI, SDK, CLI, Desk, deployment, and release artifacts are all present. It is not release-candidate ready because request identity currently fails open, the built-server CI gate does not terminate, and durable mutations are not atomic.
 
-- Local framework core: about 70% implemented.
-- Release-candidate maturity: about 60% implemented.
-- Primary blockers: external verification, concrete auth adapters, executable migration tooling, browser coverage, and publishable package outputs.
+## Scoring Model
+
+Each implementation percentage measures progress toward a production-ready 1.0 in that component:
+
+- 0%: absent.
+- 25%: contract or proof of concept.
+- 50%: usable MVP path.
+- 75%: release-candidate depth and verification.
+- 100%: production-hardened behavior, operations, compatibility, and documentation.
+
+The estimates are evidence-based engineering judgments, not line coverage or issue completion. They should be revised when an acceptance criterion below is verified.
+
+## Overall Assessment
+
+- Component-average implementation: **52%**.
+- Functional breadth: approximately **59%**.
+- Production readiness: approximately **38%**.
+- Current stage: **advanced alpha**.
+- Release blockers: authenticated identity enforcement, safe HTTP/auth defaults, and a terminating built-server CI gate.
 
 ## Modern Framework Component Matrix
 
-| Component | Estimate | In Place | Major Gaps |
+| Component | Implementation | In place | Missing or incomplete |
 | --- | ---: | --- | --- |
-| Core metadata/domain model | 85% | DocTypes, modules, fields, permissions, workflows, hooks, indexes, views | More domain constraints and richer settings/config model |
-| Runtime application services | 85% | CRUD, validation, permissions, hooks, audit, outbox, realtime, customization, naming series | More transaction boundaries and cross-store consistency |
-| Data/query/persistence | 75% | In-memory and Postgres stores, filters, sorting, cursor, projection, unique/link enforcement | Service-backed tests, query pushdown, stronger relational/index semantics |
-| HTTP/API/OpenAPI | 85% | Nitro routes, auth/admin/system/document/customization APIs, OpenAPI 3.1 | Built-server smoke and versioned API compatibility policy |
-| Auth/IAM | 70% | Password auth, signed sessions, refresh/logout, revocation, lockout, API tokens, audit, provider port | Cookie sessions, concrete OAuth/OIDC adapters, MFA/invite flows |
-| Schema evolution | 65% | Plans, checksums, rollback metadata, destructive guard, CLI migration artifact | Actual DDL generation/execution, replay tooling, reversible apply/rollback commands |
-| Jobs/events/realtime | 65% | Outbox, BullMQ adapter, dispatch helpers, in-memory realtime, SSE | Redis integration tests, retry dashboards, durable realtime/event replay |
-| Desk/admin UI | 60% | Metadata-driven Desk, auth/admin/ops/customization screens | Browser verification, UX polish, accessibility, responsive QA |
-| SDK/CLI/devex | 70% | SDK client, generated SDK types, scaffolding, migration generation | Published templates, richer CLI workflows, typed endpoint coverage parity |
-| Ops/security/release | 55% | Request IDs, headers, rate limiting, health checks, deployment/release docs | Package `dist` output, publish metadata, release automation, production observability adapters |
-| Testing/CI | 55% | Unit tests, local Nitro smoke, build/typecheck audit | Postgres/Redis service matrix, built-server smoke, browser tests |
-| Docs/examples | 70% | README, architecture, deployment, roadmap, release policy, CRM example | More production recipes and SDK/CLI workflow examples |
+| Core metadata and domain model | 68% | DocTypes, modules, ten field types, permissions, hooks, workflows, naming, indexes, navigation, and views | Cross-reference invariants, child records, attachments, computed fields, decimal semantics, ownership/row permissions, localization, typed settings |
+| Runtime and command lifecycle | 60% | CRUD, validation, permissions, hooks, transitions, customization, audit, outbox, naming, realtime, and diagnostics | Atomic unit of work, optimistic concurrency, idempotency, submit/cancel commands, consistent hook validation, bulk/cross-document commands, start/stop/dispose lifecycle |
+| Data, query, and persistence | 50% | In-memory and Postgres adapters for documents and framework records; filters, sorting, projection, cursors, links, and uniqueness checks | Query pushdown, stable opaque cursors, adapter-enforced uniqueness, locking/revisions, atomic document/outbox persistence, load/performance evidence |
+| HTTP API and OpenAPI | 58% | Broad Nitro route surface, OpenAPI 3.1, framework errors, request IDs, headers, rate-limit and telemetry ports | Authenticated-by-default routing, operations authorization, hardened CORS, version/compatibility policy, idempotency, pagination envelopes |
+| Authentication and IAM | 40% | Password sessions, cookies, refresh/logout/revocation, lockout, API tokens, roles, audit, provider port, OIDC introspection | Critical request-identity bypass, CSRF model, secure production defaults, persistent identity links, authorization-code/PKCE, recovery/invites, MFA policy |
+| Schema evolution | 60% | Plans, checksums, rollback metadata, destructive guard, SQL generation, CLI apply/replay/rollback, Postgres verification | Consistent HTTP/CLI semantics, full DocType removal, locking, drift detection, duplicate/idempotent apply policy, safe conversions |
+| Jobs, events, and realtime | 45% | Queue port, BullMQ adapter, retry helper, scheduled registry, outbox dispatcher, SSE, in-memory history | Worker/scheduler lifecycle, atomic outbox leasing, deduplication, durable multi-instance fanout and replay, graceful shutdown |
+| Desk and admin UI | 55% | Metadata lists/forms, workflow controls, auth administration, customization, audit/outbox/diagnostics screens, responsive smoke | Real-backend E2E, delete/pagination/filter UX, field errors, accessibility audit, keyboard coverage, multi-browser verification |
+| SDK, CLI, and developer experience | 55% | Broad HTTP client, generated model types, app/module/DocType scaffolding, migration commands | Generated endpoint parity, typed/retriable client errors, safe scaffold overwrite policy, standalone templates, upgrade/config workflows |
+| Operations, security, and release | 35% | Health checks, logger/metrics hooks, rate limiting, deployment docs, dist outputs, publish metadata, RC notes | Secure defaults, resource lifecycle, production observability adapters, secret/config validation, publish workflow, SBOM/security scanning |
+| Testing and CI | 55% | 52 unit/in-process tests, service-backed suites, built-server smoke assertions, five mocked browser journeys | Green terminating CI, browser job in CI, full-stack Desk test, tenant/security tests, fault/concurrency tests, coverage thresholds, working package-local test scripts |
+| Documentation and adoption | 45% | README, architecture, deployment, release policy, two roadmaps, CRM example | Standalone install guide, security model, compatibility/support matrix, contribution/security policies, API reference, verified external-consumer tutorial |
 
-## Phase 1 - Data Semantics
+## Priority 0 - Release Blockers
 
-Status: implemented
+No release candidate should be cut until all P0 items are closed and their acceptance criteria are verified.
 
-- Add rich list filters: equality, `in`, comparison, contains, and null checks. Implemented.
-- Enforce `link` field integrity before document writes. Implemented.
-- Enforce `unique` field constraints before create/update. Implemented.
-- Add stable cursor pagination and field projection after the first operator pass. Implemented with document-id cursors and data-field projection.
-- Keep behavior consistent between in-memory and Postgres JSON-document repositories. Implemented through shared list option handling.
+1. [#16 Enforce authenticated request identity and operations authorization](https://github.com/WilliamCorotan/FrameKit/issues/16)
+2. [#17 Harden HTTP, cookie, secret, and bootstrap security defaults](https://github.com/WilliamCorotan/FrameKit/issues/17)
+3. [#18 Make the built-server smoke release gate terminate reliably](https://github.com/WilliamCorotan/FrameKit/issues/18)
 
 Exit criteria:
 
-- Runtime tests cover filter operators, invalid operators, link failures, and unique conflicts. Implemented.
-- SDK and OpenAPI document the query shape. Implemented for filters, sort, cursor, offset, limit, and fields.
-- `pnpm audit:all` passes. Implemented.
+- Authenticated deployments never accept caller-asserted roles, permissions, users, or tenants.
+- Public and privileged operations have an explicit, tested authorization policy.
+- Production HTTP, cookie, secret, and bootstrap defaults fail safely.
+- The complete default-branch CI finishes green within bounded time.
 
-## Phase 2 - Integration Verification
+## Priority 1 - Release-Candidate Depth
 
-Status: implemented for local runtime; external adapters pending
-
-- Add built CRM API smoke tests for login, CRUD, auth admin, migrations, outbox, and realtime history. In-process Nitro handler smoke implemented; built-server smoke remains.
-- Add Postgres-backed tests for documents, users, audit, outbox, custom fields, naming series, and migrations.
-- Add Redis/BullMQ-backed tests for queue and retry behavior.
-- Add browser verification for Desk login, document CRUD, admin screens, operations screens, and responsive layouts.
-- Add CLI smoke coverage for generated SDK output. Implemented.
-
-Exit criteria:
-
-- CI can run unit tests without services and integration tests with service containers.
-- A production-like smoke command verifies the built Nitro server.
-
-## Phase 3 - Auth Lifecycle
-
-Status: implemented for framework core; concrete cookie/OIDC adapters pending
-
-- Add refresh tokens or short-lived cookie sessions. Signed session rotation implemented through `/api/auth/refresh`; cookie transport remains pending.
-- Add session revocation and user disable/lockout. Implemented with in-memory and Postgres persistence.
-- Add password change/reset workflows. Implemented with self-service password change and admin reset endpoints.
-- Add auth audit events for user, role, and token management. Implemented with an auth-owned audit sink and `/api/auth/audit`.
-- Add provider ports for OAuth/OIDC. Provider-independent login port implemented; concrete OAuth/OIDC adapters remain pending.
+1. [#19 Add atomic mutations, optimistic concurrency, and durable uniqueness](https://github.com/WilliamCorotan/FrameKit/issues/19)
+2. [#20 Push query operations and stable cursor pagination into Postgres](https://github.com/WilliamCorotan/FrameKit/issues/20)
+3. [#21 Harden executable migrations, drift detection, and route semantics](https://github.com/WilliamCorotan/FrameKit/issues/21)
+4. [#22 Provide durable job execution, outbox claiming, and realtime replay](https://github.com/WilliamCorotan/FrameKit/issues/22)
+5. [#23 Add real full-stack Desk CI, accessibility, and browser coverage](https://github.com/WilliamCorotan/FrameKit/issues/23)
+6. [#24 Prove standalone packages, scaffolding, and automated publication](https://github.com/WilliamCorotan/FrameKit/issues/24)
+7. [#25 Complete production identity lifecycle and OIDC flow](https://github.com/WilliamCorotan/FrameKit/issues/25)
 
 Exit criteria:
 
-- Session and token lifecycle tests cover revocation, expiry, disabled users, and provider-independent context creation. Implemented for in-memory verification.
+- Durable commands are atomic, concurrency-safe, and retry-safe.
+- Postgres query and migration behavior is bounded, deterministic, and verified under contention.
+- Jobs and realtime work across multiple processes with recoverable delivery semantics.
+- A standalone consumer can install packed artifacts, scaffold an app, authenticate, build, and run.
+- Desk behavior is verified against the real built stack in CI.
 
-## Phase 4 - Schema Evolution
+## Priority 2 - Production Maturity
 
-Status: implemented
-
-- Convert migration plans into versioned migration records with checksums. Implemented with checksum verification on apply.
-- Add generated migration files through CLI. Implemented through `generate-migration <current> <next> [--out file]`.
-- Add rollback metadata for reversible changes. Implemented on each planned migration change.
-- Add index and unique constraint migration planning from DocType metadata. Implemented in runtime migration plans.
-- Add operator confirmation for destructive changes. Implemented through `allowDestructive` apply guard.
-
-Exit criteria:
-
-- Migration plan/apply can be audited and replayed safely across environments. Implemented through checksums, rollback metadata, destructive guards, and generated migration artifacts.
-
-## Phase 5 - Operations And Release Hardening
-
-Status: partially implemented
-
-- Add request IDs, structured logging, metrics hooks, and dependency health checks. Implemented in the Nitro adapter, including optional `/health/dependencies` checks.
-- Add rate-limiting and security-header adapters. Optional in-memory/custom rate limiting and baseline security headers implemented in the Nitro adapter.
-- Add package build outputs and publishing metadata.
-- Add changelog/versioning policy. Implemented in `docs/release.md`.
-- Add deployment docs for Node/Postgres/Redis and serverless constraints. Implemented in `docs/deployment.md`.
+1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26)
+2. [#27 Add production lifecycle, observability, compatibility, and supply-chain gates](https://github.com/WilliamCorotan/FrameKit/issues/27)
 
 Exit criteria:
 
-- `pnpm audit:all` plus integration smoke checks are enough to cut a release candidate.
+- Metadata contracts cover the selected 1.0 business semantics consistently across every adapter and generated surface.
+- Runtime resources expose lifecycle and cancellation contracts.
+- Supported platforms and compatibility guarantees are published and tested.
+- Observability, dependency security, contribution, disclosure, and support workflows are usable by operators and contributors.
 
-## Remaining External Work
+## Highest-Risk Technical Findings
 
-- Built-server CRM, Postgres, and Redis verification: [#2](https://github.com/WilliamCorotan/FrameKit/issues/2).
-- Browser verification and Desk UX hardening: [#3](https://github.com/WilliamCorotan/FrameKit/issues/3).
-- Concrete OAuth/OIDC and cookie session adapters: [#4](https://github.com/WilliamCorotan/FrameKit/issues/4).
-- Executable migration apply/replay/rollback tooling: [#5](https://github.com/WilliamCorotan/FrameKit/issues/5).
-- Package publication output hardening: [#6](https://github.com/WilliamCorotan/FrameKit/issues/6).
-- Public documentation sync and examples: [#7](https://github.com/WilliamCorotan/FrameKit/issues/7).
+1. `tenantFromRequest` accepts caller-controlled tenant, user, role, and permission headers and defaults to administrator access even when auth exists.
+2. Document persistence happens before hook, audit, outbox, and realtime work completes, so an error can be returned after partial durable success.
+3. Postgres document lists materialize the tenant/DocType result set before applying filters, sort, projection, and pagination.
+4. Unique checks are list-then-write and updates have no expected revision, so concurrent requests can duplicate or overwrite data.
+5. Runtime migration apply and CLI executable migration behavior are not one consistent contract; removal, drift, locking, and replay policies remain incomplete.
+6. Outbox dispatch has no atomic claim/lease and realtime history is process-local.
+7. The built CRM smoke reaches successful assertions but leaves open handles, which blocks CI completion.
+8. Package-local test scripts fail to discover tests because their package working directory conflicts with the root Vitest include pattern.
+
+## Verification Snapshot
+
+Reevaluation checks on 2026-07-21:
+
+- `pnpm audit:all`: lint/typecheck passed, 52 tests passed and 2 service tests skipped without service environment variables, and all packages plus the CRM and Desk built.
+- `pnpm test:desk:browser`: 5 Chromium journeys passed against mocked API routes.
+- `pnpm smoke:crm:built`: assertions passed, but the process did not terminate until interrupted; tracked by #18.
+- Package-local core, runtime, and OpenAPI test commands: failed with no tests discovered; tracked by #27.
+- GitHub issues #2 through #7 are closed and their implemented work is present; older pending references were stale.
+
+## Score Update Policy
+
+When an issue closes, update only the affected rows. A score should increase only when source behavior, focused tests, production-like verification, and user/operator documentation all support the new level. Functional code without integration evidence should not be scored as release-candidate complete.

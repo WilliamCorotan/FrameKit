@@ -245,16 +245,16 @@ export const deal = defineDocType({
 | Package | Purpose | Verification status |
 | --- | --- | --- |
 | `@framekit/core` | Pure metadata definitions: DocTypes, modules, apps, permissions, workflows, views. | Unit covered. |
-| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, migration planning, checksums, destructive guards, and migration apply records. | Unit covered; service-backed verification tracked in [#2](https://github.com/WilliamCorotan/FrameKit/issues/2). |
-| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, user/role admin, and provider-independent login ports. | In-memory lifecycle covered; concrete OAuth/OIDC and cookie adapters tracked in [#4](https://github.com/WilliamCorotan/FrameKit/issues/4). |
-| `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs, auth/admin routes, operations headers, rate limiting, telemetry hooks, and health dependency checks. | In-process smoke covered; built-server smoke tracked in [#2](https://github.com/WilliamCorotan/FrameKit/issues/2). |
+| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, migration planning, checksums, destructive guards, and migration apply records. | Unit covered; atomicity and concurrency hardening tracked in [#19](https://github.com/WilliamCorotan/FrameKit/issues/19). |
+| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, user/role admin, and provider-independent login ports. | Lifecycle and adapter paths covered; production request identity and OIDC depth tracked in [#16](https://github.com/WilliamCorotan/FrameKit/issues/16) and [#25](https://github.com/WilliamCorotan/FrameKit/issues/25). |
+| `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs, cookie transport, auth/admin routes, operations headers, rate limiting, telemetry hooks, and health dependency checks. | In-process and built assertions covered; security and terminating smoke gates tracked in [#16](https://github.com/WilliamCorotan/FrameKit/issues/16) and [#18](https://github.com/WilliamCorotan/FrameKit/issues/18). |
 | `@framekit/openapi` | OpenAPI 3.1 generator from Framekit metadata and framework routes. | Unit covered. |
-| `@framekit/db` | Postgres adapters for documents, users, roles, API tokens, session revocations, audit, outbox, custom fields, views, naming series, and migration history. | Unit covered; live Postgres verification tracked in [#2](https://github.com/WilliamCorotan/FrameKit/issues/2). |
-| `@framekit/jobs` | Queue port, BullMQ adapter, outbox dispatcher, scheduled job registry. | Unit covered; Redis/BullMQ verification tracked in [#2](https://github.com/WilliamCorotan/FrameKit/issues/2). |
-| `@framekit/realtime` | Event bus contract and in-memory publisher/subscriber for document events and SSE routes. | Unit and in-process smoke covered; durable replay remains future work. |
-| `@framekit/sdk` | HTTP client for auth lifecycle, provider login, metadata, documents, audit, outbox, customization, views, migrations, realtime, and admin APIs. | Unit covered; endpoint parity documented here. |
-| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and generated migration artifacts. | CLI smoke covered; executable replay/rollback tooling tracked in [#5](https://github.com/WilliamCorotan/FrameKit/issues/5). |
-| `@framekit/desk` | React Desk UI generated from metadata, auth/admin/operations/customization surfaces. | Build covered; browser verification tracked in [#3](https://github.com/WilliamCorotan/FrameKit/issues/3). |
+| `@framekit/db` | Postgres adapters for documents, users, roles, API tokens, session revocations, audit, outbox, custom fields, views, naming series, and migration history. | Postgres integration covered; atomicity, query pushdown, and migration depth tracked in [#19](https://github.com/WilliamCorotan/FrameKit/issues/19), [#20](https://github.com/WilliamCorotan/FrameKit/issues/20), and [#21](https://github.com/WilliamCorotan/FrameKit/issues/21). |
+| `@framekit/jobs` | Queue port, BullMQ adapter, outbox dispatcher, scheduled job registry. | Unit and Redis/BullMQ integration covered; durable worker behavior tracked in [#22](https://github.com/WilliamCorotan/FrameKit/issues/22). |
+| `@framekit/realtime` | Event bus contract and in-memory publisher/subscriber for document events and SSE routes. | Unit and in-process smoke covered; durable replay is tracked in [#22](https://github.com/WilliamCorotan/FrameKit/issues/22). |
+| `@framekit/sdk` | HTTP client for auth lifecycle, provider login, metadata, documents, audit, outbox, customization, views, migrations, realtime, and admin APIs. | Unit covered; generated endpoint parity and standalone consumer verification are tracked in [#24](https://github.com/WilliamCorotan/FrameKit/issues/24). |
+| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and executable migration workflows. | CLI smoke covered; standalone consumer and publication proof tracked in [#24](https://github.com/WilliamCorotan/FrameKit/issues/24). |
+| `@framekit/desk` | React Desk UI generated from metadata, auth/admin/operations/customization surfaces. | Build and mocked browser journeys covered; real full-stack browser CI tracked in [#23](https://github.com/WilliamCorotan/FrameKit/issues/23). |
 
 ## Repository Layout
 
@@ -267,7 +267,7 @@ docs/              Architecture, deployment, and roadmap docs
 
 ## Deployment
 
-The default production target is a Nitro Node server with Postgres and Redis:
+The intended production target is a Nitro Node server with Postgres and Redis. The current release is an advanced alpha and must not be treated as production-ready until the P0 security items in the [maturity roadmap](docs/maturity-roadmap.md) are closed.
 
 ```bash
 docker compose up --build
@@ -333,7 +333,7 @@ pnpm audit:all
 Current verification status:
 
 - Full audit passes: lint, typecheck, tests, and build.
-- Test suite passes: 9 files, 44 tests.
+- Test suite passes locally: 9 files and 52 tests; 2 service-backed files and 2 tests skip without service environment variables.
 - Production build passes for packages, Desk, and CRM example.
 - In-process Nitro smoke covers auth lifecycle, provider login, OpenAPI, diagnostics, document CRUD, uniqueness, filters, cursor/projection, auth admin, password reset/change, customization, migrations, outbox, realtime history, and security/operations headers.
 
@@ -352,7 +352,7 @@ See [docs/architecture.md](docs/architecture.md).
 
 ## Roadmap Status
 
-The current local framework core is largely implemented. Remaining release-candidate work is tracked in [docs/maturity-roadmap.md](docs/maturity-roadmap.md) and GitHub Issues.
+Framekit is currently assessed as an advanced alpha: 52% implemented toward a production-ready 1.0, with broad MVP functionality but open security, consistency, scale, and release-gate work. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
 
 ## License
 
