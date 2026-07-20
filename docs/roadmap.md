@@ -19,18 +19,18 @@ For the active production-depth roadmap after the MVP phases below, see [maturit
 
 ### Phase 1 - Authentication And Sessions
 
-Status: implemented for the MVP, with security remediation required by [#16](https://github.com/WilliamCorotan/FrameKit/issues/16)
+Status: implemented for the MVP; authenticated routing was hardened by [#16](https://github.com/WilliamCorotan/FrameKit/issues/16)
 
 - Add a framework auth package with password hashing, signed sessions, tenant context resolution, and an in-memory user store.
 - Add Nitro auth endpoints for login and current user.
-- Let generated document routes resolve tenant/user context from Bearer tokens. The original header fallback is not safely development-only and must be replaced by #16.
+- Generated document routes resolve tenant/user context from Bearer tokens or signed cookies. Header-derived identity is now restricted to an explicit development/test-only mode when auth is not configured.
 - Seed the CRM example with an admin user.
 
 Exit criteria:
 
 - Login returns a signed session token.
 - `/api/auth/me` returns the current user from the token.
-- Document routes work with Bearer tokens; any header-derived development identity must become explicit, fail-safe, and production-disabled.
+- Document routes work with signed authentication; header-derived development identity is explicit, fail-safe, and production-disabled.
 
 ### Phase 2 - Durable Framework Records
 
