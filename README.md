@@ -156,6 +156,7 @@ Framework operations use dedicated permissions (or the `*` superuser permission)
 | `framekit.diagnostics.read` | Runtime diagnostics |
 | `framekit.migrations.read` | Migration history |
 | `framekit.migrations.manage` | Migration planning and apply |
+| `framekit.realtime.read` | Realtime event history and SSE stream |
 | `framekit.audit.read` | Runtime audit trail |
 | `framekit.outbox.read` | Outbox inspection |
 | `framekit.outbox.manage` | Outbox dispatch/failure mutation |

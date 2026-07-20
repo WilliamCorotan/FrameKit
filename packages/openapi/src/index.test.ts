@@ -63,6 +63,8 @@ describe("createOpenApiDocument", () => {
     expect(doc.paths["/api/auth/login"]?.post?.security).toEqual([]);
     expect(doc.paths["/api/auth/providers/{id}/login"]?.post?.security).toEqual([]);
     expect(doc.paths["/api/meta"]?.get?.security).toBeUndefined();
+    expect(doc.paths["/api/realtime/events"]?.get?.["x-framekit-permission"]).toBe("framekit.realtime.read");
+    expect(doc.paths["/api/realtime/stream"]?.get?.["x-framekit-permission"]).toBe("framekit.realtime.read");
     expect(doc.components.parameters).not.toHaveProperty("UserId");
     expect(doc.components.parameters).not.toHaveProperty("Roles");
     expect(doc.components.parameters).not.toHaveProperty("Permissions");

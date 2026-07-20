@@ -127,7 +127,31 @@ describe("createNitroHandler", () => {
       name: "Secure",
       modules: [defineModule({ id: "records", name: "Records", doctypes: [record] })]
     });
-    const runtime = createRuntime(app);
+    const realtimeHistory: RuntimeRealtimeEvent[] = [{
+      channel: "tenant:default:documents",
+      type: "record.updated",
+      payload: { doctype: "record", document: { title: "Realtime payload" } }
+    }];
+    const realtimeListeners = new Map<string, Set<(event: RuntimeRealtimeEvent) => void>>();
+    const runtime = createRuntime(app, {
+      realtime: {
+        publish(event) {
+          realtimeHistory.push(event);
+          for (const listener of realtimeListeners.get(event.channel) ?? []) {
+            listener(event);
+          }
+        },
+        list(channel) {
+          return realtimeHistory.filter((event) => event.channel === channel);
+        },
+        subscribe(channel, listener) {
+          const listeners = realtimeListeners.get(channel) ?? new Set<(event: RuntimeRealtimeEvent) => void>();
+          listeners.add(listener);
+          realtimeListeners.set(channel, listeners);
+          return () => listeners.delete(listener);
+        }
+      }
+    });
     await runtime.create(
       { tenantId: "other", userId: "seed", roles: [], permissions: ["*"] },
       "record",
@@ -144,6 +168,15 @@ describe("createNitroHandler", () => {
           passwordHash: await hashPassword("reader-password"),
           roles: ["reader"],
           permissions: ["records.read"]
+        },
+        {
+          tenantId: "default",
+          id: "realtime-reader",
+          email: "realtime@example.com",
+          name: "Realtime Reader",
+          passwordHash: await hashPassword("realtime-password"),
+          roles: ["realtime-reader"],
+          permissions: ["framekit.realtime.read"]
         }
       ])
     });
@@ -197,6 +230,8 @@ describe("createNitroHandler", () => {
     const operationRequests: Array<[string, string, unknown?]> = [
       ["GET", "/api/diagnostics"],
       ["GET", "/api/migrations"],
+      ["GET", "/api/realtime/events"],
+      ["GET", "/api/realtime/stream"],
       ["POST", "/api/migrations/plan", { app }],
       ["POST", "/api/migrations/apply", { plan: {} }],
       ["GET", "/api/audit"],
@@ -214,6 +249,28 @@ describe("createNitroHandler", () => {
         body
       }), `${method} ${path}`).rejects.toMatchObject({ code: "FORBIDDEN" });
     }
+
+    const realtimeLogin = await json<{ token: string }>(fetch, "/api/auth/login", {
+      method: "POST",
+      body: { email: "realtime@example.com", password: "realtime-password" }
+    });
+    const realtimeHeaders = { authorization: `Bearer ${realtimeLogin.token}` };
+    const history = await json<RuntimeRealtimeEvent[]>(fetch, "/api/realtime/events", { headers: realtimeHeaders });
+    expect(history).toEqual([expect.objectContaining({ type: "record.updated" })]);
+
+    const streamResponse = await fetch(new Request("http://localhost/api/realtime/stream", { headers: realtimeHeaders }));
+    expect(streamResponse.status).toBe(200);
+    expect(streamResponse.headers.get("content-type")).toContain("text/event-stream");
+    const streamReader = streamResponse.body?.getReader();
+    expect(streamReader).toBeDefined();
+    const firstChunk = await streamReader!.read();
+    expect(new TextDecoder().decode(firstChunk.value)).toContain("retry: 3000");
+    for (const listener of realtimeListeners.get("tenant:default:documents") ?? []) {
+      listener(realtimeHistory[0]!);
+    }
+    const eventChunk = await streamReader!.read();
+    expect(new TextDecoder().decode(eventChunk.value)).toContain("Realtime payload");
+    await streamReader!.cancel();
   });
 
   it("allows header identity only through the explicit non-production development escape hatch", async () => {

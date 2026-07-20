@@ -24,6 +24,7 @@ type Operation = {
   requestBody?: unknown;
   responses: Record<string, unknown>;
   security?: Array<Record<string, never[]>>;
+  "x-framekit-permission"?: string;
 };
 
 export function createOpenApiDocument(app: AppDefinition, options: OpenApiOptions = {}) {
@@ -189,6 +190,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: "listRealtimeEvents",
         summary: "List recent realtime document events",
         tags: ["System"],
+        "x-framekit-permission": "framekit.realtime.read",
         parameters: [queryParam("limit", "integer")],
         responses: okResponse({ type: "array", items: { type: "object", additionalProperties: true } })
       }
@@ -198,6 +200,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: "streamRealtimeEvents",
         summary: "Stream realtime document events using server-sent events",
         tags: ["System"],
+        "x-framekit-permission": "framekit.realtime.read",
         responses: {
           "200": {
             description: "Realtime event stream",

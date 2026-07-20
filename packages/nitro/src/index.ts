@@ -336,13 +336,16 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.migrationHistory(tenant);
       }
       if (method === "GET" && path === basePath + "/realtime/events") {
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.realtime.read", "read realtime events");
         const query = getQuery(event);
-        return await runtime.realtimeEvents(await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity), {
+        return await runtime.realtimeEvents(tenant, {
           limit: typeof query.limit === "string" ? Number(query.limit) : undefined
         });
       }
       if (method === "GET" && path === basePath + "/realtime/stream") {
         const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.realtime.read", "stream realtime events");
         return createRealtimeStream(runtime, tenant, event.req.signal);
       }
       if (method === "POST" && path === basePath + "/migrations/plan") {
