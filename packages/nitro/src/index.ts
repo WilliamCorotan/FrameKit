@@ -13,6 +13,15 @@ export type NitroAdapterOptions = {
   rateLimit?: NitroRateLimitOptions | NitroRateLimiter | false;
   healthChecks?: Record<string, NitroHealthCheck>;
   authCookie?: NitroAuthCookieOptions | false;
+  development?: NitroDevelopmentOptions;
+};
+
+export type NitroDevelopmentOptions = {
+  /**
+   * Accept caller-provided identity headers when no auth service is configured.
+   * This escape hatch is accepted only when NODE_ENV is "development" or "test".
+   */
+  allowHeaderIdentity?: boolean;
 };
 
 export type NitroAuthCookieOptions = {
@@ -61,6 +70,11 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
   const basePath = options.basePath ?? "/api";
   const rateLimiter = createRateLimiter(options.rateLimit);
   const authCookie = options.authCookie === false ? undefined : normalizeAuthCookieOptions(options.authCookie);
+  const allowHeaderIdentity = options.development?.allowHeaderIdentity === true;
+  const environment = nodeEnvironment();
+  if (allowHeaderIdentity && environment !== "development" && environment !== "test") {
+    throw new Error("development.allowHeaderIdentity requires NODE_ENV=development or NODE_ENV=test.");
+  }
 
   return defineEventHandler(async (event) => {
     const startedAt = performance.now();
@@ -72,7 +86,9 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
     try {
       event.res.headers.set("access-control-allow-origin", "*");
       event.res.headers.set("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
-      event.res.headers.set("access-control-allow-headers", "authorization,content-type,x-tenant-id,x-user-id,x-roles,x-permissions");
+      event.res.headers.set("access-control-allow-headers", allowHeaderIdentity
+        ? "authorization,content-type,x-tenant-id,x-user-id,x-roles,x-permissions"
+        : "authorization,content-type,x-tenant-id");
       event.res.headers.set("x-request-id", requestId);
       event.res.headers.set("x-content-type-options", "nosniff");
       event.res.headers.set("referrer-policy", "no-referrer");
@@ -101,7 +117,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return health;
       }
       if (method === "GET" && path === basePath + "/meta") {
-        return await runtime.metadata(await tenantFromRequest(event.req, options.auth, authCookie));
+        return await runtime.metadata(await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity));
       }
       if (method === "POST" && path === basePath + "/auth/login") {
         if (!options.auth) {
@@ -310,23 +326,28 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         throw new FramekitError("METHOD_NOT_ALLOWED", "Method not allowed", 405);
       }
       if (method === "GET" && path === basePath + "/diagnostics") {
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.diagnostics.read", "read runtime diagnostics");
         return await runtime.diagnostics();
       }
       if (method === "GET" && path === basePath + "/migrations") {
-        return await runtime.migrationHistory(await tenantFromRequest(event.req, options.auth, authCookie));
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.migrations.read", "read migration history");
+        return await runtime.migrationHistory(tenant);
       }
       if (method === "GET" && path === basePath + "/realtime/events") {
         const query = getQuery(event);
-        return await runtime.realtimeEvents(await tenantFromRequest(event.req, options.auth, authCookie), {
+        return await runtime.realtimeEvents(await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity), {
           limit: typeof query.limit === "string" ? Number(query.limit) : undefined
         });
       }
       if (method === "GET" && path === basePath + "/realtime/stream") {
-        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
         return createRealtimeStream(runtime, tenant, event.req.signal);
       }
       if (method === "POST" && path === basePath + "/migrations/plan") {
-        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.migrations.manage", "plan migrations");
         const body = ((await readBody(event)) ?? {}) as { app?: unknown };
         if (!body.app || typeof body.app !== "object") {
           throw new FramekitError("VALIDATION_FAILED", "app is required.", 422);
@@ -334,7 +355,8 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.planMigration(tenant, body.app as never);
       }
       if (method === "POST" && path === basePath + "/migrations/apply") {
-        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.migrations.manage", "apply migrations");
         const body = ((await readBody(event)) ?? {}) as { plan?: unknown; allowDestructive?: boolean };
         if (!body.plan || typeof body.plan !== "object") {
           throw new FramekitError("VALIDATION_FAILED", "plan is required.", 422);
@@ -342,14 +364,16 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.applyMigration(tenant, body.plan as never, { allowDestructive: body.allowDestructive });
       }
       if (method === "GET" && path === basePath + "/audit") {
-        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.audit.read", "read audit events");
         const query = getQuery(event);
         return await runtime.auditTrail(tenant, {
           limit: typeof query.limit === "string" ? Number(query.limit) : undefined
         });
       }
       if (method === "GET" && path === basePath + "/outbox") {
-        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.outbox.read", "read outbox events");
         const query = getQuery(event);
         return await runtime.outboxEvents(tenant, {
           limit: typeof query.limit === "string" ? Number(query.limit) : undefined,
@@ -358,7 +382,8 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       }
       const outboxAction = matchOutboxPath(path, basePath);
       if (method === "POST" && outboxAction) {
-        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.outbox.manage", "mutate outbox events");
         if (outboxAction.action === "dispatch") {
           return await runtime.markOutboxDispatched(tenant, outboxAction.id);
         }
@@ -372,10 +397,13 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         });
       }
       if (method === "GET" && path === basePath + "/custom-fields") {
-        return await runtime.customFields(await tenantFromRequest(event.req, options.auth, authCookie));
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.customization.read", "read custom fields");
+        return await runtime.customFields(tenant);
       }
       if (method === "POST" && path === basePath + "/custom-fields") {
-        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.customization.manage", "add custom fields");
         const body = ((await readBody(event)) ?? {}) as { doctype?: string; field?: unknown };
         if (!body.doctype || !body.field) {
           throw new FramekitError("VALIDATION_FAILED", "doctype and field are required.", 422);
@@ -384,10 +412,13 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.addCustomField(tenant, { doctype: body.doctype, field: body.field });
       }
       if (method === "GET" && path === basePath + "/views") {
-        return await runtime.views(await tenantFromRequest(event.req, options.auth, authCookie));
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.customization.read", "read views");
+        return await runtime.views(tenant);
       }
       if (method === "POST" && path === basePath + "/views") {
-        const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.customization.manage", "update views");
         const body = ((await readBody(event)) ?? {}) as { doctype?: string; type?: "list" | "form"; fields?: string[] };
         if (!body.doctype || (body.type !== "list" && body.type !== "form") || !Array.isArray(body.fields)) {
           throw new FramekitError("VALIDATION_FAILED", "doctype, type, and fields are required.", 422);
@@ -400,7 +431,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         throw new FramekitError("NOT_FOUND", "Route not found", 404);
       }
 
-      const tenant = await tenantFromRequest(event.req, options.auth, authCookie);
+      const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
       if (method === "GET" && !match.id) {
         const query = getQuery(event);
         return await runtime.list(tenant, match.doctype, {
@@ -541,11 +572,21 @@ async function authenticatedTenantFromRequest(request: Request, auth: PasswordAu
   return (await auth.verifyBearerToken(token)).context;
 }
 
-async function tenantFromRequest(request: Request, auth?: PasswordAuthService, cookie?: Required<NitroAuthCookieOptions>): Promise<TenantContext> {
+async function tenantFromRequest(
+  request: Request,
+  auth?: PasswordAuthService,
+  cookie?: Required<NitroAuthCookieOptions>,
+  allowHeaderIdentity = false
+): Promise<TenantContext> {
   const token = sessionTokenFromRequest(request, cookie);
-  if (token && auth) {
-    const session = await auth.verifyBearerToken(token);
-    return session.context;
+  if (auth) {
+    if (!token) {
+      throw new FramekitError("UNAUTHENTICATED", "Missing session token.", 401);
+    }
+    return (await auth.verifyBearerToken(token)).context;
+  }
+  if (!allowHeaderIdentity) {
+    throw new FramekitError("AUTH_NOT_CONFIGURED", "Auth is required for protected routes.", 501);
   }
   return {
     tenantId: request.headers.get("x-tenant-id") ?? "default",
@@ -620,6 +661,13 @@ function assertAuthManager(tenant: TenantContext): void {
   throw new FramekitError("FORBIDDEN", "Missing permission to manage authentication resources.", 403);
 }
 
+function assertOperationPermission(tenant: TenantContext, permission: string, operation: string): void {
+  if (tenant.permissions.includes("*") || tenant.permissions.includes(permission)) {
+    return;
+  }
+  throw new FramekitError("FORBIDDEN", `Missing ${permission} permission to ${operation}.`, 403);
+}
+
 function splitHeader(value: string | null): string[] | undefined {
   return value ? value.split(",").map((part) => part.trim()).filter(Boolean) : undefined;
 }
@@ -649,6 +697,10 @@ function createRateLimiter(option: NitroAdapterOptions["rateLimit"]): NitroRateL
 
 function requestKey(request: Request): string {
   return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || request.headers.get("x-real-ip") || "local";
+}
+
+function nodeEnvironment(): string | undefined {
+  return (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
 }
 
 async function runHealthChecks(checks: Record<string, NitroHealthCheck>) {
