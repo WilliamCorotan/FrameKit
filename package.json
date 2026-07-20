@@ -16,6 +16,7 @@
     "test:desk:browser": "pnpm --filter @framekit/desk test:browser",
     "test:services": "pnpm --filter @framekit/db test:integration && pnpm --filter @framekit/jobs test:integration",
     "smoke:crm:built": "pnpm --filter @framekit/example-crm smoke:built",
+    "test:smoke:crm:built": "pnpm --filter @framekit/example-crm test:smoke-built",
     "typecheck": "pnpm -r --if-present typecheck",
     "audit:all": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
   },
