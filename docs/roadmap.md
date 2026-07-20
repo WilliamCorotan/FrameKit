@@ -1,6 +1,6 @@
 # Framekit Roadmap
 
-> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-21, Framekit is assessed at 52% implementation toward a production-ready 1.0 and remains an advanced alpha.
+> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-21, Framekit is assessed at 55% implementation toward a production-ready 1.0 and remains an advanced alpha.
 
 ## Implemented
 
@@ -119,8 +119,8 @@ Core and runtime remain inward modules. Nitro, Postgres, BullMQ, and Desk are ad
 
 ### 2026-07-21 - Production Maturity Reevaluation
 
-- Reclassified the project as advanced alpha: broad MVP functionality is present, but production readiness is blocked by request identity fail-open behavior and a non-terminating built-server CI smoke.
+- Reclassified the project as advanced alpha: broad MVP functionality is present, while production-safe defaults and transactional consistency remain incomplete.
 - Replaced the stale external-work list in the maturity roadmap: issues #2 through #7 are closed and their implementations are present.
-- Scored 12 modern framework components using a production-ready 1.0 rubric; component-average implementation is 52%, functional breadth is approximately 59%, and production readiness is approximately 38%.
+- Scored 12 modern framework components using a production-ready 1.0 rubric; after completing #16 and #18, component-average implementation is 55%, functional breadth is approximately 60%, and production readiness is approximately 43%.
 - Opened prioritized tracking issues #16 through #27 with acceptance criteria.
-- Current order: secure identity and release gates, atomic/concurrent persistence, scalable queries and migrations, durable jobs/realtime, full-stack verification and standalone publication, then deeper domain and operational maturity.
+- Current order: finish production-safe HTTP/auth defaults, then atomic/concurrent persistence, scalable queries and migrations, durable jobs/realtime, full-stack verification and standalone publication, and deeper domain and operational maturity.
