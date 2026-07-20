@@ -90,6 +90,7 @@ async function createApp(rawName: string, log: (message: string) => void): Promi
           typecheck: "tsc -p tsconfig.json --noEmit"
         },
         dependencies: {
+          "@framekit/auth": "workspace:*",
           "@framekit/core": "workspace:*",
           "@framekit/nitro": "workspace:*",
           "@framekit/runtime": "workspace:*",
@@ -107,13 +108,13 @@ async function createApp(rawName: string, log: (message: string) => void): Promi
   );
   await writeFile(
     join(id, "routes", "[...].ts"),
-    `import { createNitroHandler } from "@framekit/nitro";\nimport { runtime } from "../src/app.js";\n\nexport default createNitroHandler(runtime);\n`
+    `import { createNitroHandler } from "@framekit/nitro";\nimport { auth, runtime } from "../src/app.js";\n\nexport default createNitroHandler(runtime, { auth });\n`
   );
   await writeFile(
     join(id, "src", "app.ts"),
-    `import { defineApp, defineDocType, defineModule } from "@framekit/core";\nimport { createRuntime } from "@framekit/runtime";\n\nconst note = defineDocType({\n  name: "note",\n  label: "Note",\n  naming: { prefix: "NOTE", series: true, digits: 5 },\n  fields: [\n    { name: "title", label: "Title", type: "text", required: true, inList: true },\n    { name: "body", label: "Body", type: "long_text" }\n  ],\n  permissions: [\n    { action: "create", permissions: ["notes.write"] },\n    { action: "read", permissions: ["notes.read"] },\n    { action: "update", permissions: ["notes.write"] }\n  ]\n});\n\nconst notes = defineModule({\n  id: "notes",\n  name: "Notes",\n  doctypes: [note],\n  permissions: ["notes.read", "notes.write"],\n  navigation: [{ label: "Notes", path: "/doctype/note", order: 10 }]\n});\n\nexport const app = defineApp({ name: "${title(id)}", modules: [notes] });\nexport const runtime = createRuntime(app);\n`
+    `import { hashPassword, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";\nimport { defineApp, defineDocType, defineModule } from "@framekit/core";\nimport { createRuntime } from "@framekit/runtime";\n\nconst note = defineDocType({\n  name: "note",\n  label: "Note",\n  naming: { prefix: "NOTE", series: true, digits: 5 },\n  fields: [\n    { name: "title", label: "Title", type: "text", required: true, inList: true },\n    { name: "body", label: "Body", type: "long_text" }\n  ],\n  permissions: [\n    { action: "create", permissions: ["notes.write"] },\n    { action: "read", permissions: ["notes.read"] },\n    { action: "update", permissions: ["notes.write"] }\n  ]\n});\n\nconst notes = defineModule({\n  id: "notes",\n  name: "Notes",\n  doctypes: [note],\n  permissions: ["notes.read", "notes.write"],\n  navigation: [{ label: "Notes", path: "/doctype/note", order: 10 }]\n});\n\nexport const app = defineApp({ name: "${title(id)}", modules: [notes] });\nexport const runtime = createRuntime(app);\nexport const auth = new PasswordAuthService({\n  secret: process.env.FRAMEKIT_AUTH_SECRET ?? "development-secret-change-me",\n  userStore: new InMemoryUserStore([{\n    tenantId: "default",\n    id: "admin",\n    email: process.env.FRAMEKIT_ADMIN_EMAIL ?? "admin@example.com",\n    name: "Administrator",\n    passwordHash: await hashPassword(process.env.FRAMEKIT_ADMIN_PASSWORD ?? "change-me-before-deploying"),\n    roles: ["administrator"],\n    permissions: ["*"]\n  }])\n});\n`
   );
-  await writeFile(join(id, ".env.example"), "PORT=3000\nNITRO_PRESET=node-server\n");
+  await writeFile(join(id, ".env.example"), "PORT=3000\nNITRO_PRESET=node-server\nFRAMEKIT_AUTH_SECRET=replace-with-a-long-random-secret\nFRAMEKIT_ADMIN_EMAIL=admin@example.com\nFRAMEKIT_ADMIN_PASSWORD=replace-before-deploying\n");
   await writeFile(
     join(id, "Dockerfile"),
     `FROM node:24-alpine AS deps\nWORKDIR /app\nCOPY . .\nRUN corepack enable && corepack prepare pnpm@11.9.0 --activate && pnpm install --frozen-lockfile=false\n\nFROM deps AS build\nRUN pnpm build\n\nFROM node:24-alpine AS runner\nWORKDIR /app\nENV NODE_ENV=production\nCOPY --from=build /app/.output ./.output\nEXPOSE 3000\nCMD ["node", ".output/server/index.mjs"]\n`

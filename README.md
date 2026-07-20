@@ -147,6 +147,24 @@ curl -s http://localhost:3000/api/doctypes/customer \
   -H "authorization: Bearer $TOKEN"
 ```
 
+When an auth service is configured, every API route except health checks, login/provider login, and the OpenAPI document requires a valid bearer token or session cookie. Tenant, user, role, and permission headers never override that authenticated context.
+
+Framework operations use dedicated permissions (or the `*` superuser permission):
+
+| Permission | Operations |
+| --- | --- |
+| `framekit.diagnostics.read` | Runtime diagnostics |
+| `framekit.migrations.read` | Migration history |
+| `framekit.migrations.manage` | Migration planning and apply |
+| `framekit.realtime.read` | Realtime event history and SSE stream |
+| `framekit.audit.read` | Runtime audit trail |
+| `framekit.outbox.read` | Outbox inspection |
+| `framekit.outbox.manage` | Outbox dispatch/failure mutation |
+| `framekit.customization.read` | Custom-field and view inspection |
+| `framekit.customization.manage` | Custom-field and view mutation |
+
+Apps without an auth service cannot access protected routes by default. Local-only prototypes may explicitly enable `development.allowHeaderIdentity`; Framekit accepts that escape hatch only when `NODE_ENV=development` or `NODE_ENV=test`.
+
 SDK auth lifecycle and admin example:
 
 ```ts

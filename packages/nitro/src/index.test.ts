@@ -1,5 +1,5 @@
 import { H3, toWebHandler } from "h3";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, type RuntimeRealtimeEvent } from "@framekit/runtime";
@@ -114,6 +114,189 @@ describe("createNitroHandler", () => {
     }));
     expect(logout.status).toBe(204);
     expect(logout.headers.getSetCookie()[0]).toContain("Max-Age=0");
+  });
+
+  it("requires authenticated identity, ignores forged identity headers, and enforces operations permissions", async () => {
+    const record = defineDocType({
+      name: "record",
+      label: "Record",
+      fields: [{ name: "title", label: "Title", type: "text", required: true }],
+      permissions: [{ action: "read", permissions: ["records.read"] }]
+    });
+    const app = defineApp({
+      name: "Secure",
+      modules: [defineModule({ id: "records", name: "Records", doctypes: [record] })]
+    });
+    const realtimeHistory: RuntimeRealtimeEvent[] = [{
+      channel: "tenant:default:documents",
+      type: "record.updated",
+      payload: { doctype: "record", document: { title: "Realtime payload" } }
+    }];
+    const realtimeListeners = new Map<string, Set<(event: RuntimeRealtimeEvent) => void>>();
+    const runtime = createRuntime(app, {
+      realtime: {
+        publish(event) {
+          realtimeHistory.push(event);
+          for (const listener of realtimeListeners.get(event.channel) ?? []) {
+            listener(event);
+          }
+        },
+        list(channel) {
+          return realtimeHistory.filter((event) => event.channel === channel);
+        },
+        subscribe(channel, listener) {
+          const listeners = realtimeListeners.get(channel) ?? new Set<(event: RuntimeRealtimeEvent) => void>();
+          listeners.add(listener);
+          realtimeListeners.set(channel, listeners);
+          return () => listeners.delete(listener);
+        }
+      }
+    });
+    await runtime.create(
+      { tenantId: "other", userId: "seed", roles: [], permissions: ["*"] },
+      "record",
+      { title: "Other tenant secret" }
+    );
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      userStore: new InMemoryUserStore([
+        {
+          tenantId: "default",
+          id: "reader",
+          email: "reader@example.com",
+          name: "Reader",
+          passwordHash: await hashPassword("reader-password"),
+          roles: ["reader"],
+          permissions: ["records.read"]
+        },
+        {
+          tenantId: "default",
+          id: "realtime-reader",
+          email: "realtime@example.com",
+          name: "Realtime Reader",
+          passwordHash: await hashPassword("realtime-password"),
+          roles: ["realtime-reader"],
+          permissions: ["framekit.realtime.read"]
+        }
+      ])
+    });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { auth }));
+    const fetch = toWebHandler(h3);
+
+    for (const path of ["/health", "/health/dependencies", "/api/openapi.json"]) {
+      expect((await fetch(new Request(`http://localhost${path}`))).status).toBe(200);
+    }
+
+    const protectedPaths = [
+      "/api/meta",
+      "/api/diagnostics",
+      "/api/migrations",
+      "/api/realtime/events",
+      "/api/realtime/stream",
+      "/api/audit",
+      "/api/outbox",
+      "/api/custom-fields",
+      "/api/views",
+      "/api/doctypes/record",
+      "/api/auth/users"
+    ];
+    const forgedIdentity = {
+      "x-tenant-id": "other",
+      "x-user-id": "forged-admin",
+      "x-roles": "administrator",
+      "x-permissions": "*"
+    };
+    for (const path of protectedPaths) {
+      const response = await fetch(new Request(`http://localhost${path}`, { headers: forgedIdentity }));
+      expect(response.status, path).toBe(401);
+      await expect(response.json(), path).resolves.toMatchObject({ code: "UNAUTHENTICATED" });
+    }
+
+    const login = await json<{ token: string }>(fetch, "/api/auth/login", {
+      method: "POST",
+      body: { email: "reader@example.com", password: "reader-password" }
+    });
+    const forgedAuthenticatedHeaders = {
+      authorization: `Bearer ${login.token}`,
+      ...forgedIdentity
+    };
+    const records = await json<Array<{ data: { title: string } }>>(fetch, "/api/doctypes/record", {
+      headers: forgedAuthenticatedHeaders
+    });
+    expect(records).toEqual([]);
+    await expect(json(fetch, "/api/auth/users", { headers: forgedAuthenticatedHeaders })).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    const operationRequests: Array<[string, string, unknown?]> = [
+      ["GET", "/api/diagnostics"],
+      ["GET", "/api/migrations"],
+      ["GET", "/api/realtime/events"],
+      ["GET", "/api/realtime/stream"],
+      ["POST", "/api/migrations/plan", { app }],
+      ["POST", "/api/migrations/apply", { plan: {} }],
+      ["GET", "/api/audit"],
+      ["GET", "/api/outbox"],
+      ["POST", "/api/outbox/forged/dispatch"],
+      ["GET", "/api/custom-fields"],
+      ["POST", "/api/custom-fields", { doctype: "record", field: { name: "note", label: "Note", type: "text" } }],
+      ["GET", "/api/views"],
+      ["POST", "/api/views", { doctype: "record", type: "list", fields: ["title"] }]
+    ];
+    for (const [method, path, body] of operationRequests) {
+      await expect(json(fetch, path, {
+        method,
+        headers: forgedAuthenticatedHeaders,
+        body
+      }), `${method} ${path}`).rejects.toMatchObject({ code: "FORBIDDEN" });
+    }
+
+    const realtimeLogin = await json<{ token: string }>(fetch, "/api/auth/login", {
+      method: "POST",
+      body: { email: "realtime@example.com", password: "realtime-password" }
+    });
+    const realtimeHeaders = { authorization: `Bearer ${realtimeLogin.token}` };
+    const history = await json<RuntimeRealtimeEvent[]>(fetch, "/api/realtime/events", { headers: realtimeHeaders });
+    expect(history).toEqual([expect.objectContaining({ type: "record.updated" })]);
+
+    const streamResponse = await fetch(new Request("http://localhost/api/realtime/stream", { headers: realtimeHeaders }));
+    expect(streamResponse.status).toBe(200);
+    expect(streamResponse.headers.get("content-type")).toContain("text/event-stream");
+    const streamReader = streamResponse.body?.getReader();
+    expect(streamReader).toBeDefined();
+    const firstChunk = await streamReader!.read();
+    expect(new TextDecoder().decode(firstChunk.value)).toContain("retry: 3000");
+    for (const listener of realtimeListeners.get("tenant:default:documents") ?? []) {
+      listener(realtimeHistory[0]!);
+    }
+    const eventChunk = await streamReader!.read();
+    expect(new TextDecoder().decode(eventChunk.value)).toContain("Realtime payload");
+    await streamReader!.cancel();
+  });
+
+  it("allows header identity only through the explicit non-production development escape hatch", async () => {
+    const runtime = createRuntime(defineApp({ name: "Development", modules: [] }));
+    const secureH3 = new H3();
+    secureH3.all("/**", createNitroHandler(runtime));
+    const secureResponse = await toWebHandler(secureH3)(new Request("http://localhost/api/meta", {
+      headers: { "x-user-id": "developer", "x-permissions": "*" }
+    }));
+    expect(secureResponse.status).toBe(501);
+
+    const developmentH3 = new H3();
+    developmentH3.all("/**", createNitroHandler(runtime, { development: { allowHeaderIdentity: true } }));
+    const developmentResponse = await toWebHandler(developmentH3)(new Request("http://localhost/api/meta", {
+      headers: { "x-user-id": "developer", "x-permissions": "*" }
+    }));
+    expect(developmentResponse.status).toBe(200);
+
+    vi.stubEnv("NODE_ENV", "production");
+    try {
+      expect(() => createNitroHandler(runtime, { development: { allowHeaderIdentity: true } })).toThrow(
+        "development.allowHeaderIdentity requires NODE_ENV=development or NODE_ENV=test"
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("smokes auth, documents, admin APIs, customization, outbox, migrations, realtime, and OpenAPI", async () => {

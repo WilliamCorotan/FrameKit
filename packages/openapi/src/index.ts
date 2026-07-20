@@ -23,6 +23,8 @@ type Operation = {
   parameters?: unknown[];
   requestBody?: unknown;
   responses: Record<string, unknown>;
+  security?: Array<Record<string, never[]>>;
+  "x-framekit-permission"?: string;
 };
 
 export function createOpenApiDocument(app: AppDefinition, options: OpenApiOptions = {}) {
@@ -146,7 +148,17 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: "getHealth",
         summary: "Check app health",
         tags: ["System"],
-        responses: okResponse({ type: "object", additionalProperties: true })
+        responses: okResponse({ type: "object", additionalProperties: true }),
+        security: []
+      }
+    },
+    "/health/dependencies": {
+      get: {
+        operationId: "getDependencyHealth",
+        summary: "Check app dependency health",
+        tags: ["System"],
+        responses: okResponse({ type: "object", additionalProperties: true }),
+        security: []
       }
     },
     [`${basePath}/meta`]: {
@@ -178,6 +190,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: "listRealtimeEvents",
         summary: "List recent realtime document events",
         tags: ["System"],
+        "x-framekit-permission": "framekit.realtime.read",
         parameters: [queryParam("limit", "integer")],
         responses: okResponse({ type: "array", items: { type: "object", additionalProperties: true } })
       }
@@ -187,6 +200,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: "streamRealtimeEvents",
         summary: "Stream realtime document events using server-sent events",
         tags: ["System"],
+        "x-framekit-permission": "framekit.realtime.read",
         responses: {
           "200": {
             description: "Realtime event stream",
@@ -356,7 +370,8 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: "getOpenApiDocument",
         summary: "Read this OpenAPI document",
         tags: ["System"],
-        responses: okResponse({ type: "object", additionalProperties: true })
+        responses: okResponse({ type: "object", additionalProperties: true }),
+        security: []
       }
     },
     [`${basePath}/auth/login`]: {
@@ -372,7 +387,8 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
             password: { type: "string", format: "password" }
           }
         }, true),
-        responses: okResponse(ref("AuthSession"))
+        responses: okResponse(ref("AuthSession")),
+        security: []
       }
     },
     [`${basePath}/auth/providers/{id}/login`]: {
@@ -388,7 +404,8 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
             token: { type: "string" }
           }
         }, true),
-        responses: okResponse(ref("AuthSession"))
+        responses: okResponse(ref("AuthSession")),
+        security: []
       }
     },
     [`${basePath}/auth/me`]: {
@@ -668,10 +685,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         }
       },
       parameters: {
-        TenantId: headerParam("x-tenant-id"),
-        UserId: headerParam("x-user-id"),
-        Roles: headerParam("x-roles"),
-        Permissions: headerParam("x-permissions")
+        TenantId: headerParam("x-tenant-id")
       }
     },
     security: [{ bearerAuth: [] }, { cookieAuth: [] }]

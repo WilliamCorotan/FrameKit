@@ -57,6 +57,17 @@ describe("createOpenApiDocument", () => {
     expect(doc.components.schemas.CreatedApiToken).toBeDefined();
     expect(doc.components.securitySchemes.cookieAuth).toMatchObject({ type: "apiKey", in: "cookie", name: "framekit_session" });
     expect(doc.security).toEqual([{ bearerAuth: [] }, { cookieAuth: [] }]);
+    expect(doc.paths["/health"]?.get?.security).toEqual([]);
+    expect(doc.paths["/health/dependencies"]?.get?.security).toEqual([]);
+    expect(doc.paths["/api/openapi.json"]?.get?.security).toEqual([]);
+    expect(doc.paths["/api/auth/login"]?.post?.security).toEqual([]);
+    expect(doc.paths["/api/auth/providers/{id}/login"]?.post?.security).toEqual([]);
+    expect(doc.paths["/api/meta"]?.get?.security).toBeUndefined();
+    expect(doc.paths["/api/realtime/events"]?.get?.["x-framekit-permission"]).toBe("framekit.realtime.read");
+    expect(doc.paths["/api/realtime/stream"]?.get?.["x-framekit-permission"]).toBe("framekit.realtime.read");
+    expect(doc.components.parameters).not.toHaveProperty("UserId");
+    expect(doc.components.parameters).not.toHaveProperty("Roles");
+    expect(doc.components.parameters).not.toHaveProperty("Permissions");
     const dealInput = doc.components.schemas.DealInput;
     expect(dealInput).toBeDefined();
     expect(dealInput?.required).toContain("title");
