@@ -29,6 +29,11 @@ export type ListOptions = {
   };
 };
 
+export type DocumentPage = {
+  items: DocumentRecord[];
+  nextCursor?: string;
+};
+
 export type FilterPrimitive = string | number | boolean | null;
 
 export type FilterOperator = {
@@ -47,6 +52,7 @@ export type FilterValue = FilterPrimitive | FilterPrimitive[] | FilterOperator;
 
 export type DocumentRepository = {
   list(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentRecord[]>;
+  listPage?(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentPage>;
   get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined>;
   create(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord>;
   update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options?: { expectedRevision?: number }): Promise<DocumentRecord>;
@@ -445,10 +451,22 @@ export class FramekitRuntime {
   }
 
   async list(tenant: TenantContext, doctypeName: string, options?: ListOptions): Promise<DocumentRecord[]> {
+    return (await this.listPage(tenant, doctypeName, options)).items;
+  }
+
+  async listPage(tenant: TenantContext, doctypeName: string, options: ListOptions = {}): Promise<DocumentPage> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "read");
     this.assertListOptions(doctype, options);
-    return this.repository.list(tenant, doctype, options);
+    if (this.repository.listPage) return this.repository.listPage(tenant, doctype, options);
+    const limit = options.limit ?? 100;
+    const items = await this.repository.list(tenant, doctype, { ...options, limit: limit + 1 });
+    const hasMore = items.length > limit;
+    const pageItems = items.slice(0, limit);
+    return {
+      items: pageItems,
+      nextCursor: hasMore && pageItems.length > 0 ? encodeDocumentCursor(pageItems.at(-1)!, options.sort, doctype) : undefined
+    };
   }
 
   async get(tenant: TenantContext, doctypeName: string, id: string): Promise<DocumentRecord> {
@@ -644,20 +662,7 @@ export class FramekitRuntime {
   }
 
   private assertListOptions(doctype: DocTypeDefinition, options: ListOptions = {}): void {
-    const validFields = new Set(doctype.fields.map((field) => field.name));
-    for (const [field, filter] of Object.entries(options.filters ?? {})) {
-      if (!validFields.has(field)) {
-        throw new FramekitError("UNKNOWN_FILTER_FIELD", `Unknown filter field "${field}" for ${doctype.name}`, 422);
-      }
-      assertFilterShape(doctype.name, field, filter);
-    }
-    if (options.sort && options.sort.field !== "id" && options.sort.field !== "createdAt" && options.sort.field !== "updatedAt" && !validFields.has(options.sort.field)) {
-      throw new FramekitError("UNKNOWN_SORT_FIELD", `Unknown sort field "${options.sort.field}" for ${doctype.name}`, 422);
-    }
-    const unknownProjectionFields = (options.fields ?? []).filter((field) => !validFields.has(field));
-    if (unknownProjectionFields.length > 0) {
-      throw new FramekitError("UNKNOWN_PROJECTION_FIELD", `Unknown projection fields for ${doctype.name}: ${unknownProjectionFields.join(", ")}`, 422);
-    }
+    validateListOptions(doctype, options);
   }
 
   private async assertLinksExist(tenant: TenantContext, doctype: DocTypeDefinition, data: DocumentData): Promise<void> {
@@ -868,8 +873,13 @@ export class InMemoryDocumentRepository implements DocumentRepository {
   }
 
   async list(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentRecord[]> {
+    return (await this.listPage(tenant, doctype, options)).items;
+  }
+
+  async listPage(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentPage> {
+    validateListOptions(doctype, options);
     const records = [...this.records.values()].filter((record) => record.tenantId === tenant.tenantId && record.doctype === doctype.name);
-    return applyListOptions(records, options);
+    return applyListOptionsPage(records, options, doctype);
   }
 
   async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
@@ -1381,31 +1391,73 @@ function coerceFieldValue(doctype: string, field: string, type: string, value: u
   }
 }
 
-export function applyFilters(records: DocumentRecord[], filters: Record<string, FilterValue> = {}): DocumentRecord[] {
-  const entries = Object.entries(filters).filter(([, value]) => value !== undefined && value !== null && value !== "");
+export function validateListOptions(doctype: DocTypeDefinition, options: ListOptions = {}): void {
+  if (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 1_000)) {
+    throw new FramekitError("INVALID_LIMIT", "limit must be an integer between 1 and 1000", 422);
+  }
+  if (options.offset !== undefined && (!Number.isInteger(options.offset) || options.offset < 0)) {
+    throw new FramekitError("INVALID_OFFSET", "offset must be a non-negative integer", 422);
+  }
+  const validFields = new Set(doctype.fields.map((field) => field.name));
+  for (const [field, filter] of Object.entries(options.filters ?? {})) {
+    if (!validFields.has(field)) {
+      throw new FramekitError("UNKNOWN_FILTER_FIELD", `Unknown filter field "${field}" for ${doctype.name}`, 422);
+    }
+    assertFilterShape(doctype.name, field, filter);
+    const fieldDefinition = doctype.fields.find((candidate) => candidate.name === field);
+    if (fieldDefinition?.type === "json" && !isJsonNullFilter(filter)) {
+      throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `JSON field "${field}" only supports isNull filtering`, 422);
+    }
+  }
+  if (options.sort && options.sort.field !== "id" && options.sort.field !== "createdAt" && options.sort.field !== "updatedAt" && !validFields.has(options.sort.field)) {
+    throw new FramekitError("UNKNOWN_SORT_FIELD", `Unknown sort field "${options.sort.field}" for ${doctype.name}`, 422);
+  }
+  const sortField = doctype.fields.find((field) => field.name === options.sort?.field);
+  if (sortField?.type === "json") {
+    throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `Sorting JSON field "${sortField.name}" is not supported`, 422);
+  }
+  if (options.cursor) decodeDocumentCursor(options.cursor, options.sort, doctype);
+  const unknownProjectionFields = (options.fields ?? []).filter((field) => !validFields.has(field));
+  if (unknownProjectionFields.length > 0) {
+    throw new FramekitError("UNKNOWN_PROJECTION_FIELD", `Unknown projection fields for ${doctype.name}: ${unknownProjectionFields.join(", ")}`, 422);
+  }
+}
+
+export function applyFilters(records: DocumentRecord[], filters: Record<string, FilterValue> = {}, doctype?: DocTypeDefinition): DocumentRecord[] {
+  const entries = Object.entries(filters).filter(([, value]) => value !== undefined && value !== "");
   if (entries.length === 0) {
     return records;
   }
   return records.filter((record) =>
     entries.every(([field, expected]) => {
       const actual = record.data[field];
-      return matchesFilter(actual, expected);
+      return matchesFilter(actual, expected, doctype?.fields.find((candidate) => candidate.name === field)?.type);
     })
   );
 }
 
 export function applyListOptions(records: DocumentRecord[], options: ListOptions = {}): DocumentRecord[] {
-  const searched = options.search ? records.filter((record) => JSON.stringify(record.data).toLowerCase().includes(options.search!.toLowerCase())) : records;
-  const sorted = sortRecords(applyFilters(searched, options.filters), options.sort);
-  const cursorOffset = options.cursor ? cursorIndex(sorted, options.cursor) : 0;
-  const offset = cursorOffset + (options.offset ?? 0);
-  const page = sorted.slice(offset, offset + (options.limit ?? 100));
-  return projectRecords(page, options.fields);
+  return applyListOptionsPage(records, options).items;
 }
 
-function cursorIndex(records: DocumentRecord[], cursor: string): number {
-  const index = records.findIndex((record) => record.id === cursor);
-  return index >= 0 ? index + 1 : records.length;
+export function applyListOptionsPage(records: DocumentRecord[], options: ListOptions = {}, doctype?: DocTypeDefinition): DocumentPage {
+  const searchableFields = new Set(doctype?.fields.filter((field) => field.type !== "json").map((field) => field.name));
+  const searched = options.search
+    ? records.filter((record) => Object.entries(record.data).some(([field, value]) =>
+        (!doctype || searchableFields.has(field)) && String(value ?? "").toLowerCase().includes(options.search!.toLowerCase())
+      ))
+    : records;
+  const sorted = sortRecords(applyFilters(searched, options.filters, doctype), options.sort, doctype);
+  const cursor = options.cursor ? decodeDocumentCursor(options.cursor, options.sort, doctype) : undefined;
+  const afterCursor = cursor ? sorted.filter((record) => recordAfterCursor(record, cursor, doctype)) : sorted;
+  const limit = options.limit ?? 100;
+  const candidates = afterCursor.slice(options.offset ?? 0, (options.offset ?? 0) + limit + 1);
+  const hasMore = candidates.length > limit;
+  const page = candidates.slice(0, limit);
+  return {
+    items: projectRecords(page, options.fields),
+    nextCursor: hasMore && page.length > 0 ? encodeDocumentCursor(page.at(-1)!, options.sort, doctype) : undefined
+  };
 }
 
 function projectRecords(records: DocumentRecord[], fields?: string[]): DocumentRecord[] {
@@ -1423,7 +1475,7 @@ function projectRecords(records: DocumentRecord[], fields?: string[]): DocumentR
   });
 }
 
-function matchesFilter(actual: unknown, expected: FilterValue): boolean {
+function matchesFilter(actual: unknown, expected: FilterValue, fieldType?: string): boolean {
   if (isFilterOperator(expected)) {
     if ("isNull" in expected && expected.isNull !== undefined) {
       const isNull = actual === undefined || actual === null || actual === "";
@@ -1443,16 +1495,16 @@ function matchesFilter(actual: unknown, expected: FilterValue): boolean {
     if ("contains" in expected && expected.contains !== undefined && !String(actual ?? "").toLowerCase().includes(expected.contains.toLowerCase())) {
       return false;
     }
-    if ("gt" in expected && expected.gt !== undefined && !(compareValues(actual, expected.gt) > 0)) {
+    if ("gt" in expected && expected.gt !== undefined && !(compareValues(actual, expected.gt, fieldType) > 0)) {
       return false;
     }
-    if ("gte" in expected && expected.gte !== undefined && !(compareValues(actual, expected.gte) >= 0)) {
+    if ("gte" in expected && expected.gte !== undefined && !(compareValues(actual, expected.gte, fieldType) >= 0)) {
       return false;
     }
-    if ("lt" in expected && expected.lt !== undefined && !(compareValues(actual, expected.lt) < 0)) {
+    if ("lt" in expected && expected.lt !== undefined && !(compareValues(actual, expected.lt, fieldType) < 0)) {
       return false;
     }
-    if ("lte" in expected && expected.lte !== undefined && !(compareValues(actual, expected.lte) <= 0)) {
+    if ("lte" in expected && expected.lte !== undefined && !(compareValues(actual, expected.lte, fieldType) <= 0)) {
       return false;
     }
     return true;
@@ -1481,17 +1533,19 @@ function isFilterOperator(value: unknown): value is FilterOperator {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function isJsonNullFilter(value: FilterValue): boolean {
+  return isFilterOperator(value) && Object.keys(value).length === 1 && value.isNull !== undefined;
+}
+
 function sameValue(left: unknown, right: unknown): boolean {
   return String(left) === String(right);
 }
 
-function compareValues(left: unknown, right: unknown): number {
-  const leftNumber = Number(left);
-  const rightNumber = Number(right);
-  if (Number.isFinite(leftNumber) && Number.isFinite(rightNumber)) {
-    return leftNumber - rightNumber;
-  }
-  return String(left ?? "").localeCompare(String(right ?? ""), undefined, { numeric: true });
+function compareValues(left: unknown, right: unknown, fieldType?: string): number {
+  if (fieldType === "number" || fieldType === "currency") return Number(left) - Number(right);
+  const leftValue = String(left ?? "");
+  const rightValue = String(right ?? "");
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
 }
 
 function filterPrimitive(value: unknown): FilterPrimitive {
@@ -1501,16 +1555,17 @@ function filterPrimitive(value: unknown): FilterPrimitive {
   return String(value);
 }
 
-export function sortRecords(records: DocumentRecord[], sort: ListOptions["sort"] = { field: "updatedAt", direction: "desc" }): DocumentRecord[] {
+export function sortRecords(records: DocumentRecord[], sort: ListOptions["sort"] = { field: "updatedAt", direction: "desc" }, doctype?: DocTypeDefinition): DocumentRecord[] {
   const direction = sort.direction === "asc" ? 1 : -1;
+  const fieldType = doctype?.fields.find((field) => field.name === sort.field)?.type;
   return [...records].sort((left, right) => {
-    const leftValue = sortableValue(left, sort.field);
-    const rightValue = sortableValue(right, sort.field);
-    return direction * leftValue.localeCompare(rightValue, undefined, { numeric: true });
+    const primary = compareValues(sortableValue(left, sort.field), sortableValue(right, sort.field), fieldType);
+    if (primary !== 0) return direction * primary;
+    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
   });
 }
 
-function sortableValue(record: DocumentRecord, field: string): string {
+function sortableValue(record: DocumentRecord, field: string): unknown {
   if (field === "id") {
     return record.id;
   }
@@ -1521,7 +1576,66 @@ function sortableValue(record: DocumentRecord, field: string): string {
     return record.updatedAt;
   }
   const value = record.data[field];
-  return value === undefined || value === null ? "" : String(value);
+  return value === undefined || value === null ? "" : value;
+}
+
+type DocumentCursor = {
+  v: 1;
+  field: string;
+  direction: "asc" | "desc";
+  value: string | number | boolean;
+  id: string;
+};
+
+export function encodeDocumentCursor(record: DocumentRecord, sort: ListOptions["sort"], doctype?: DocTypeDefinition): string {
+  const normalized = normalizeSort(sort);
+  const fieldType = doctype?.fields.find((field) => field.name === normalized.field)?.type;
+  const rawValue = sortableValue(record, normalized.field);
+  const value = fieldType === "number" || fieldType === "currency" ? Number(rawValue) : rawValue;
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+    throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `Cannot create a cursor for ${normalized.field}`, 422);
+  }
+  const payload: DocumentCursor = { v: 1, ...normalized, value, id: record.id };
+  return base64Url(new TextEncoder().encode(JSON.stringify(payload)));
+}
+
+export function decodeDocumentCursor(cursor: string, sort: ListOptions["sort"], doctype?: DocTypeDefinition): DocumentCursor {
+  let payload: unknown;
+  try {
+    const base64 = cursor.replaceAll("-", "+").replaceAll("_", "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    const binary = atob(padded);
+    payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(binary, (character) => character.charCodeAt(0))));
+  } catch {
+    throw new FramekitError("INVALID_CURSOR", "Cursor is not a valid Framekit document cursor", 422);
+  }
+  const expected = normalizeSort(sort);
+  const candidate = payload as Partial<DocumentCursor>;
+  if (
+    candidate.v !== 1 || candidate.field !== expected.field || candidate.direction !== expected.direction ||
+    typeof candidate.id !== "string" || !["string", "number", "boolean"].includes(typeof candidate.value)
+  ) {
+    throw new FramekitError("INVALID_CURSOR", "Cursor does not match the requested sort order", 422);
+  }
+  const field = doctype?.fields.find((item) => item.name === expected.field);
+  if (field?.type === "json") {
+    throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `Sorting JSON field "${field.name}" is not supported`, 422);
+  }
+  return candidate as DocumentCursor;
+}
+
+function recordAfterCursor(record: DocumentRecord, cursor: DocumentCursor, doctype?: DocTypeDefinition): boolean {
+  const fieldType = doctype?.fields.find((field) => field.name === cursor.field)?.type;
+  const primary = compareValues(sortableValue(record, cursor.field), cursor.value, fieldType);
+  const directed = cursor.direction === "asc" ? primary : -primary;
+  return directed > 0 || (directed === 0 && record.id > cursor.id);
+}
+
+function normalizeSort(sort: ListOptions["sort"]): { field: string; direction: "asc" | "desc" } {
+  return {
+    field: sort?.field ?? "updatedAt",
+    direction: sort?.direction === "asc" ? "asc" : "desc"
+  };
 }
 
 function createRuntimeWarnings(

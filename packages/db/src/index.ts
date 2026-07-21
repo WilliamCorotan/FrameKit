@@ -1,4 +1,4 @@
-import { and, eq, sql as drizzleSql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, lt, lte, ne, or, sql as drizzleSql, type SQL } from "drizzle-orm";
 import { integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres, { type Sql } from "postgres";
@@ -6,11 +6,15 @@ import type { ApiTokenRecord, ApiTokenStore, AuthRole, AuthUser, RoleStore, Sess
 import type { CustomFieldDefinition, DocTypeDefinition, DocumentRecord, TenantContext, ViewDefinition } from "@framekit/core";
 import { FramekitError } from "@framekit/core";
 import {
-  applyListOptions,
+  decodeDocumentCursor,
+  encodeDocumentCursor,
+  validateListOptions,
   type AuditEvent,
   type AuditStore,
   type CustomizationStore,
   type DocumentRepository,
+  type DocumentPage,
+  type FilterOperator,
   type ListOptions,
   type MigrationChange,
   type MigrationPlan,
@@ -200,6 +204,7 @@ export const framekitMigrations = pgTable(
 export type PostgresRepositoryOptions = {
   connectionString: string;
   max?: number;
+  onQuery?: (query: { sql: string; params: unknown[] }) => void;
 };
 
 export type PostgresMutationStage = "document" | "hooks" | "audit" | "outbox" | "idempotency";
@@ -210,9 +215,11 @@ export type PostgresMutationUnitOfWorkOptions = PostgresRepositoryOptions & {
 
 export class PostgresDocumentRepository implements DocumentRepository {
   private readonly db: PostgresJsDatabase;
+  private readonly onQuery?: PostgresRepositoryOptions["onQuery"];
 
   constructor(options: PostgresRepositoryOptions) {
     this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.onQuery = options.onQuery;
   }
 
   async migrate(): Promise<void> {
@@ -228,11 +235,69 @@ export class PostgresDocumentRepository implements DocumentRepository {
   }
 
   async list(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentRecord[]> {
-    const rows = await this.db
-      .select()
+    return (await this.listPage(tenant, doctype, options)).items;
+  }
+
+  async listPage(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentPage> {
+    validateListOptions(doctype, options);
+    const sort = normalizedDocumentSort(options.sort);
+    const sortField = doctype.fields.find((field) => field.name === sort.field);
+    const sortExpression = documentSortExpression(sort.field, sortField?.type);
+    const idExpression = drizzleSql<string>`${framekitDocuments.id} collate "C"`;
+    const conditions: SQL[] = [
+      eq(framekitDocuments.tenantId, tenant.tenantId),
+      eq(framekitDocuments.doctype, doctype.name),
+      ...compileDocumentFilters(doctype, options.filters)
+    ];
+    if (options.search) {
+      const pattern = containsPattern(options.search.toLowerCase());
+      const searchableFields = doctype.fields.filter((field) => field.type !== "json");
+      conditions.push(searchableFields.length === 0
+        ? drizzleSql`false`
+        : or(...searchableFields.map((field) => drizzleSql`
+            lower(coalesce(${framekitDocuments.data} ->> ${field.name}, '')) like ${pattern} escape '\\'
+          `))!);
+    }
+    if (options.cursor) {
+      const cursor = decodeDocumentCursor(options.cursor, sort, doctype);
+      const primary = sort.direction === "asc" ? gt(sortExpression, cursor.value) : lt(sortExpression, cursor.value);
+      conditions.push(or(primary, and(eq(sortExpression, cursor.value), gt(idExpression, cursor.id)))!);
+    }
+    const dataExpression = documentProjection(options.fields);
+    const limit = options.limit ?? 100;
+    const query = this.db
+      .select({
+        tenantId: framekitDocuments.tenantId,
+        doctype: framekitDocuments.doctype,
+        id: framekitDocuments.id,
+        revision: framekitDocuments.revision,
+        state: framekitDocuments.state,
+        data: dataExpression,
+        createdAt: framekitDocuments.createdAt,
+        updatedAt: framekitDocuments.updatedAt,
+        cursorValue: sortExpression
+      })
       .from(framekitDocuments)
-      .where(and(eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name)));
-    return applyListOptions(rows.map(rowToRecord), options);
+      .where(and(...conditions))
+      .orderBy(sort.direction === "asc" ? asc(sortExpression) : desc(sortExpression), asc(idExpression))
+      .offset(options.offset ?? 0)
+      .limit(limit + 1);
+    this.onQuery?.(query.toSQL());
+    const rows = await query;
+    const hasMore = rows.length > limit;
+    const pageRows = rows.slice(0, limit);
+    const items = pageRows.map(({ cursorValue: _cursorValue, ...row }) => selectedRowToRecord(row));
+    const lastRow = pageRows.at(-1);
+    let nextCursor: string | undefined;
+    if (hasMore && lastRow) {
+      const last = items.at(-1)!;
+      const cursorValue = sortField?.type === "number" || sortField?.type === "currency" ? Number(lastRow.cursorValue) : lastRow.cursorValue;
+      nextCursor = encodeDocumentCursor({
+        ...last,
+        data: sortField ? { ...last.data, [sort.field]: cursorValue } : last.data
+      }, sort, doctype);
+    }
+    return { items, nextCursor };
   }
 
   async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
@@ -1277,6 +1342,122 @@ function mapMutationError(error: unknown, command: MutationCommand): unknown {
     return new FramekitError("DOCUMENT_EXISTS", `${command.doctype.name} "${command.document.id}" already exists`, 409);
   }
   return error;
+}
+
+function normalizedDocumentSort(sort: ListOptions["sort"]): { field: string; direction: "asc" | "desc" } {
+  return {
+    field: sort?.field ?? "updatedAt",
+    direction: sort?.direction === "asc" ? "asc" : "desc"
+  };
+}
+
+function documentSortExpression(field: string, fieldType?: string): SQL<string | number> {
+  if (field === "id") return drizzleSql<string>`${framekitDocuments.id} collate "C"`;
+  if (field === "createdAt") return drizzleSql<string>`to_char(${framekitDocuments.createdAt} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') collate "C"`;
+  if (field === "updatedAt") return drizzleSql<string>`to_char(${framekitDocuments.updatedAt} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') collate "C"`;
+  if (fieldType === "number" || fieldType === "currency") {
+    return drizzleSql<number>`coalesce((${framekitDocuments.data} ->> ${field})::numeric, 0)`;
+  }
+  return drizzleSql<string>`coalesce(${framekitDocuments.data} ->> ${field}, '') collate "C"`;
+}
+
+function documentProjection(fields?: string[]): typeof framekitDocuments.data | SQL<Record<string, unknown>> {
+  if (!fields) return framekitDocuments.data;
+  if (fields.length === 0) return drizzleSql<Record<string, unknown>>`'{}'::jsonb`;
+  const objects = fields.map((field) => drizzleSql`
+    case when ${framekitDocuments.data} ? cast(${field} as text)
+      then jsonb_build_object(cast(${field} as text), ${framekitDocuments.data} -> cast(${field} as text))
+      else '{}'::jsonb end
+  `);
+  return drizzleSql<Record<string, unknown>>`${drizzleSql.join(objects, drizzleSql` || `)}`;
+}
+
+function compileDocumentFilters(doctype: DocTypeDefinition, filters: ListOptions["filters"] = {}): SQL[] {
+  const conditions: SQL[] = [];
+  for (const [field, filter] of Object.entries(filters)) {
+    if (filter === undefined || filter === "") continue;
+    const fieldType = doctype.fields.find((candidate) => candidate.name === field)?.type;
+    if (!fieldType) throw new FramekitError("UNKNOWN_FILTER_FIELD", `Unknown filter field "${field}" for ${doctype.name}`, 422);
+    if (fieldType === "json" && (!filter || typeof filter !== "object" || Array.isArray(filter) || Object.keys(filter).length !== 1 || filter.isNull === undefined)) {
+      throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `JSON field "${field}" only supports isNull filtering`, 422);
+    }
+    const text = drizzleSql<string>`coalesce(${framekitDocuments.data} ->> ${field}, '')`;
+    const comparable = fieldType === "number" || fieldType === "currency"
+      ? drizzleSql<number>`coalesce((${framekitDocuments.data} ->> ${field})::numeric, 0)`
+      : text;
+    if (Array.isArray(filter)) {
+      conditions.push(filter.length === 0 ? drizzleSql`false` : or(...filter.map((value) => equalityFilter(field, text, value)))!);
+      continue;
+    }
+    if (!filter || typeof filter !== "object") {
+      conditions.push(equalityFilter(field, text, filter));
+      continue;
+    }
+    const operator = filter as FilterOperator;
+    const unknownOperators = Object.keys(operator).filter((key) => !["eq", "ne", "in", "contains", "gt", "gte", "lt", "lte", "isNull"].includes(key));
+    if (unknownOperators.length > 0 || (operator.in !== undefined && !Array.isArray(operator.in))) {
+      throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `Unsupported filter shape for ${doctype.name}.${field}`, 422, { operators: unknownOperators });
+    }
+    if (operator.isNull !== undefined) {
+      const isNull = or(
+        drizzleSql`not (${framekitDocuments.data} ? ${field})`,
+        drizzleSql`${framekitDocuments.data} -> ${field} = 'null'::jsonb`,
+        eq(text, "")
+      )!;
+      conditions.push(operator.isNull ? isNull : drizzleSql`not (${isNull})`);
+    }
+    if (operator.eq !== undefined) conditions.push(equalityFilter(field, text, operator.eq));
+    if (operator.ne !== undefined) {
+      conditions.push(operator.ne === null
+        ? or(drizzleSql`not (${framekitDocuments.data} ? ${field})`, drizzleSql`${framekitDocuments.data} -> ${field} <> 'null'::jsonb` )!
+        : ne(text, String(operator.ne)));
+    }
+    if (operator.in !== undefined) {
+      conditions.push(operator.in.length === 0 ? drizzleSql`false` : or(...operator.in.map((value) => equalityFilter(field, text, value)))!);
+    }
+    if (operator.contains !== undefined) {
+      conditions.push(drizzleSql`lower(${text}) like ${containsPattern(operator.contains.toLowerCase())} escape '\\'`);
+    }
+    const present = fieldType === "number" || fieldType === "currency"
+      ? and(drizzleSql`${framekitDocuments.data} ? ${field}`, ne(text, ""))!
+      : undefined;
+    if (operator.gt !== undefined) conditions.push(present ? and(present, gt(comparable, operator.gt))! : gt(comparable, operator.gt));
+    if (operator.gte !== undefined) conditions.push(present ? and(present, gte(comparable, operator.gte))! : gte(comparable, operator.gte));
+    if (operator.lt !== undefined) conditions.push(present ? and(present, lt(comparable, operator.lt))! : lt(comparable, operator.lt));
+    if (operator.lte !== undefined) conditions.push(present ? and(present, lte(comparable, operator.lte))! : lte(comparable, operator.lte));
+  }
+  return conditions;
+}
+
+function equalityFilter(field: string, text: SQL<string>, value: unknown): SQL {
+  if (value === null) return drizzleSql`${framekitDocuments.data} -> ${field} = 'null'::jsonb`;
+  return eq(text, String(value));
+}
+
+function containsPattern(value: string): string {
+  return `%${value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_")}%`;
+}
+
+function selectedRowToRecord(row: {
+  tenantId: string;
+  doctype: string;
+  id: string;
+  revision: number;
+  state: string | null;
+  data: Record<string, unknown>;
+  createdAt: Date;
+  updatedAt: Date;
+}): DocumentRecord {
+  return {
+    tenantId: row.tenantId,
+    doctype: row.doctype,
+    id: row.id,
+    revision: row.revision,
+    state: row.state ?? undefined,
+    data: row.data,
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString()
+  };
 }
 
 function rowToRecord(row: typeof framekitDocuments.$inferSelect): DocumentRecord {

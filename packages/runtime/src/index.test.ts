@@ -104,9 +104,18 @@ describe("runtime document service", () => {
     const beta = await runtime.create(tenant, "customer", { name: "Beta", status: "paused", notes: "second" });
     await runtime.create(tenant, "customer", { name: "Gamma", status: "active", notes: "third" });
 
+    const firstPage = await runtime.listPage(tenant, "customer", {
+      sort: { field: "name", direction: "asc" },
+      fields: ["name"],
+      limit: 2
+    });
+    expect(firstPage.items.at(-1)?.id).toBe(beta.id);
+    expect(firstPage.nextCursor).toBeDefined();
+    expect(firstPage.nextCursor).not.toContain(beta.id);
+
     const page = await runtime.list(tenant, "customer", {
       sort: { field: "name", direction: "asc" },
-      cursor: beta.id,
+      cursor: firstPage.nextCursor,
       fields: ["name"],
       limit: 1
     });
@@ -114,6 +123,7 @@ describe("runtime document service", () => {
     expect(page).toHaveLength(1);
     expect(page[0]?.data).toEqual({ name: "Gamma" });
     expect(page[0]?.id).toBe("customer-id7abcde");
+    await expect(runtime.list(tenant, "customer", { sort: { field: "name", direction: "desc" }, cursor: firstPage.nextCursor })).rejects.toMatchObject({ code: "INVALID_CURSOR" });
     await expect(runtime.list(tenant, "customer", { fields: ["unknown"] })).rejects.toMatchObject({ code: "UNKNOWN_PROJECTION_FIELD" });
   });
 

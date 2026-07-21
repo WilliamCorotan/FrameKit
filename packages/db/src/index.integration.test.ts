@@ -1,7 +1,7 @@
 import postgres from "postgres";
 import { describe, expect, it, afterAll, beforeAll } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
-import { createRuntime } from "@framekit/runtime";
+import { createRuntime, InMemoryDocumentRepository, type ListOptions } from "@framekit/runtime";
 import {
   PostgresApiTokenStore,
   PostgresAuditStore,
@@ -52,6 +52,18 @@ const dealDocType = defineDocType({
   permissions: [
     { action: "create", permissions: ["crm.deal"] },
     { action: "read", permissions: ["crm.deal"] }
+  ]
+});
+
+const queryDocType = defineDocType({
+  name: "query_record",
+  label: "Query Record",
+  fields: [
+    { name: "name", label: "Name", type: "text" },
+    { name: "status", label: "Status", type: "select", options: ["active", "paused"] },
+    { name: "score", label: "Score", type: "number" },
+    { name: "notes", label: "Notes", type: "long_text" },
+    { name: "metadata", label: "Metadata", type: "json" }
   ]
 });
 
@@ -192,6 +204,100 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(true);
     await stores.sessionRevocations.revoke("pg-integration-session", new Date(Date.now() - 60_000).toISOString());
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(false);
+  });
+
+  it("pushes list operations into parameterized SQL with in-memory parity", async () => {
+    const memory = new InMemoryDocumentRepository();
+    const timestamp = "2026-07-06T00:00:00.000Z";
+    const fixtures = [
+      { id: "query-01", data: { name: "Alpha", status: "active", score: 2, notes: "needle one", metadata: { rank: 1 } } },
+      { id: "query-02", data: { name: "Beta", status: "paused", score: 10, notes: "other", metadata: { rank: 2 } } },
+      { id: "query-03", data: { name: "Gamma", status: "active", score: 10, notes: "needle two", metadata: { rank: 3 } } },
+      { id: "query-04", data: { name: "Delta", status: "active", score: 25, notes: "other", metadata: { rank: 4 } } },
+      { id: "query-05", data: { name: "%_' literal", status: "active", score: 30, notes: "escaped", metadata: { rank: 5 } } }
+    ];
+    for (const fixture of fixtures) {
+      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
+      await memory.create(tenant, queryDocType, record);
+      await sql`
+        insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+        values (${record.tenantId}, ${record.doctype}, ${record.id}, 1, null, ${sql.json(record.data)}, ${record.createdAt}, ${record.updatedAt})
+      `;
+    }
+
+    const shapes: ListOptions[] = [
+      { filters: { status: "active", score: { gte: 10 } }, sort: { field: "score", direction: "asc" }, fields: ["name", "score"], limit: 10 },
+      { search: "needle", sort: { field: "name", direction: "desc" }, fields: ["name", "notes"], limit: 10 },
+      { filters: { name: { contains: "%_'" } }, sort: { field: "name", direction: "asc" }, limit: 10 },
+      { filters: { score: { in: [2, 25] } }, sort: { field: "score", direction: "desc" }, offset: 1, limit: 1 }
+    ];
+    for (const options of shapes) {
+      const postgresPage = await stores.repository.listPage(tenant, queryDocType, options);
+      const memoryPage = await memory.listPage(tenant, queryDocType, options);
+      expect(postgresPage).toEqual(memoryPage);
+    }
+
+    const postgresFirst = await stores.repository.listPage(tenant, queryDocType, { sort: { field: "score", direction: "asc" }, limit: 2 });
+    const memoryFirst = await memory.listPage(tenant, queryDocType, { sort: { field: "score", direction: "asc" }, limit: 2 });
+    expect(postgresFirst).toEqual(memoryFirst);
+    expect(postgresFirst.nextCursor).toBeDefined();
+    const concurrent = {
+      tenantId: tenant.tenantId,
+      doctype: queryDocType.name,
+      id: "query-concurrent-before-cursor",
+      revision: 1,
+      state: undefined,
+      data: { name: "Inserted before cursor", status: "active", score: 1 },
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
+    await memory.create(tenant, queryDocType, concurrent);
+    await sql`
+      insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+      values (${concurrent.tenantId}, ${concurrent.doctype}, ${concurrent.id}, 1, null, ${sql.json(concurrent.data)}, ${concurrent.createdAt}, ${concurrent.updatedAt})
+    `;
+    const nextOptions = { sort: { field: "score", direction: "asc" } as const, cursor: postgresFirst.nextCursor, limit: 2 };
+    const postgresNext = await stores.repository.listPage(tenant, queryDocType, nextOptions);
+    expect(postgresNext).toEqual(await memory.listPage(tenant, queryDocType, nextOptions));
+    expect(postgresNext.items.map((record) => record.id)).toEqual(["query-03", "query-04"]);
+    await expect(stores.repository.listPage(tenant, queryDocType, { sort: { field: "metadata", direction: "asc" } })).rejects.toMatchObject({ code: "UNSUPPORTED_QUERY_SHAPE" });
+  });
+
+  it("uses a bounded parameterized query plan for a realistically large tenant", async () => {
+    await sql`
+      insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+      select ${tenant.tenantId}, ${queryDocType.name}, 'perf-' || lpad(value::text, 5, '0'), 1, null,
+             jsonb_build_object('name', 'Performance ' || value, 'status', case when value % 2 = 0 then 'active' else 'paused' end, 'score', value),
+             ${new Date("2026-01-01T00:00:00.000Z")} + value * interval '1 millisecond',
+             ${new Date("2026-01-01T00:00:00.000Z")} + value * interval '1 millisecond'
+      from generate_series(1, 10000) as value
+    `;
+    const captured: Array<{ sql: string; params: unknown[] }> = [];
+    const repository = new PostgresDocumentRepository({ connectionString: connectionString!, onQuery: (query) => { captured.push(query); } });
+    try {
+      const injection = "active' OR true --";
+      await expect(repository.listPage(tenant, queryDocType, { filters: { status: injection }, limit: 5 })).resolves.toMatchObject({ items: [] });
+      expect(captured[0]!.sql).not.toContain(injection);
+      expect(captured[0]!.params).toContain(injection);
+
+      const page = await repository.listPage(tenant, queryDocType, {
+        filters: { status: "active" },
+        fields: ["name", "status"],
+        limit: 5
+      });
+      expect(page.items).toHaveLength(5);
+      expect(page.items.every((record) => Object.keys(record.data).every((field) => field === "name" || field === "status"))).toBe(true);
+      const boundedQuery = captured.at(-1)!;
+      expect(boundedQuery.sql).toContain("limit");
+      expect(boundedQuery.sql).not.toContain("active");
+      expect(boundedQuery.params).toContain("active");
+      const plan = await sql.unsafe(`explain (analyze, buffers, format json) ${boundedQuery.sql}`, boundedQuery.params as never[]);
+      const planText = JSON.stringify(plan);
+      expect(planText).toContain("Limit");
+      expect(planText).toMatch(/Index Scan|Bitmap Index Scan/);
+    } finally {
+      await (repository as unknown as { db: { $client: { end(options?: { timeout?: number }): Promise<void> } } }).db.$client.end({ timeout: 1 });
+    }
   });
 
   it("enforces concurrent uniqueness and optimistic revisions", async () => {
