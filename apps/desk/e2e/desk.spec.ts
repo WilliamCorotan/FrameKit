@@ -102,6 +102,10 @@ test("covers document list, create, edit, delete, pagination, search, and workfl
   }
   await page.getByRole("button", { name: "Next page" }).click();
   await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Next page" })).toBeDisabled();
+  await page.getByRole("button", { name: "Previous page" }).click();
+  await expect(page.getByText("Page 1")).toBeVisible();
+  await page.getByRole("button", { name: "Next page" }).click();
   await page.getByRole("button", { name: /CUSTOMER-001/ }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete" }).click();

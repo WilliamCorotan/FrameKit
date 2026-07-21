@@ -8,7 +8,7 @@ test("uses real auth, restores the session, reports server errors, and signs out
   await page.goto("/");
   await page.getByLabel("Password").fill("incorrect-password");
   await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByRole("status")).not.toHaveText("Signing in…");
+  await expect(page.getByRole("status")).toContainText("Invalid email or password");
   await expect(page.getByRole("heading", { name: "Metadata operations console" })).toBeVisible();
 
   await page.getByLabel("Password").fill("admin12345");
@@ -32,6 +32,23 @@ test("runs real document CRUD, deletion, workflow, and pagination", async ({ pag
   await signIn(page);
   await page.getByLabel("Filter records").fill(`Page ${suffix}`);
   await expect(page.getByText("Page 1")).toBeVisible();
+  const firstPageIds = await recordIds(page);
+  expect(firstPageIds).toHaveLength(5);
+  await page.locator(".list button.row").first().click();
+  const updatedOwner = `Updated ${suffix}`;
+  await page.getByLabel("Owner").fill(updatedOwner);
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByLabel("Owner")).toHaveValue(updatedOwner);
+  await expect(page.locator(".list button.row").first()).toContainText(updatedOwner);
+  await page.getByRole("button", { name: "Next page" }).click();
+  await expect(page.getByText("Page 2")).toBeVisible();
+  const secondPageIds = await recordIds(page);
+  expect(secondPageIds).toHaveLength(2);
+  expect(new Set([...firstPageIds, ...secondPageIds]).size).toBe(7);
+  await expect(page.getByRole("button", { name: "Next page" })).toBeDisabled();
+  await page.getByRole("button", { name: "Previous page" }).click();
+  await expect(page.getByText("Page 1")).toBeVisible();
+  expect(await recordIds(page)).toEqual(firstPageIds);
   await page.getByRole("button", { name: "Next page" }).click();
   await expect(page.getByText("Page 2")).toBeVisible();
   await page.locator(".list button.row").first().click();
@@ -103,6 +120,10 @@ async function signIn(page: Page) {
   await page.goto("/");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
+}
+
+async function recordIds(page: Page): Promise<string[]> {
+  return page.locator(".list button.row strong").allTextContents();
 }
 
 async function loginApi(request: APIRequestContext): Promise<string> {

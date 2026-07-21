@@ -122,6 +122,7 @@ function App() {
   const [activeDocType, setActiveDocType] = useState("customer");
   const [section, setSection] = useState<DeskSection>("documents");
   const [records, setRecords] = useState<DocumentRecord[]>([]);
+  const [hasNextPage, setHasNextPage] = useState(false);
   const [selected, setSelected] = useState<DocumentRecord | undefined>();
   const [draft, setDraft] = useState<Record<string, unknown>>({});
   const [query, setQuery] = useState("");
@@ -179,11 +180,13 @@ function App() {
   async function refresh(doctype = activeDocType, search = query, targetPage = page) {
     try {
       setStatus("Syncing…");
-      const params = new URLSearchParams({ limit: String(pageSize), offset: String(targetPage * pageSize) });
+      const params = new URLSearchParams({ limit: String(pageSize + 1), offset: String(targetPage * pageSize) });
       if (search) {
         params.set("search", search);
       }
-      const list = await fetchJson<DocumentRecord[]>(`/api/doctypes/${doctype}?${params}`, { token });
+      const result = await fetchJson<DocumentRecord[]>(`/api/doctypes/${doctype}?${params}`, { token });
+      const list = result.slice(0, pageSize);
+      setHasNextPage(result.length > pageSize);
       setRecords(list);
       setSelected(list[0]);
       setDraft(list[0]?.data ?? {});
@@ -343,7 +346,7 @@ function App() {
             <div className="pagination" aria-label="Record pagination">
               <button onClick={() => setPage((current) => Math.max(0, current - 1))} disabled={page === 0} aria-label="Previous page"><ChevronLeft size={16} /> Previous</button>
               <span>Page {page + 1}</span>
-              <button onClick={() => setPage((current) => current + 1)} disabled={records.length < pageSize} aria-label="Next page">Next <ChevronRight size={16} /></button>
+              <button onClick={() => setPage((current) => current + 1)} disabled={!hasNextPage} aria-label="Next page">Next <ChevronRight size={16} /></button>
             </div>
           </section>
 
