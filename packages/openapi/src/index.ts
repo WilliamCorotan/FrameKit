@@ -15,6 +15,8 @@ type JsonSchema = {
   items?: JsonSchema;
   description?: string;
   minimum?: number;
+  minLength?: number;
+  pattern?: string;
 };
 
 type Operation = {
@@ -722,7 +724,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
           summary: `Transfer ownership of a ${doctype.label} document`,
           tags: [doctype.label],
           parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
-          requestBody: jsonBody({ type: "object", required: ["ownerId"], properties: { ownerId: { type: "string" } } }, true),
+          requestBody: jsonBody({ type: "object", required: ["ownerId"], properties: { ownerId: { type: "string", minLength: 1, pattern: ".*\\S.*" } } }, true),
           responses: okResponse(ref(recordName))
         }
       };

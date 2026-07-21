@@ -369,14 +369,22 @@ export class PostgresDocumentRepository implements DocumentRepository {
     return { items, nextCursor };
   }
 
-  async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { access?: "read" | "write" | "transfer" } = {}): Promise<DocumentRecord | undefined> {
+  async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { access?: "read" | "write" } = {}): Promise<DocumentRecord | undefined> {
     const conditions = [eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id)];
-    conditions.push(options.access === "transfer" ? drizzleSql`${canTransferOwnership(tenant, doctype)}` : compileRowPolicy(tenant, doctype, options.access ?? "read"));
+    conditions.push(compileRowPolicy(tenant, doctype, options.access ?? "read"));
     const rows = await this.db
       .select()
       .from(framekitDocuments)
       .where(and(...conditions))
       .limit(1);
+    return rows[0] ? rowToRecord(rows[0]) : undefined;
+  }
+
+  async getForOwnerTransfer(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
+    if (!canTransferOwnership(tenant, doctype)) return undefined;
+    const rows = await this.db.select().from(framekitDocuments).where(and(
+      eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id)
+    )).limit(1);
     return rows[0] ? rowToRecord(rows[0]) : undefined;
   }
 
@@ -399,12 +407,10 @@ export class PostgresDocumentRepository implements DocumentRepository {
     return record;
   }
 
-  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number; ownerTransfer?: boolean } = {}): Promise<DocumentRecord> {
+  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number } = {}): Promise<DocumentRecord> {
     const conditions = [eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, record.id)];
-    if (!options.ownerTransfer) {
-      conditions.push(compileRowPolicy(tenant, doctype, "write"));
-      conditions.push(record.ownerId === undefined ? drizzleSql`${framekitDocuments.ownerId} is null` : eq(framekitDocuments.ownerId, record.ownerId));
-    } else conditions.push(drizzleSql`${canTransferOwnership(tenant, doctype)}`);
+    conditions.push(compileRowPolicy(tenant, doctype, "write"));
+    conditions.push(record.ownerId === undefined ? drizzleSql`${framekitDocuments.ownerId} is null` : eq(framekitDocuments.ownerId, record.ownerId));
     if (options.expectedRevision !== undefined) conditions.push(eq(framekitDocuments.revision, options.expectedRevision));
     const rows = await this.db
       .update(framekitDocuments)
@@ -419,11 +425,24 @@ export class PostgresDocumentRepository implements DocumentRepository {
       .where(and(...conditions))
       .returning();
     if (!rows[0]) {
-      const current = await this.get(tenant, doctype, record.id, { access: options.ownerTransfer ? "transfer" : "write" });
+      const current = await this.get(tenant, doctype, record.id, { access: "write" });
       if (current && options.expectedRevision !== undefined) {
         throw postgresRevisionConflict(doctype.name, record.id, options.expectedRevision, current.revision);
       }
       throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${record.id}" does not exist`, 404);
+    }
+    return rowToRecord(rows[0]);
+  }
+
+  async transferOwner(tenant: TenantContext, doctype: DocTypeDefinition, id: string, ownerId: string, options: { expectedRevision: number; updatedAt: string }): Promise<DocumentRecord> {
+    if (!canTransferOwnership(tenant, doctype)) throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
+    const rows = await this.db.update(framekitDocuments).set({
+      ownerId, revision: options.expectedRevision + 1, updatedAt: new Date(options.updatedAt)
+    }).where(and(eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id), eq(framekitDocuments.revision, options.expectedRevision))).returning();
+    if (!rows[0]) {
+      const current = await this.getForOwnerTransfer(tenant, doctype, id);
+      if (current) throw postgresRevisionConflict(doctype.name, id, options.expectedRevision, current.revision);
+      throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
     }
     return rowToRecord(rows[0]);
   }
@@ -522,13 +541,24 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
                 data = ${tx.json(command.document.data as postgres.JSONValue)}, updated_at = ${command.document.updatedAt}
             where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
               and id = ${command.document.id} and revision = ${command.expectedRevision!}
-              and (${command.ownerTransfer === true ? canTransferOwnership(command.tenant, command.doctype) : scope === "all"} or (${!command.ownerTransfer && scope === "self"} and owner_id = ${command.tenant.userId}))
-              and (${command.ownerTransfer === true} or owner_id is not distinct from ${command.document.ownerId ?? null})
+              and (${scope === "all"} or (${scope === "self"} and owner_id = ${command.tenant.userId}))
+              and owner_id is not distinct from ${command.document.ownerId ?? null}
             returning revision
           `;
           if (!rows[0]) await throwMutationWriteFailure(tx, command);
           result = command.document;
           await replaceUniqueValues(tx, command);
+        } else if (command.operation === "transfer_owner") {
+          const rows = await tx<{ revision: number }[]>`
+            update framekit_documents
+            set owner_id = ${command.document.ownerId!}, revision = ${command.document.revision}, updated_at = ${command.document.updatedAt}
+            where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
+              and id = ${command.document.id} and revision = ${command.expectedRevision!}
+              and ${canTransferOwnership(command.tenant, command.doctype)}
+            returning revision
+          `;
+          if (!rows[0]) await throwMutationWriteFailure(tx, command);
+          result = command.document;
         } else {
           const scope = rowPolicyScope(command.tenant, command.doctype, "write");
           const rows = await tx<{ revision: number }[]>`
@@ -2007,7 +2037,7 @@ async function replaceUniqueValues(sql: postgres.TransactionSql, command: Mutati
 }
 
 async function throwMutationWriteFailure(sql: postgres.TransactionSql, command: MutationCommand): Promise<never> {
-  const scope = command.ownerTransfer && canTransferOwnership(command.tenant, command.doctype) ? "all" : rowPolicyScope(command.tenant, command.doctype, "write");
+  const scope = command.operation === "transfer_owner" && canTransferOwnership(command.tenant, command.doctype) ? "all" : rowPolicyScope(command.tenant, command.doctype, "write");
   const rows = await sql<{ revision: number }[]>`
     select revision from framekit_documents
     where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name} and id = ${command.document.id}

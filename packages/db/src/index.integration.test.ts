@@ -322,6 +322,23 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(runtime.submit(alice, "secured_record", bobRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
     await expect(runtime.create(bob, "secured_reference", { target: aliceRecord.id })).rejects.toMatchObject({ code: "LINK_NOT_FOUND" });
     await expect(runtime.create(bob, "secured_record", { title: "Hidden duplicate", code: "alice-code" })).rejects.toMatchObject({ code: "UNIQUE_CONSTRAINT_FAILED" });
+    let rollbackId = 0;
+    const rollbackRuntime = createRuntime(defineApp({ name: app.name, modules: [defineModule({
+      id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType, securedDocType, securedReferenceDocType],
+      hooks: { afterUpdate: { secured_record: [({ document }) => { if (document?.data.title === "Rollback" && document.ownerId === "bob") throw new Error("injected transfer hook failure"); }] } }
+    })] }), {
+      repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
+      idGenerator: () => `rollback-${++rollbackId}`
+    });
+    const rollbackRecord = await rollbackRuntime.create(alice, "secured_record", { title: "Rollback", code: "rollback-code" });
+    await expect(rollbackRuntime.transferOwner(manager, "secured_record", rollbackRecord.id, "bob", { expectedRevision: 1 })).rejects.toThrow("injected transfer hook failure");
+    const rollbackRows = await sql<{ ownerId: string; revision: number; title: string }[]>`
+      select owner_id as "ownerId", revision, data ->> 'title' as title from framekit_documents
+      where tenant_id = ${tenant.tenantId} and id = ${rollbackRecord.id}
+    `;
+    expect(rollbackRows).toEqual([{ ownerId: "alice", revision: 1, title: "Rollback" }]);
+    await expect(rollbackRuntime.get(alice, "secured_record", rollbackRecord.id)).resolves.toMatchObject({ ownerId: "alice", revision: 1 });
+    await expect(rollbackRuntime.get(bob, "secured_record", rollbackRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
     const transferred = await runtime.transferOwner(manager, "secured_record", aliceRecord.id, "bob", { expectedRevision: aliceRecord.revision });
     expect(transferred).toMatchObject({ ownerId: "bob", revision: 2 });
     const rows = await sql<{ ownerId: string }[]>`select owner_id as "ownerId" from framekit_documents where tenant_id = ${tenant.tenantId} and id = ${aliceRecord.id}`;

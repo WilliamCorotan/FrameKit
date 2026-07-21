@@ -62,9 +62,11 @@ export type LifecycleResource = {
 export type DocumentRepository = LifecycleResource & {
   list(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentRecord[]>;
   listPage?(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentPage>;
-  get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options?: { access?: "read" | "write" | "transfer" }): Promise<DocumentRecord | undefined>;
+  get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options?: { access?: "read" | "write" }): Promise<DocumentRecord | undefined>;
+  getForOwnerTransfer(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined>;
   create(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord>;
-  update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options?: { expectedRevision?: number; ownerTransfer?: boolean }): Promise<DocumentRecord>;
+  update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options?: { expectedRevision?: number }): Promise<DocumentRecord>;
+  transferOwner(tenant: TenantContext, doctype: DocTypeDefinition, id: string, ownerId: string, options: { expectedRevision: number; updatedAt: string }): Promise<DocumentRecord>;
   delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options?: { expectedRevision?: number }): Promise<void>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
@@ -75,7 +77,7 @@ export type MutationOptions = {
 };
 
 export type MutationCommand = {
-  operation: "create" | "update" | "delete";
+  operation: "create" | "update" | "delete" | "transfer_owner";
   tenant: TenantContext;
   doctype: DocTypeDefinition;
   document: DocumentRecord;
@@ -84,7 +86,6 @@ export type MutationCommand = {
   idempotencyFingerprint: string;
   audit: AuditEvent;
   outbox: OutboxEvent;
-  ownerTransfer?: boolean;
   afterWrite(): Promise<void>;
 };
 
@@ -829,12 +830,13 @@ export class FramekitRuntime {
     if (!canTransferOwnership(tenant, doctype)) {
       throw new FramekitError("FORBIDDEN", `Missing permission to transfer ownership of ${doctype.name}`, 403);
     }
-    if (!ownerId.trim()) throw new FramekitError("INVALID_OWNER", "Owner id is required", 422);
+    if (typeof ownerId !== "string" || !ownerId.trim()) throw new FramekitError("INVALID_OWNER", "Owner id must be a non-empty string", 422);
+    ownerId = ownerId.trim();
     requireExpectedRevisionForRetry(options);
     const fingerprint = mutationFingerprint("transfer_owner", doctype.name, { id, ownerId, expectedRevision: options.expectedRevision });
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
     if (replay) return replay;
-    const existing = await this.repository.get(tenant, doctype, id, { access: "transfer" });
+    const existing = await this.repository.getForOwnerTransfer(tenant, doctype, id);
     if (!existing) throw new FramekitError("DOCUMENT_NOT_FOUND", `No ${doctype.name} document with id "${id}"`, 404);
     const expectedRevision = options.expectedRevision ?? existing.revision;
     const updated: DocumentRecord = { ...existing, ownerId, revision: existing.revision + 1, updatedAt: this.now().toISOString() };
@@ -843,12 +845,11 @@ export class FramekitRuntime {
     const outbox = this.createOutboxEvent(tenant, "owner.transferred", updated);
     const execution = this.mutations
       ? await this.mutations.execute({
-          operation: "update", tenant, doctype, document: updated, expectedRevision,
+          operation: "transfer_owner", tenant, doctype, document: updated, expectedRevision,
           idempotencyKey: options.idempotencyKey, idempotencyFingerprint: fingerprint, audit, outbox,
-          ownerTransfer: true,
           afterWrite: () => this.runHooks("afterUpdate", tenant, doctype, updated, updated.data)
         })
-      : { document: await this.updateWithoutUnitOfWork(tenant, doctype, updated, updated.data, expectedRevision, audit, outbox, "afterUpdate", true), replayed: false };
+      : { document: await this.transferOwnerWithoutUnitOfWork(tenant, doctype, updated, expectedRevision, audit, outbox), replayed: false };
     const saved = execution.document!;
     if (!execution.replayed) await this.publishDocumentEvent(tenant, "owner.transferred", saved);
     return saved;
@@ -1090,11 +1091,18 @@ export class FramekitRuntime {
     expectedRevision: number,
     audit: AuditEvent,
     outbox: OutboxEvent,
-    hook: "afterUpdate" | "afterTransition" | "afterSubmit" | "afterCancel" = "afterUpdate",
-    ownerTransfer = false
+    hook: "afterUpdate" | "afterTransition" | "afterSubmit" | "afterCancel" = "afterUpdate"
   ): Promise<DocumentRecord> {
-    const saved = await this.repository.update(tenant, doctype, document, { expectedRevision, ownerTransfer });
+    const saved = await this.repository.update(tenant, doctype, document, { expectedRevision });
     await this.runHooks(hook, tenant, doctype, saved, data);
+    await this.audit.record(audit);
+    await this.outbox.record(outbox);
+    return saved;
+  }
+
+  private async transferOwnerWithoutUnitOfWork(tenant: TenantContext, doctype: DocTypeDefinition, document: DocumentRecord, expectedRevision: number, audit: AuditEvent, outbox: OutboxEvent): Promise<DocumentRecord> {
+    const saved = await this.repository.transferOwner(tenant, doctype, document.id, document.ownerId!, { expectedRevision, updatedAt: document.updatedAt });
+    await this.runHooks("afterUpdate", tenant, doctype, saved, saved.data);
     await this.audit.record(audit);
     await this.outbox.record(outbox);
     return saved;
@@ -1141,8 +1149,20 @@ export class FramekitRuntime {
   }
 }
 
+const inMemoryRepositoryCheckpoint = Symbol("inMemoryRepositoryCheckpoint");
+const inMemoryRepositoryRestore = Symbol("inMemoryRepositoryRestore");
+
 export class InMemoryDocumentRepository implements DocumentRepository {
   private readonly records = new Map<string, DocumentRecord>();
+
+  [inMemoryRepositoryCheckpoint](): Map<string, DocumentRecord> {
+    return new Map([...this.records].map(([key, record]) => [key, cloneRecord(record)]));
+  }
+
+  [inMemoryRepositoryRestore](snapshot: Map<string, DocumentRecord>): void {
+    this.records.clear();
+    for (const [key, record] of snapshot) this.records.set(key, cloneRecord(record));
+  }
 
   describe(): RepositoryDiagnostics {
     return {
@@ -1164,11 +1184,16 @@ export class InMemoryDocumentRepository implements DocumentRepository {
     return applyListOptionsPage(records, options, doctype);
   }
 
-  async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { access?: "read" | "write" | "transfer" } = {}): Promise<DocumentRecord | undefined> {
+  async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { access?: "read" | "write" } = {}): Promise<DocumentRecord | undefined> {
     const record = this.records.get(keyFor(tenant.tenantId, doctype.name, id));
-    if (record && options.access === "transfer" && !canTransferOwnership(tenant, doctype)) return undefined;
-    if (record && options.access !== "transfer" && !hasRowAccess(tenant, doctype, options.access ?? "read", record.ownerId)) return undefined;
+    if (record && !hasRowAccess(tenant, doctype, options.access ?? "read", record.ownerId)) return undefined;
     return record ? { ...record, data: { ...record.data } } : undefined;
+  }
+
+  async getForOwnerTransfer(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
+    if (!canTransferOwnership(tenant, doctype)) return undefined;
+    const record = this.records.get(keyFor(tenant.tenantId, doctype.name, id));
+    return record ? cloneRecord(record) : undefined;
   }
 
   async create(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord> {
@@ -1184,20 +1209,31 @@ export class InMemoryDocumentRepository implements DocumentRepository {
     return record;
   }
 
-  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number; ownerTransfer?: boolean } = {}): Promise<DocumentRecord> {
+  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number } = {}): Promise<DocumentRecord> {
     const key = keyFor(tenant.tenantId, doctype.name, record.id);
     const existing = this.records.get(key);
     if (!existing) {
       throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${record.id}" does not exist`, 404);
     }
-    if (options.ownerTransfer ? !canTransferOwnership(tenant, doctype) : !hasRowAccess(tenant, doctype, "write", existing.ownerId)) throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${record.id}" does not exist`, 404);
-    if (!options.ownerTransfer && record.ownerId !== existing.ownerId) throw new FramekitError("OWNER_IMMUTABLE", "Owner changes require transferOwner", 403);
+    if (!hasRowAccess(tenant, doctype, "write", existing.ownerId)) throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${record.id}" does not exist`, 404);
+    if (record.ownerId !== existing.ownerId) throw new FramekitError("OWNER_IMMUTABLE", "Owner changes require transferOwner", 403);
     if (options.expectedRevision !== undefined && existing.revision !== options.expectedRevision) {
       throw revisionConflict(doctype.name, record.id, options.expectedRevision, existing.revision);
     }
     this.assertUnique(tenant, doctype, record);
     this.records.set(key, { ...record, data: { ...record.data } });
     return record;
+  }
+
+  async transferOwner(tenant: TenantContext, doctype: DocTypeDefinition, id: string, ownerId: string, options: { expectedRevision: number; updatedAt: string }): Promise<DocumentRecord> {
+    if (!canTransferOwnership(tenant, doctype)) throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
+    const key = keyFor(tenant.tenantId, doctype.name, id);
+    const existing = this.records.get(key);
+    if (!existing) throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
+    if (existing.revision !== options.expectedRevision) throw revisionConflict(doctype.name, id, options.expectedRevision, existing.revision);
+    const transferred = { ...existing, ownerId, revision: existing.revision + 1, updatedAt: options.updatedAt, data: { ...existing.data } };
+    this.records.set(key, transferred);
+    return cloneRecord(transferred);
   }
 
   async delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { expectedRevision?: number } = {}): Promise<void> {
@@ -1432,9 +1468,7 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
         return { document: replay.result ? cloneRecord(replay.result) : undefined, replayed: true };
       }
     }
-    const previous = command.operation === "create"
-      ? undefined
-      : await this.repository.get(command.tenant, command.doctype, command.document.id);
+    const repositoryState = this.repository[inMemoryRepositoryCheckpoint]();
     const auditCheckpoint = this.audit.checkpoint();
     const outboxCheckpoint = this.outbox.checkpoint();
     let wrote = false;
@@ -1443,7 +1477,9 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
       if (command.operation === "create") {
         result = await this.repository.create(command.tenant, command.doctype, command.document);
       } else if (command.operation === "update") {
-        result = await this.repository.update(command.tenant, command.doctype, command.document, { expectedRevision: command.expectedRevision, ownerTransfer: command.ownerTransfer });
+        result = await this.repository.update(command.tenant, command.doctype, command.document, { expectedRevision: command.expectedRevision });
+      } else if (command.operation === "transfer_owner") {
+        result = await this.repository.transferOwner(command.tenant, command.doctype, command.document.id, command.document.ownerId!, { expectedRevision: command.expectedRevision!, updatedAt: command.document.updatedAt });
       } else {
         await this.repository.delete(command.tenant, command.doctype, command.document.id, { expectedRevision: command.expectedRevision });
       }
@@ -1456,15 +1492,7 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
     } catch (error) {
       this.audit.rollback(auditCheckpoint);
       this.outbox.rollback(outboxCheckpoint);
-      if (wrote) {
-        if (command.operation === "create") {
-          await this.repository.delete(command.tenant, command.doctype, command.document.id);
-        } else if (command.operation === "update" && previous) {
-          await this.repository.update(command.tenant, command.doctype, previous);
-        } else if (command.operation === "delete" && previous) {
-          await this.repository.create(command.tenant, command.doctype, previous);
-        }
-      }
+      if (wrote) this.repository[inMemoryRepositoryRestore](repositoryState);
       throw error;
     }
   }

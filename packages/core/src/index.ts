@@ -83,14 +83,14 @@ export const RowPolicyRuleSchema = z.object({
   owner: z.enum(["any", "self"]).default("any"),
   roles: z.array(z.string()).default([]),
   permissions: z.array(z.string()).default([])
-});
+}).strict();
 
 export type RowPolicyRule = z.infer<typeof RowPolicyRuleSchema>;
 
 export const RowPolicySchema = z.object({
   read: z.array(RowPolicyRuleSchema).min(1),
   write: z.array(RowPolicyRuleSchema).min(1)
-});
+}).strict();
 
 export type RowPolicy = z.infer<typeof RowPolicySchema>;
 
@@ -103,7 +103,7 @@ export const DocTypeSchema = z.object({
   ownership: z.object({
     transferRoles: z.array(z.string()).default([]),
     transferPermissions: z.array(z.string()).default([])
-  }).optional(),
+  }).strict().optional(),
   rowPolicy: RowPolicySchema.optional(),
   workflow: WorkflowSchema.optional(),
   naming: z

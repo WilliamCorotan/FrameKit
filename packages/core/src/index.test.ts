@@ -100,6 +100,14 @@ describe("core metadata", () => {
       name: "private_note", label: "Private Note", fields: [],
       rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] }
     })).toThrow(/without ownership metadata/);
+    expect(() => defineDocType({
+      name: "typo_policy", label: "Typo Policy", fields: [], ownership: {},
+      rowPolicy: { read: [{ owner: "any", permisisons: ["notes.read"] }], write: [{ owner: "self" }] }
+    } as never)).toThrow(/unrecognized key/i);
+    expect(() => defineDocType({
+      name: "typo_policy", label: "Typo Policy", fields: [], ownership: { transferPermissions: [], typo: true },
+      rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] }
+    } as never)).toThrow(/unrecognized key/i);
     const note = defineDocType({
       name: "private_note", label: "Private Note", fields: [], ownership: { transferPermissions: ["note.transfer"] },
       rowPolicy: {

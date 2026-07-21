@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
-import { applyFilters, assertDestructiveMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, migrationChecksum, validateMigrationPlan } from "./index.js";
+import { applyFilters, assertDestructiveMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -458,15 +458,19 @@ describe("runtime document service", () => {
     const reference = defineDocType({
       name: "secured_reference", label: "Secured Reference", fields: [{ name: "target", label: "Target", type: "link", linkTo: "secured_record" }]
     });
+    const repository = new InMemoryDocumentRepository();
     const runtime = createRuntime(defineApp({ name: "Rows", modules: [defineModule({ id: "rows", name: "Rows", doctypes: [secured, reference] })] }), {
+      repository,
       idGenerator: (() => { let id = 0; return () => `row-${++id}`; })()
     });
     const alice = { tenantId: "tenant", userId: "alice", roles: [], permissions: [] };
     const bob = { ...alice, userId: "bob" };
-    const manager = { ...alice, userId: "manager", roles: ["manager"], permissions: ["records.transfer"] };
+    const manager = { ...alice, userId: "manager", roles: ["manager"], permissions: ["records.transfer", "records.manage"] };
     const aliceRecord = await runtime.create(alice, "secured_record", { title: "Alice", email: "shared@example.com" });
     const bobRecord = await runtime.create(bob, "secured_record", { title: "Bob", email: "bob@example.com" });
     expect(aliceRecord.ownerId).toBe("alice");
+    await expect(repository.update(manager, secured, { ...aliceRecord, ownerId: "bob", data: { ...aliceRecord.data, title: "bypassed" } }, { expectedRevision: 1, ownerTransfer: true } as never))
+      .rejects.toMatchObject({ code: "OWNER_IMMUTABLE" });
     expect((await runtime.list(alice, "secured_record")).map((record) => record.id)).toEqual([aliceRecord.id]);
     expect(await runtime.list(manager, "secured_record")).toHaveLength(2);
     await expect(runtime.get(alice, "secured_record", bobRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
@@ -483,6 +487,28 @@ describe("runtime document service", () => {
     await expect(runtime.get(alice, "secured_record", aliceRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
     await expect(runtime.get(bob, "secured_record", aliceRecord.id)).resolves.toMatchObject({ ownerId: "bob" });
     expect((await runtime.auditTrail(manager)).map((event) => event.action)).toContain("transfer_owner");
+  });
+
+  it("rolls back ownership, access, and revision when a transfer side effect fails", async () => {
+    const secured = defineDocType({
+      name: "owned_note", label: "Owned Note", ownership: { transferPermissions: ["notes.transfer"] },
+      fields: [{ name: "title", label: "Title", type: "text", required: true }],
+      rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] }
+    });
+    const runtime = createRuntime(defineApp({ name: "Transfer rollback", modules: [defineModule({
+      id: "notes", name: "Notes", doctypes: [secured], hooks: {
+        afterUpdate: { owned_note: [({ document }) => { if (document?.ownerId === "bob") throw new Error("injected transfer failure"); }] }
+      }
+    })] }), { idGenerator: () => "owned-note-1" });
+    const alice = { tenantId: "tenant", userId: "alice", roles: [], permissions: [] };
+    const bob = { ...alice, userId: "bob" };
+    const manager = { ...alice, userId: "manager", permissions: ["notes.transfer"] };
+    const created = await runtime.create(alice, "owned_note", { title: "Alice's note" });
+
+    await expect(runtime.transferOwner(manager, "owned_note", created.id, "bob", { expectedRevision: 1 })).rejects.toThrow("injected transfer failure");
+    await expect(runtime.get(alice, "owned_note", created.id)).resolves.toMatchObject({ ownerId: "alice", revision: 1, data: { title: "Alice's note" } });
+    await expect(runtime.get(bob, "owned_note", created.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    expect(await runtime.auditTrail(manager)).not.toEqual(expect.arrayContaining([expect.objectContaining({ action: "transfer_owner" })]));
   });
 
   it("plans row policy changes as explicit destructive migrations", async () => {

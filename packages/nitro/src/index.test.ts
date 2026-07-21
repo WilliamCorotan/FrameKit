@@ -47,8 +47,14 @@ describe("createNitroHandler", () => {
       method: "POST", headers: { ...headers, "if-match": String(submitted.revision) }
     });
     expect(cancelled).toMatchObject({ revision: submitted.revision + 1, documentStatus: "cancelled" });
+    await expect(json(fetch, `/api/doctypes/invoice/${created.id}/owner`, {
+      method: "POST", headers: { ...headers, "if-match": String(cancelled.revision) }, body: { ownerId: 123 }
+    })).rejects.toMatchObject({ code: "INVALID_OWNER" });
+    await expect(json(fetch, `/api/doctypes/invoice/${created.id}/owner`, {
+      method: "POST", headers: { ...headers, "if-match": String(cancelled.revision) }, body: { ownerId: "   " }
+    })).rejects.toMatchObject({ code: "INVALID_OWNER" });
     const transferred = await json<{ revision: number; ownerId: string }>(fetch, `/api/doctypes/invoice/${created.id}/owner`, {
-      method: "POST", headers: { ...headers, "if-match": String(cancelled.revision) }, body: { ownerId: "reviewer" }
+      method: "POST", headers: { ...headers, "if-match": String(cancelled.revision) }, body: { ownerId: " reviewer " }
     });
     expect(transferred).toMatchObject({ revision: cancelled.revision + 1, ownerId: "reviewer" });
   });
