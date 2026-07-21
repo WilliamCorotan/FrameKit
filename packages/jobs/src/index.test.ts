@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
 import { createRuntime } from "@framekit/runtime";
 import { dispatchOutboxEvents, InMemoryQueue, OutboxDispatcher, retryFailedOutboxEvents, ScheduledJobRegistry, ScheduledJobRunner } from "./index.js";
@@ -162,6 +162,9 @@ describe("dispatchOutboxEvents", () => {
     expect(runs).toBe(1);
     runner.start();
     await runner.close();
+    await runner.dispose();
+    expect(() => runner.start()).toThrow("closed");
+    await expect(runner.runDue()).rejects.toThrow("closed");
   });
 
   it("sweeps already-exhausted failed events into dead-letter state", async () => {
@@ -191,14 +194,37 @@ describe("dispatchOutboxEvents", () => {
 
     const dispatcher = new OutboxDispatcher(runtime, tenant, async () => undefined, { intervalMs: 5 });
     dispatcher.start(controller.signal);
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
     controller.abort();
     await dispatcher.dispose();
+    await dispatcher.close();
     expect(await dispatcher.health()).toMatchObject({ details: { running: false } });
+    expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+    expect(() => dispatcher.start()).toThrow("closed");
+    await expect(dispatcher.runOnce()).rejects.toThrow("closed");
 
     const queue = new InMemoryQueue();
     await queue.start();
     await queue.dispose();
     await expect(queue.enqueue("closed", {})).rejects.toThrow("closed");
+  });
+
+  it("contains shutdown failures triggered by abort signals", async () => {
+    vi.useFakeTimers();
+    const registry = new ScheduledJobRegistry();
+    let rejectJob!: (reason: unknown) => void;
+    registry.register({ name: "failing", schedule: "* * * * *", handler: () => new Promise((_resolve, reject) => { rejectJob = reject; }) });
+    const runner = new ScheduledJobRunner(registry, 5);
+    const controller = new AbortController();
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    runner.start(controller.signal);
+    await vi.advanceTimersByTimeAsync(5);
+    controller.abort();
+    rejectJob(new Error("active job failed during shutdown"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+    expect(() => runner.start()).toThrow("closed");
+    vi.useRealTimers();
   });
 });
 

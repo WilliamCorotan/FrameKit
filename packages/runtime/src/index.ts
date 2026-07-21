@@ -312,18 +312,21 @@ export class FramekitRuntime {
 
   private async startResources(signal?: AbortSignal): Promise<void> {
     const started: LifecycleResource[] = [];
+    let starting: LifecycleResource | undefined;
     try {
       for (const resource of this.resources) {
         signal?.throwIfAborted();
+        starting = resource;
         await resource.start?.(signal);
         started.push(resource);
+        starting = undefined;
       }
       this.lifecycleState = "started";
     } catch (error) {
       try {
-        await closeLifecycleResources(started.reverse());
+        await closeLifecycleResources([...(starting ? [starting] : []), ...started.reverse()]);
       } catch (closeError) {
-        throw new AggregateError([error, closeError], "Runtime startup and rollback both failed.");
+        throw new AggregateError([error, ...aggregateErrorCauses(closeError)], "Runtime startup and rollback both failed.");
       } finally {
         this.lifecycleState = "closed";
       }
@@ -2238,4 +2241,8 @@ async function closeLifecycleResources(resources: LifecycleResource[]): Promise<
     }
   }
   if (failures.length > 0) throw new AggregateError(failures, "One or more runtime resources failed to close.");
+}
+
+function aggregateErrorCauses(error: unknown): unknown[] {
+  return error instanceof AggregateError ? [...error.errors] : [error];
 }

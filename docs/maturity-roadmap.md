@@ -96,12 +96,12 @@ Exit criteria:
 
 Reevaluation checks on 2026-07-21:
 
-- `pnpm audit:all`: lint/typecheck, 109 unit/in-process tests, enforced coverage thresholds, and all package, CRM, and Desk builds pass.
+- `pnpm audit:all`: lint/typecheck, 111 unit/in-process tests, enforced coverage thresholds, and all package, CRM, and Desk builds pass.
 - `pnpm test:desk:browser`: 5 Chromium journeys passed against mocked API routes.
 - `pnpm smoke:crm:built`: assertions and bounded cleanup regression tests pass and terminate; #18 is closed.
 - CI defines bounded package-local/coverage, Node 22/24, Postgres 16/17, Redis 7/8, built-smoke, standalone, browser, CodeQL, dependency audit, Dependabot, and SBOM gates.
 - Forged-header, cross-tenant, operation-permission, realtime-history, and SSE authorization checks pass; #16 is closed.
-- All ten public packages expose working package-local test commands; coverage is 66.98% statements, 61.31% branches, 65.38% functions, and 68.90% lines at this reevaluation.
+- All ten public packages expose working package-local test commands; coverage is 67.58% statements, 61.40% branches, 66.08% functions, and 69.41% lines at this reevaluation.
 - GitHub issues #2 through #7 are closed and their implemented work is present; older pending references were stale.
 
 ## Score Update Policy
