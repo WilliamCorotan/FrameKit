@@ -129,6 +129,7 @@ describe("createNitroHandler", () => {
     expect(downloaded.data).toBe("AQID");
     await json(fetch, `/api/doctypes/order/${created.id}/attachments/files/${uploaded.id}`, { method: "DELETE", headers: { ...headers, "if-match": "2" } });
     await expect(json(fetch, `/api/doctypes/order/${created.id}/attachments/files/${uploaded.id}`, { headers })).rejects.toMatchObject({ code: "ATTACHMENT_NOT_FOUND" });
+    await expect(json(fetch, `/api/doctypes/order/${created.id}/attachments/files/%00`, { headers })).rejects.toMatchObject({ code: "INVALID_PATH" });
   });
 
   it("exposes submit and cancel document lifecycle commands", async () => {

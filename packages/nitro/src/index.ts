@@ -744,9 +744,21 @@ function matchCommandPath(path: string, basePath: string): string | undefined {
 function matchAttachmentPath(path: string, basePath: string): { doctype: string; id: string; field: string; attachmentId?: string } | undefined {
   const prefix = `${basePath}/doctypes/`;
   if (!path.startsWith(prefix)) return undefined;
-  const [doctype, id, resource, field, attachmentId, ...extra] = path.slice(prefix.length).split("/").filter(Boolean).map(decodeURIComponent);
-  if (!doctype || !id || resource !== "attachments" || !field || extra.length > 0) return undefined;
-  return { doctype, id, field, ...(attachmentId ? { attachmentId } : {}) };
+  const encoded = path.slice(prefix.length).split("/");
+  if ((encoded.length !== 4 && encoded.length !== 5) || encoded.some((part) => !part)) return undefined;
+  const [doctype, id, resource, field, attachmentId] = encoded.map(decodePathSegment);
+  if (resource !== "attachments") return undefined;
+  return { doctype: doctype!, id: id!, field: field!, ...(attachmentId ? { attachmentId } : {}) };
+}
+
+function decodePathSegment(value: string): string {
+  try {
+    const decoded = decodeURIComponent(value);
+    if (!decoded || decoded.includes("\0")) throw new Error("invalid segment");
+    return decoded;
+  } catch {
+    throw new FramekitError("INVALID_PATH", "Request path contains a malformed identifier.", 400);
+  }
 }
 
 function decodeBase64(value: string): Uint8Array {

@@ -287,9 +287,10 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
 
   it("persists ordered child ownership and attachment metadata through PostgreSQL", async () => {
     const attachmentStorage = new InMemoryAttachmentStorage();
+    let collectionId = 0;
     const runtime = createRuntime(app, {
       repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
-      attachmentStorage, idGenerator: createIdGenerator("collection")
+      attachmentStorage, idGenerator: () => `col-${++collectionId}`
     });
     const created = await runtime.create(tenant, "collection_order", { title: "PG order", lines: [
       { data: { sku: "A", quantity: "2" } }, { data: { sku: "B", quantity: 1 } }
@@ -301,7 +302,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       .rejects.toMatchObject({ code: "INVALID_CHILD_ID" });
     const attachment = await runtime.uploadAttachment(tenant, "collection_order", created.id, "files", {
       name: "proof.txt", contentType: "text/plain", bytes: new Uint8Array([1, 2, 3])
-    }, { expectedRevision: reordered.revision });
+    }, { expectedRevision: reordered.revision, idempotencyKey: "pg-attachment-upload" });
+    expect(attachment.sha256).toMatch(/^sha256:[A-Za-z0-9_-]{43}$/);
     const restarted = createRuntime(app, {
       repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations, attachmentStorage
     });
@@ -310,6 +312,46 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       data: { lines: [{ id: originalLines[1]!.id, position: 0 }, { id: originalLines[0]!.id, position: 1 }], files: [{ id: attachment.id, storageKey: attachment.storageKey }] }
     });
     await expect(restarted.downloadAttachment(tenant, "collection_order", created.id, "files", attachment.id)).resolves.toMatchObject({ bytes: new Uint8Array([1, 2, 3]) });
+    const later = await restarted.update(tenant, "collection_order", created.id, { title: "PG order changed" }, { expectedRevision: 3 });
+    await expect(restarted.uploadAttachment(tenant, "collection_order", created.id, "files", {
+      name: "proof.txt", contentType: "text/plain", bytes: new Uint8Array([1, 2, 3])
+    }, { expectedRevision: reordered.revision, idempotencyKey: "pg-attachment-upload" })).resolves.toEqual(attachment);
+    await restarted.deleteAttachment(tenant, "collection_order", created.id, "files", attachment.id, { expectedRevision: later.revision, idempotencyKey: "pg-attachment-delete" });
+    await restarted.update(tenant, "collection_order", created.id, { title: "PG order final" }, { expectedRevision: later.revision + 2 });
+    await expect(restarted.deleteAttachment(tenant, "collection_order", created.id, "files", attachment.id, { expectedRevision: later.revision, idempotencyKey: "pg-attachment-delete" })).resolves.toBeUndefined();
+
+    const raced = await runtime.create(tenant, "collection_order", { title: "PG race", lines: [{ data: { sku: "RACE", quantity: 1 } }] });
+    let raceArrivals = 0;
+    let releaseRace!: () => void;
+    const raceBarrier = new Promise<void>((resolve) => { releaseRace = resolve; });
+    const raceStorage = {
+      put: async (...args: Parameters<InMemoryAttachmentStorage["put"]>) => { await attachmentStorage.put(...args); raceArrivals += 1; if (raceArrivals === 2) releaseRace(); await raceBarrier; },
+      get: (...args: Parameters<InMemoryAttachmentStorage["get"]>) => attachmentStorage.get(...args),
+      delete: (...args: Parameters<InMemoryAttachmentStorage["delete"]>) => attachmentStorage.delete(...args),
+      list: (...args: Parameters<InMemoryAttachmentStorage["list"]>) => attachmentStorage.list(...args),
+      releaseLease: (...args: Parameters<InMemoryAttachmentStorage["releaseLease"]>) => attachmentStorage.releaseLease(...args),
+      deleteIfUnleased: (...args: Parameters<InMemoryAttachmentStorage["deleteIfUnleased"]>) => attachmentStorage.deleteIfUnleased(...args)
+    };
+    const raceRuntime = createRuntime(app, {
+      repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
+      attachmentStorage: raceStorage, idGenerator: createIdGenerator("race-a")
+    });
+    const competing = createRuntime(app, {
+      repository: new PostgresDocumentRepository({ connectionString: connectionString! }),
+      audit: new PostgresAuditStore({ connectionString: connectionString! }),
+      outbox: new PostgresOutboxStore({ connectionString: connectionString! }),
+      mutations: new PostgresMutationUnitOfWork({ connectionString: connectionString! }), attachmentStorage: raceStorage,
+      idGenerator: createIdGenerator("collection-race")
+    });
+    const racedUploads = await Promise.allSettled([
+      raceRuntime.uploadAttachment(tenant, "collection_order", raced.id, "files", { name: "a", contentType: "text/plain", bytes: new Uint8Array([1]) }),
+      competing.uploadAttachment(tenant, "collection_order", raced.id, "files", { name: "b", contentType: "text/plain", bytes: new Uint8Array([2]) })
+    ]);
+    expect(racedUploads.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(racedUploads.filter((result) => result.status === "rejected").map((result) => (result as PromiseRejectedResult).reason.code)).toEqual(["REVISION_CONFLICT"]);
+    await expect(runtime.get(tenant, "collection_order", raced.id)).resolves.toMatchObject({ revision: 2, data: { files: [expect.any(Object)] } });
+    expect((await attachmentStorage.list(`${encodeURIComponent(tenant.tenantId)}/${encodeURIComponent(app.name)}/collection_order/${raced.id}/files/`))).toHaveLength(1);
+    await competing.close();
   });
 
   it("atomically persists tenant identity links and consumes lifecycle/OIDC state once", async () => {
@@ -525,6 +567,29 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       await sql.unsafe("drop index if exists framekit_documents_legacy_conflict_code_uniq");
       await (faultStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
     }
+  });
+
+  it("rejects collection-schema apply and rollback without changing rows or migration history", async () => {
+    const migrationTenant = { ...tenant, tenantId: "pg_collection_schema_guard" };
+    const rows = defineDocType({ name: "guard_rows", label: "Guard rows", fields: [{ name: "lines", label: "Lines", type: "children", fields: [
+      { name: "sku", label: "SKU", type: "text" }
+    ] }] });
+    const current = defineApp({ name: "PG Collection Guard", modules: [defineModule({ id: "rows", name: "Rows", doctypes: [rows] })] });
+    const next = defineApp({ name: current.name, modules: [defineModule({ id: "rows", name: "Rows", doctypes: [defineDocType({
+      ...rows, fields: [{ name: "lines", label: "Lines", type: "children", fields: [
+        { name: "sku", label: "SKU", type: "text" }, { name: "quantity", label: "Quantity", type: "number", required: true }
+      ] }]
+    })] })] });
+    await sql`delete from framekit_documents where tenant_id = ${migrationTenant.tenantId}`;
+    await sql`delete from framekit_migrations where tenant_id = ${migrationTenant.tenantId}`;
+    await sql`insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+      values (${migrationTenant.tenantId}, ${rows.name}, 'legacy-row', 1, null, ${sql.json({ lines: [{ id: "line-1", position: 0, data: { sku: "A" } }] })}, now(), now())`;
+    const plan = await createRuntime(current, { idGenerator: () => "collection-schema-guard" }).planMigration(migrationTenant, next);
+    await expect(stores.migrations.applyPlan(migrationTenant, plan, { allowDestructive: true })).rejects.toMatchObject({ code: "UNSUPPORTED_MIGRATION_CONVERSION" });
+    await expect(stores.migrations.rollback(migrationTenant, { ...plan, appliedAt: new Date().toISOString() }, { allowDestructive: true })).rejects.toMatchObject({ code: "UNSUPPORTED_MIGRATION_CONVERSION" });
+    const documents = await sql<{ data: Record<string, unknown> }[]>`select data from framekit_documents where tenant_id = ${migrationTenant.tenantId}`;
+    expect(documents).toEqual([{ data: { lines: [{ id: "line-1", data: { sku: "A" }, position: 0 }] } }]);
+    await expect(stores.migrations.list(migrationTenant)).resolves.toEqual([]);
   });
 
   it("resumes approved online conversions with durable checkpoints and isolated concurrent operators", async () => {

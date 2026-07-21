@@ -559,18 +559,18 @@ export class FramekitClient {
   }
 
   uploadAttachment(doctype: string, id: string, field: string, input: { name: string; contentType: string; bytes: Uint8Array }, options: MutationRequestOptions = {}): Promise<AttachmentMetadata> {
-    return this.request(`/api/doctypes/${doctype}/${id}/attachments/${field}`, {
+    return this.request(`/api/doctypes/${pathSegment(doctype)}/${pathSegment(id)}/attachments/${pathSegment(field)}`, {
       method: "POST", body: { name: input.name, contentType: input.contentType, data: encodeBase64(input.bytes) }, headers: mutationHeaders(options), signal: options.signal
     });
   }
 
   async downloadAttachment(doctype: string, id: string, field: string, attachmentId: string, options: { signal?: AbortSignal } = {}): Promise<AttachmentDownload> {
-    const response = await this.request<{ metadata: AttachmentMetadata; data: string }>(`/api/doctypes/${doctype}/${id}/attachments/${field}/${attachmentId}`, { signal: options.signal });
+    const response = await this.request<{ metadata: AttachmentMetadata; data: string }>(`/api/doctypes/${pathSegment(doctype)}/${pathSegment(id)}/attachments/${pathSegment(field)}/${pathSegment(attachmentId)}`, { signal: options.signal });
     return { metadata: response.metadata, bytes: decodeBase64(response.data) };
   }
 
   deleteAttachment(doctype: string, id: string, field: string, attachmentId: string, options: MutationRequestOptions = {}): Promise<void> {
-    return this.request(`/api/doctypes/${doctype}/${id}/attachments/${field}/${attachmentId}`, { method: "DELETE", headers: mutationHeaders(options), signal: options.signal });
+    return this.request(`/api/doctypes/${pathSegment(doctype)}/${pathSegment(id)}/attachments/${pathSegment(field)}/${pathSegment(attachmentId)}`, { method: "DELETE", headers: mutationHeaders(options), signal: options.signal });
   }
 
   cleanupOrphanAttachments(options: { signal?: AbortSignal } = {}): Promise<{ deleted: string[] }> {
@@ -644,13 +644,13 @@ export function generateSdkTypes(app: AppDefinition): string {
     const name = pascal(doctype.name);
     lines.push(`export type ${name}Input = {`);
     for (const field of doctype.fields.filter((candidate) => !candidate.computed && candidate.type !== "attachments")) {
-      lines.push(`  ${field.name}${field.required ? "" : "?"}: ${tsType(field)};`);
+      lines.push(`  ${field.name}${field.required ? "" : "?"}: ${tsType(field, "input")};`);
     }
     lines.push("};", "");
     lines.push(`export type ${name}Patch = Partial<${name}Input>;`);
     lines.push(`export type ${name}Data = {`);
     for (const field of doctype.fields) {
-      lines.push(`  ${field.name}${field.required || field.computed ? "" : "?"}: ${tsType(field)};`);
+      lines.push(`  ${field.name}${field.required || field.computed ? "" : "?"}: ${tsType(field, "output")};`);
     }
     lines.push("};", "");
     lines.push(`export type ${name}Record = DocumentRecord<${name}Data>;`);
@@ -795,7 +795,7 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function tsType(field: FieldDefinition): string {
+function tsType(field: FieldDefinition, direction: "input" | "output" = "output"): string {
   const domain = field.validators.find((validator) => validator.kind === "domain");
   if (domain?.kind === "domain") return domain.values.map((value) => JSON.stringify(value)).join(" | ");
   switch (field.type) {
@@ -811,7 +811,7 @@ function tsType(field: FieldDefinition): string {
     case "select":
       return field.options?.length ? field.options.map((option) => JSON.stringify(option)).join(" | ") : "string";
     case "children":
-      return `Array<{ id?: string; position?: number; data: { ${(field.fields ?? []).map((child) => `${child.name}${child.required ? "" : "?"}: ${tsType(child)}`).join("; ")} } }>`;
+      return `Array<{ id${direction === "input" ? "?" : ""}: string; position${direction === "input" ? "?" : ""}: number; data: { ${(field.fields ?? []).map((child) => `${child.name}${child.required ? "" : "?"}: ${tsType(child as FieldDefinition, direction)}`).join("; ")} } }>`;
     case "attachments":
       return "AttachmentMetadata[]";
     default:
@@ -823,6 +823,11 @@ function encodeBase64(bytes: Uint8Array): string {
   let binary = "";
   for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
   return btoa(binary);
+}
+
+function pathSegment(value: string): string {
+  if (!value) throw new Error("URL path segments must not be empty.");
+  return encodeURIComponent(value);
 }
 
 function decodeBase64(value: string): Uint8Array {

@@ -70,9 +70,11 @@ export type AttachmentMetadata = {
   name: string;
   contentType: string;
   size: number;
+  sha256: string;
   storageKey: string;
   createdAt: string;
   createdBy: string;
+  pendingDelete?: { fingerprint: string; requestedAt: string; requestedBy: string };
 };
 
 export function decimalPrecision(field: Pick<FieldDefinition, "type" | "precision">): number {

@@ -894,7 +894,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
 function doctypeOutputSchema(doctype: DocTypeDefinition): JsonSchema {
   return {
     type: "object",
-    properties: Object.fromEntries(doctype.fields.map((field) => [field.name, fieldSchema(field)])),
+    properties: Object.fromEntries(doctype.fields.map((field) => [field.name, fieldSchema(field, "output")])),
     required: doctype.fields.filter((field) => field.required || field.computed).map((field) => field.name),
     additionalProperties: false
   };
@@ -908,7 +908,7 @@ function doctypeInputSchema(doctype: DocTypeDefinition, partial: boolean): JsonS
     if (field.computed || (field.readOnly && partial)) {
       continue;
     }
-    properties[field.name] = fieldSchema(field);
+    properties[field.name] = fieldSchema(field, "input");
     if (!partial && field.required) {
       required.push(field.name);
     }
@@ -921,7 +921,7 @@ function doctypeInputSchema(doctype: DocTypeDefinition, partial: boolean): JsonS
   };
 }
 
-function fieldSchema(field: FieldDefinition): JsonSchema {
+function fieldSchema(field: FieldDefinition, direction: "input" | "output" = "output"): JsonSchema {
   const description = field.description;
   let schema: JsonSchema;
   switch (field.type) {
@@ -954,14 +954,18 @@ function fieldSchema(field: FieldDefinition): JsonSchema {
       schema = { description };
       break;
     case "children":
+      {
+        const childProperties = Object.fromEntries((field.fields ?? []).map((child) => [child.name, fieldSchema(child as FieldDefinition, direction)]));
+        const childRequired = (field.fields ?? []).filter((child) => child.required).map((child) => child.name);
       return {
         type: "array", description, items: {
-          type: "object", required: ["id", "position", "data"], properties: {
+          type: "object", required: direction === "output" ? ["id", "position", "data"] : ["data"], properties: {
             id: { type: "string" }, position: { type: "integer", minimum: 0 },
-            data: { type: "object", properties: Object.fromEntries((field.fields ?? []).map((child) => [child.name, fieldSchema(child)])), additionalProperties: false }
-          }
+            data: { type: "object", properties: childProperties, required: childRequired.length > 0 ? childRequired : undefined, additionalProperties: false }
+          }, additionalProperties: false
         }
       };
+      }
     case "attachments":
       return { type: "array", description, items: attachmentMetadataSchema() };
     default:
@@ -1010,11 +1014,16 @@ function exactDecimalPattern(field: FieldDefinition): string {
 
 function attachmentMetadataSchema(): JsonSchema {
   return {
-    type: "object", required: ["id", "name", "contentType", "size", "storageKey", "createdAt", "createdBy"],
+    type: "object", required: ["id", "name", "contentType", "size", "sha256", "storageKey", "createdAt", "createdBy"],
     properties: {
       id: { type: "string" }, name: { type: "string" }, contentType: { type: "string" }, size: { type: "integer", minimum: 0 },
-      storageKey: { type: "string" }, createdAt: { type: "string", format: "date-time" }, createdBy: { type: "string" }
-    }
+      sha256: { type: "string", pattern: "^sha256:[A-Za-z0-9_-]{43}$" }, storageKey: { type: "string" },
+      createdAt: { type: "string", format: "date-time" }, createdBy: { type: "string" },
+      pendingDelete: {
+        type: "object", required: ["fingerprint", "requestedAt", "requestedBy"], additionalProperties: false,
+        properties: { fingerprint: { type: "string" }, requestedAt: { type: "string", format: "date-time" }, requestedBy: { type: "string" } }
+      }
+    }, additionalProperties: false
   };
 }
 
