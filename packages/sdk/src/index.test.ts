@@ -4,7 +4,7 @@ import { createRuntime, validateMigrationPlan, type MigrationPlan as RuntimeMigr
 import { ofetch } from "ofetch";
 import {
   createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitCancelledError, FramekitClient, FramekitConflictError,
-  FramekitServerError, FramekitValidationError, generateSdkTypes, upgradeFramekitClientConfig, type MigrationPlan
+  FramekitResponseError, FramekitServerError, FramekitValidationError, generateSdkTypes, upgradeFramekitClientConfig, type MigrationPlan
 } from "./index.js";
 
 vi.mock("ofetch", () => ({ ofetch: vi.fn() }));
@@ -183,6 +183,33 @@ describe("generateSdkTypes", () => {
     vi.mocked(ofetch).mockReset().mockRejectedValueOnce(httpFailure(503, "UNAVAILABLE", "retry")).mockResolvedValueOnce({ id: "one" } as never);
     await expect(client.create("customer", { name: "Safe" }, { idempotencyKey: "create-one" })).resolves.toMatchObject({ id: "one" });
     expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies unknown HTTP responses separately from transport failures and never retries 405", async () => {
+    vi.mocked(ofetch).mockRejectedValue(httpFailure(405, "HTTP_405", "method not allowed"));
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3, baseDelayMs: 0 } });
+
+    const error = await client.get("customer", "one").catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(FramekitResponseError);
+    expect(error).toMatchObject({ status: 405, code: "HTTP_405" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("reserves transport retries for failures without an HTTP response", async () => {
+    vi.mocked(ofetch).mockRejectedValueOnce(new TypeError("fetch failed")).mockResolvedValueOnce({ ok: true, app: "Recovered" } as never);
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 2, baseDelayMs: 0 } });
+
+    await expect(client.health()).resolves.toMatchObject({ app: "Recovered" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("forwards list AbortSignal and performs zero requests when it is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort("cancel before list");
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3 } });
+
+    await expect(client.list("customer", { signal: controller.signal })).rejects.toBeInstanceOf(FramekitCancelledError);
+    expect(vi.mocked(ofetch)).not.toHaveBeenCalled();
   });
 
   it("cancels retry waits with AbortSignal", async () => {

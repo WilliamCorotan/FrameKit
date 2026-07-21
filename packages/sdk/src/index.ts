@@ -94,6 +94,7 @@ export class FramekitNotFoundError extends FramekitSdkError {}
 export class FramekitConflictError extends FramekitSdkError {}
 export class FramekitRateLimitError extends FramekitSdkError {}
 export class FramekitServerError extends FramekitSdkError {}
+export class FramekitResponseError extends FramekitSdkError {}
 export class FramekitTransportError extends FramekitSdkError {}
 export class FramekitCancelledError extends FramekitSdkError {}
 
@@ -303,8 +304,8 @@ export class FramekitClient {
     return this.request("/api/migrations/plan", { method: "POST", body: { app } });
   }
 
-  applyMigration(plan: MigrationPlan, options: { allowDestructive?: boolean } = {}): Promise<MigrationRecord> {
-    return this.request("/api/migrations/apply", { method: "POST", body: { plan, allowDestructive: options.allowDestructive } });
+  applyMigration(plan: MigrationPlan, options: { allowDestructive?: boolean; signal?: AbortSignal } = {}): Promise<MigrationRecord> {
+    return this.request("/api/migrations/apply", { method: "POST", body: { plan, allowDestructive: options.allowDestructive }, signal: options.signal });
   }
 
   openapi<T = unknown>(): Promise<T> {
@@ -472,7 +473,7 @@ export class FramekitClient {
   }
 
   list<TData extends DocumentData = DocumentData>(doctype: string, options: ListDocumentsOptions = {}): Promise<DocumentRecord<TData>[]> {
-    return this.request(`/api/doctypes/${doctype}${listQuery(options)}`);
+    return this.request(`/api/doctypes/${doctype}${listQuery(options)}`, { signal: options.signal });
   }
 
   async listPage<TData extends DocumentData = DocumentData>(doctype: string, options: ListDocumentsOptions = {}): Promise<ListDocumentsPage<TData>> {
@@ -579,7 +580,7 @@ export function upgradeFramekitClientConfig(input: FramekitClientOptions): Frame
 export function generateSdkTypes(app: AppDefinition): string {
   const lines: string[] = [
     "import type { DocumentRecord } from \"@framekit/core\";",
-    "export { FramekitSdkError, FramekitValidationError, FramekitAuthenticationError, FramekitAuthorizationError, FramekitNotFoundError, FramekitConflictError, FramekitRateLimitError, FramekitServerError, FramekitTransportError, FramekitCancelledError } from \"@framekit/sdk\";",
+    "export { FramekitSdkError, FramekitValidationError, FramekitAuthenticationError, FramekitAuthorizationError, FramekitNotFoundError, FramekitConflictError, FramekitRateLimitError, FramekitServerError, FramekitResponseError, FramekitTransportError, FramekitCancelledError } from \"@framekit/sdk\";",
     "export type { FramekitClientConfigV1, FramekitClientConfigV2, FramekitRetryPolicy } from \"@framekit/sdk\";",
     ""
   ];
@@ -674,6 +675,7 @@ function toFramekitSdkError(cause: unknown, signal?: AbortSignal): FramekitSdkEr
   if (status === 409) return new FramekitConflictError(...args);
   if (status === 429) return new FramekitRateLimitError(...args);
   if (status && status >= 500) return new FramekitServerError(...args);
+  if (candidate.response) return new FramekitResponseError(...args);
   return new FramekitTransportError(...args);
 }
 
