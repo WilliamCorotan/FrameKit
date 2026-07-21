@@ -83,6 +83,15 @@ test("runs real document CRUD, deletion, workflow, and pagination", async ({ pag
   await page.getByRole("button", { name: "Cancel" }).click();
   expect((await cancelRequest).headers()["if-match"]).toBe("3");
   await expect(page.getByText("Cancelled")).toBeVisible();
+  await page.getByLabel("Owner").fill(`owner-${suffix}`);
+  const ownerResponse = page.waitForResponse((response) => response.url().endsWith("/owner"));
+  await page.getByRole("button", { name: "Transfer owner" }).click();
+  const ownerPayload = await (await ownerResponse).json() as Record<string, unknown>;
+  expect(ownerPayload).toMatchObject({ ownerId: `owner-${suffix}`, revision: 5 });
+  expect(ownerPayload).not.toHaveProperty("data");
+  expect(ownerPayload).not.toHaveProperty("documentStatus");
+  await expect(page.getByLabel("Owner")).toHaveValue(`owner-${suffix}`);
+  await expect(page.getByText("Revision 5")).toBeVisible();
 });
 
 test("runs real administration and proves a least-privilege user is denied", async ({ page }, testInfo) => {

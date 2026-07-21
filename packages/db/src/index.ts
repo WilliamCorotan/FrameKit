@@ -8,7 +8,7 @@ import type {
   OidcAuthorizationState, OidcAuthorizationStateStore, RoleStore, SessionRevocationStore, UserStore
 } from "@framekit/auth";
 import type { CustomFieldDefinition, DocTypeDefinition, DocumentRecord, TenantContext, ViewDefinition } from "@framekit/core";
-import { FramekitError } from "@framekit/core";
+import { canTransferOwnership, FramekitError, rowPolicyScope } from "@framekit/core";
 import {
   decodeDocumentCursor,
   encodeDocumentCursor,
@@ -50,6 +50,7 @@ export const framekitDocuments = pgTable(
     id: text("id").notNull(),
     revision: integer("revision").notNull().default(1),
     documentStatus: text("document_status").notNull().default("draft").$type<DocumentRecord["documentStatus"]>(),
+    ownerId: text("owner_id"),
     state: text("state"),
     data: jsonb("data").notNull().$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
@@ -312,6 +313,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
     const conditions: SQL[] = [
       eq(framekitDocuments.tenantId, tenant.tenantId),
       eq(framekitDocuments.doctype, doctype.name),
+      compileRowPolicy(tenant, doctype, "read"),
       ...compileDocumentFilters(doctype, options.filters)
     ];
     if (options.search) {
@@ -337,6 +339,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
         id: framekitDocuments.id,
         revision: framekitDocuments.revision,
         documentStatus: framekitDocuments.documentStatus,
+        ownerId: framekitDocuments.ownerId,
         state: framekitDocuments.state,
         data: dataExpression,
         createdAt: framekitDocuments.createdAt,
@@ -366,22 +369,36 @@ export class PostgresDocumentRepository implements DocumentRepository {
     return { items, nextCursor };
   }
 
-  async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
+  async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { access?: "read" | "write" } = {}): Promise<DocumentRecord | undefined> {
+    const conditions = [eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id)];
+    conditions.push(compileRowPolicy(tenant, doctype, options.access ?? "read"));
     const rows = await this.db
       .select()
       .from(framekitDocuments)
-      .where(and(eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id)))
+      .where(and(...conditions))
       .limit(1);
     return rows[0] ? rowToRecord(rows[0]) : undefined;
   }
 
-  async create(_tenant: TenantContext, _doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord> {
+  async getForOwnerTransfer(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
+    if (!canTransferOwnership(tenant, doctype)) return undefined;
+    const rows = await this.db.select().from(framekitDocuments).where(and(
+      eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id)
+    )).limit(1);
+    return rows[0] ? rowToRecord(rows[0]) : undefined;
+  }
+
+  async create(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord> {
+    if ((doctype.ownership && record.ownerId !== tenant.userId) || (!doctype.ownership && record.ownerId !== undefined)) {
+      throw new FramekitError("INVALID_OWNER", "Document owner must be assigned by enabled ownership metadata", 403);
+    }
     await this.db.insert(framekitDocuments).values({
       tenantId: record.tenantId,
       doctype: record.doctype,
       id: record.id,
       revision: record.revision,
       documentStatus: record.documentStatus,
+      ownerId: record.ownerId,
       state: record.state,
       data: record.data,
       createdAt: new Date(record.createdAt),
@@ -392,12 +409,15 @@ export class PostgresDocumentRepository implements DocumentRepository {
 
   async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number } = {}): Promise<DocumentRecord> {
     const conditions = [eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, record.id)];
+    conditions.push(compileRowPolicy(tenant, doctype, "write"));
+    conditions.push(record.ownerId === undefined ? drizzleSql`${framekitDocuments.ownerId} is null` : eq(framekitDocuments.ownerId, record.ownerId));
     if (options.expectedRevision !== undefined) conditions.push(eq(framekitDocuments.revision, options.expectedRevision));
     const rows = await this.db
       .update(framekitDocuments)
       .set({
         revision: record.revision,
         documentStatus: record.documentStatus,
+        ownerId: record.ownerId,
         state: record.state,
         data: record.data,
         updatedAt: new Date(record.updatedAt)
@@ -405,7 +425,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
       .where(and(...conditions))
       .returning();
     if (!rows[0]) {
-      const current = await this.get(tenant, doctype, record.id);
+      const current = await this.get(tenant, doctype, record.id, { access: "write" });
       if (current && options.expectedRevision !== undefined) {
         throw postgresRevisionConflict(doctype.name, record.id, options.expectedRevision, current.revision);
       }
@@ -414,15 +434,29 @@ export class PostgresDocumentRepository implements DocumentRepository {
     return rowToRecord(rows[0]);
   }
 
+  async transferOwner(tenant: TenantContext, doctype: DocTypeDefinition, id: string, ownerId: string, options: { expectedRevision: number; updatedAt: string }): Promise<DocumentRecord> {
+    if (!canTransferOwnership(tenant, doctype)) throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
+    const rows = await this.db.update(framekitDocuments).set({
+      ownerId, revision: options.expectedRevision + 1, updatedAt: new Date(options.updatedAt)
+    }).where(and(eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id), eq(framekitDocuments.revision, options.expectedRevision))).returning();
+    if (!rows[0]) {
+      const current = await this.getForOwnerTransfer(tenant, doctype, id);
+      if (current) throw postgresRevisionConflict(doctype.name, id, options.expectedRevision, current.revision);
+      throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
+    }
+    return rowToRecord(rows[0]);
+  }
+
   async delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { expectedRevision?: number } = {}): Promise<void> {
     const conditions = [eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id)];
+    conditions.push(compileRowPolicy(tenant, doctype, "write"));
     if (options.expectedRevision !== undefined) conditions.push(eq(framekitDocuments.revision, options.expectedRevision));
     const rows = await this.db
       .delete(framekitDocuments)
       .where(and(...conditions))
       .returning({ revision: framekitDocuments.revision });
     if (!rows[0]) {
-      const current = await this.get(tenant, doctype, id);
+      const current = await this.get(tenant, doctype, id, { access: "write" });
       if (current && options.expectedRevision !== undefined) {
         throw postgresRevisionConflict(doctype.name, id, options.expectedRevision, current.revision);
       }
@@ -469,6 +503,9 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
   }
 
   async execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }> {
+    if (command.operation === "create" && ((command.doctype.ownership && command.document.ownerId !== command.tenant.userId) || (!command.doctype.ownership && command.document.ownerId !== undefined))) {
+      throw new FramekitError("INVALID_OWNER", "Document owner must be assigned by enabled ownership metadata", 403);
+    }
     try {
       return await this.sql.begin(async (tx) => {
         if (command.idempotencyKey) {
@@ -488,31 +525,48 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
         let result: DocumentRecord | undefined;
         if (command.operation === "create") {
           await tx`
-            insert into framekit_documents (tenant_id, doctype, id, revision, document_status, state, data, created_at, updated_at)
+            insert into framekit_documents (tenant_id, doctype, id, revision, document_status, owner_id, state, data, created_at, updated_at)
             values (
               ${command.document.tenantId}, ${command.document.doctype}, ${command.document.id}, ${command.document.revision},
-              ${command.document.documentStatus}, ${command.document.state ?? null}, ${tx.json(command.document.data as postgres.JSONValue)}, ${command.document.createdAt}, ${command.document.updatedAt}
+              ${command.document.documentStatus}, ${command.document.ownerId ?? null}, ${command.document.state ?? null}, ${tx.json(command.document.data as postgres.JSONValue)}, ${command.document.createdAt}, ${command.document.updatedAt}
             )
           `;
           result = command.document;
           await replaceUniqueValues(tx, command);
         } else if (command.operation === "update") {
+          const scope = rowPolicyScope(command.tenant, command.doctype, "write");
           const rows = await tx<{ revision: number }[]>`
             update framekit_documents
-            set revision = ${command.document.revision}, document_status = ${command.document.documentStatus}, state = ${command.document.state ?? null},
+            set revision = ${command.document.revision}, document_status = ${command.document.documentStatus}, owner_id = ${command.document.ownerId ?? null}, state = ${command.document.state ?? null},
                 data = ${tx.json(command.document.data as postgres.JSONValue)}, updated_at = ${command.document.updatedAt}
             where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
               and id = ${command.document.id} and revision = ${command.expectedRevision!}
+              and (${scope === "all"} or (${scope === "self"} and owner_id = ${command.tenant.userId}))
+              and owner_id is not distinct from ${command.document.ownerId ?? null}
             returning revision
           `;
           if (!rows[0]) await throwMutationWriteFailure(tx, command);
           result = command.document;
           await replaceUniqueValues(tx, command);
+        } else if (command.operation === "transfer_owner") {
+          const rows = await tx<typeof framekitDocuments.$inferSelect[]>`
+            update framekit_documents
+            set owner_id = ${command.document.ownerId!}, revision = ${command.document.revision}, updated_at = ${command.document.updatedAt}
+            where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
+              and id = ${command.document.id} and revision = ${command.expectedRevision!}
+              and ${canTransferOwnership(command.tenant, command.doctype)}
+            returning tenant_id as "tenantId", doctype, id, revision, document_status as "documentStatus", owner_id as "ownerId", state, data,
+                      created_at as "createdAt", updated_at as "updatedAt"
+          `;
+          if (!rows[0]) await throwMutationWriteFailure(tx, command);
+          result = rowToRecord(rows[0]!);
         } else {
+          const scope = rowPolicyScope(command.tenant, command.doctype, "write");
           const rows = await tx<{ revision: number }[]>`
             delete from framekit_documents
             where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
               and id = ${command.document.id} and revision = ${command.expectedRevision!}
+              and (${scope === "all"} or (${scope === "self"} and owner_id = ${command.tenant.userId}))
             returning revision
           `;
           if (!rows[0]) await throwMutationWriteFailure(tx, command);
@@ -523,18 +577,19 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
         }
 
         await this.faultInjector?.("document", command);
-        await command.afterWrite();
+        await command.afterWrite(result);
         await this.faultInjector?.("hooks", command);
+        const sideEffects = typeof command.sideEffects === "function" ? command.sideEffects(result!) : command.sideEffects;
         await tx`
           insert into framekit_audit_events (tenant_id, id, user_id, action, doctype, document_id, created_at)
-          values (${command.audit.tenantId}, ${command.audit.id}, ${command.audit.userId}, ${command.audit.action},
-                  ${command.audit.doctype}, ${command.audit.documentId}, ${command.audit.createdAt})
+          values (${sideEffects.audit.tenantId}, ${sideEffects.audit.id}, ${sideEffects.audit.userId}, ${sideEffects.audit.action},
+                  ${sideEffects.audit.doctype}, ${sideEffects.audit.documentId}, ${sideEffects.audit.createdAt})
         `;
         await this.faultInjector?.("audit", command);
         await tx`
           insert into framekit_outbox_events (tenant_id, id, type, topic, payload, status, attempts, created_at, processed_at, error)
-          values (${command.outbox.tenantId}, ${command.outbox.id}, ${command.outbox.type}, ${command.outbox.topic},
-                  ${tx.json(command.outbox.payload as postgres.JSONValue)}, ${command.outbox.status}, ${command.outbox.attempts}, ${command.outbox.createdAt}, null, null)
+          values (${sideEffects.outbox.tenantId}, ${sideEffects.outbox.id}, ${sideEffects.outbox.type}, ${sideEffects.outbox.topic},
+                  ${tx.json(sideEffects.outbox.payload as postgres.JSONValue)}, ${sideEffects.outbox.status}, ${sideEffects.outbox.attempts}, ${sideEffects.outbox.createdAt}, null, null)
         `;
         await this.faultInjector?.("outbox", command);
         if (command.idempotencyKey) {
@@ -1502,6 +1557,7 @@ create table if not exists framekit_documents (
   id text not null,
   revision integer not null default 1,
   document_status text not null default 'draft',
+  owner_id text,
   state text,
   data jsonb not null,
   created_at timestamptz not null,
@@ -1510,6 +1566,7 @@ create table if not exists framekit_documents (
 );
 alter table framekit_documents add column if not exists revision integer not null default 1;
 alter table framekit_documents add column if not exists document_status text not null default 'draft';
+alter table framekit_documents add column if not exists owner_id text;
 create index if not exists framekit_documents_lookup on framekit_documents (tenant_id, doctype, updated_at desc);
 `;
 }
@@ -1518,6 +1575,7 @@ export function createMutationTablesSql(): string {
   return `
 alter table framekit_documents add column if not exists revision integer not null default 1;
 alter table framekit_documents add column if not exists document_status text not null default 'draft';
+alter table framekit_documents add column if not exists owner_id text;
 create table if not exists framekit_document_unique_values (
   tenant_id text not null,
   doctype text not null,
@@ -1815,6 +1873,8 @@ function statementsForChange(tenantId: string, change: MigrationChange | Migrati
       return [`create unique index if not exists ${indexIdentifier(change, "uniq")} on framekit_documents (tenant_id, doctype, (data ->> ${sqlLiteral(change.field)})) where doctype = ${sqlLiteral(change.doctype)} and data ? ${sqlLiteral(change.field)} and data ->> ${sqlLiteral(change.field)} <> '';`];
     case "remove_unique_constraint":
       return [`drop index if exists ${indexIdentifier(change, "uniq")};`];
+    case "change_row_policy":
+      return [`-- change_row_policy ${change.doctype}: authorize only after any required owner_id backfill`];
   }
 }
 
@@ -1934,6 +1994,8 @@ function rollbackFromChange(change: MigrationChange): MigrationRollback {
       return { kind: "remove_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
     case "remove_unique_constraint":
       return { kind: "add_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+    case "change_row_policy":
+      return { kind: "change_row_policy", doctype: change.doctype, field: "row_policy", destructive: true, from: change.to, to: change.from };
   }
 }
 
@@ -1977,9 +2039,11 @@ async function replaceUniqueValues(sql: postgres.TransactionSql, command: Mutati
 }
 
 async function throwMutationWriteFailure(sql: postgres.TransactionSql, command: MutationCommand): Promise<never> {
+  const scope = command.operation === "transfer_owner" && canTransferOwnership(command.tenant, command.doctype) ? "all" : rowPolicyScope(command.tenant, command.doctype, "write");
   const rows = await sql<{ revision: number }[]>`
     select revision from framekit_documents
     where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name} and id = ${command.document.id}
+      and (${scope === "all"} or (${scope === "self"} and owner_id = ${command.tenant.userId}))
     limit 1
   `;
   if (!rows[0]) {
@@ -2110,6 +2174,13 @@ function compileDocumentFilters(doctype: DocTypeDefinition, filters: ListOptions
   return conditions;
 }
 
+function compileRowPolicy(tenant: TenantContext, doctype: DocTypeDefinition, operation: "read" | "write"): SQL {
+  const scope = rowPolicyScope(tenant, doctype, operation);
+  if (scope === "all") return drizzleSql`true`;
+  if (scope === "self") return eq(framekitDocuments.ownerId, tenant.userId);
+  return drizzleSql`false`;
+}
+
 function equalityFilter(field: string, text: SQL<string>, value: unknown): SQL {
   if (value === null) return drizzleSql`${framekitDocuments.data} -> ${field} = 'null'::jsonb`;
   return and(
@@ -2129,6 +2200,7 @@ function selectedRowToRecord(row: {
   id: string;
   revision: number;
   documentStatus: DocumentRecord["documentStatus"];
+  ownerId: string | null;
   state: string | null;
   data: Record<string, unknown>;
   createdAt: Date;
@@ -2140,6 +2212,7 @@ function selectedRowToRecord(row: {
     id: row.id,
     revision: row.revision,
     documentStatus: row.documentStatus,
+    ownerId: row.ownerId ?? undefined,
     state: row.state ?? undefined,
     data: row.data,
     createdAt: row.createdAt.toISOString(),
@@ -2154,6 +2227,7 @@ function rowToRecord(row: typeof framekitDocuments.$inferSelect): DocumentRecord
     id: row.id,
     revision: row.revision,
     documentStatus: row.documentStatus,
+    ownerId: row.ownerId ?? undefined,
     state: row.state ?? undefined,
     data: row.data,
     createdAt: row.createdAt.toISOString(),

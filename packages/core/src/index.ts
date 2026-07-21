@@ -14,7 +14,7 @@ export const fieldTypes = [
 ] as const;
 
 export type FieldType = (typeof fieldTypes)[number];
-export type DocumentAction = "create" | "read" | "update" | "delete" | "submit" | "cancel" | "transition";
+export type DocumentAction = "create" | "read" | "update" | "delete" | "submit" | "cancel" | "transition" | "transfer_owner";
 export type DocumentStatus = "draft" | "submitted" | "cancelled";
 
 export const FieldSchema = z.object({
@@ -53,7 +53,7 @@ export const ViewSchema = z.object({
 export type ViewDefinition = z.infer<typeof ViewSchema>;
 
 export const PermissionRuleSchema = z.object({
-  action: z.enum(["create", "read", "update", "delete", "submit", "cancel", "transition"]),
+  action: z.enum(["create", "read", "update", "delete", "submit", "cancel", "transition", "transfer_owner"]),
   roles: z.array(z.string()).default([]),
   permissions: z.array(z.string()).default([])
 });
@@ -79,12 +79,32 @@ export const WorkflowSchema = z.object({
 
 export type WorkflowDefinition = z.infer<typeof WorkflowSchema>;
 
+export const RowPolicyRuleSchema = z.object({
+  owner: z.enum(["any", "self"]).default("any"),
+  roles: z.array(z.string()).default([]),
+  permissions: z.array(z.string()).default([])
+}).strict();
+
+export type RowPolicyRule = z.infer<typeof RowPolicyRuleSchema>;
+
+export const RowPolicySchema = z.object({
+  read: z.array(RowPolicyRuleSchema).min(1),
+  write: z.array(RowPolicyRuleSchema).min(1)
+}).strict();
+
+export type RowPolicy = z.infer<typeof RowPolicySchema>;
+
 export const DocTypeSchema = z.object({
   name: z.string().min(1).regex(/^[a-z][a-z0-9_]*$/),
   label: z.string().min(1),
   description: z.string().optional(),
   fields: z.array(FieldSchema).default([]),
   permissions: z.array(PermissionRuleSchema).default([]),
+  ownership: z.object({
+    transferRoles: z.array(z.string()).default([]),
+    transferPermissions: z.array(z.string()).default([])
+  }).strict().optional(),
+  rowPolicy: RowPolicySchema.optional(),
   workflow: WorkflowSchema.optional(),
   naming: z
     .object({
@@ -113,7 +133,9 @@ export const HookNames = [
   "beforeSubmit",
   "afterSubmit",
   "beforeCancel",
-  "afterCancel"
+  "afterCancel",
+  "beforeOwnerTransfer",
+  "afterOwnerTransfer"
 ] as const;
 
 export type HookName = (typeof HookNames)[number];
@@ -133,9 +155,17 @@ export type DocumentRecord<TData extends DocumentData = DocumentData> = {
   tenantId: string;
   revision: number;
   documentStatus: DocumentStatus;
+  ownerId?: string;
   data: TData;
   state?: string;
   createdAt: string;
+  updatedAt: string;
+};
+
+export type OwnerTransferReceipt = {
+  id: string;
+  ownerId: string;
+  revision: number;
   updatedAt: string;
 };
 
@@ -267,10 +297,31 @@ export function listNavigation(app: AppDefinition): NavigationItem[] {
   return app.modules.flatMap((module) => module.navigation).sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
 }
 
-export function hasAccess(context: TenantContext, rule: PermissionRule | WorkflowTransition): boolean {
+export function hasAccess(context: TenantContext, rule: PermissionRule | WorkflowTransition | RowPolicyRule): boolean {
   const roleAllowed = context.roles.includes("*") || rule.roles.length === 0 || rule.roles.some((role) => context.roles.includes(role));
   const permissionAllowed = context.permissions.includes("*") || rule.permissions.length === 0 || rule.permissions.some((permission) => context.permissions.includes(permission));
   return roleAllowed && permissionAllowed;
+}
+
+export type RowPolicyScope = "all" | "self" | "none";
+
+export function rowPolicyScope(context: TenantContext, doctype: DocTypeDefinition, operation: "read" | "write"): RowPolicyScope {
+  if (!doctype.rowPolicy || context.roles.includes("*") || context.permissions.includes("*")) return "all";
+  const matched = doctype.rowPolicy[operation].filter((rule) => hasAccess(context, rule));
+  if (matched.some((rule) => rule.owner === "any")) return "all";
+  return matched.some((rule) => rule.owner === "self") ? "self" : "none";
+}
+
+export function hasRowAccess(context: TenantContext, doctype: DocTypeDefinition, operation: "read" | "write", ownerId?: string): boolean {
+  const scope = rowPolicyScope(context, doctype, operation);
+  return scope === "all" || (scope === "self" && ownerId === context.userId);
+}
+
+export function canTransferOwnership(context: TenantContext, doctype: DocTypeDefinition): boolean {
+  if (!doctype.ownership) return false;
+  if (context.roles.includes("*") || context.permissions.includes("*")) return true;
+  const rule = { owner: "any" as const, roles: doctype.ownership.transferRoles, permissions: doctype.ownership.transferPermissions };
+  return rule.roles.length + rule.permissions.length > 0 && hasAccess(context, rule);
 }
 
 export function assertPermission(context: TenantContext, doctype: DocTypeDefinition, action: DocumentAction): void {
@@ -338,6 +389,9 @@ function assertModuleDependencies(modules: ModuleDefinition[]): void {
 
 function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
   const fields = new Map(doctype.fields.map((field) => [field.name, field]));
+  if (doctype.rowPolicy && !doctype.ownership && [...doctype.rowPolicy.read, ...doctype.rowPolicy.write].some((rule) => rule.owner === "self")) {
+    throw new Error(`DocType "${doctype.name}" uses owner policies without ownership metadata`);
+  }
   for (const field of doctype.fields) {
     if (field.type === "select") {
       if (!field.options?.length) throw new Error(`Select field "${doctype.name}.${field.name}" requires options`);

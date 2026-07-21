@@ -94,9 +94,30 @@ const queryDocType = defineDocType({
   ]
 });
 
+const securedDocType = defineDocType({
+  name: "secured_record",
+  label: "Secured Record",
+  ownership: { transferPermissions: ["records.transfer"] },
+  fields: [
+    { name: "title", label: "Title", type: "text", required: true },
+    { name: "code", label: "Code", type: "text", unique: true },
+    { name: "stage", label: "Stage", type: "select", options: ["open", "done"] }
+  ],
+  rowPolicy: {
+    read: [{ owner: "self" }, { owner: "any", roles: ["manager"] }],
+    write: [{ owner: "self" }, { owner: "any", permissions: ["records.manage"] }]
+  },
+  workflow: { field: "stage", initialState: "open", states: ["open", "done"], transitions: [{ action: "finish", from: ["open"], to: "done" }] }
+});
+
+const securedReferenceDocType = defineDocType({
+  name: "secured_reference", label: "Secured Reference",
+  fields: [{ name: "target", label: "Target", type: "link", linkTo: "secured_record" }]
+});
+
 const app = defineApp({
   name: "Postgres Integration",
-  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType] })]
+  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType, securedDocType, securedReferenceDocType] })]
 });
 
 describe.skipIf(!connectionString)("Postgres durable stores", () => {
@@ -204,7 +225,9 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
               fields: [...customerDocType.fields, { name: "segment", label: "Segment", type: "text" }]
             }),
             dealDocType,
-            approvalDocType
+            approvalDocType,
+            securedDocType,
+            securedReferenceDocType
           ]
         })
       ]
@@ -264,6 +287,83 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(stores.oidcStates.consume("oidc", "state-hash", now)).resolves.toBeUndefined();
     await stores.authAudit.record({ id: "auth-audit-1", tenantId: tenant.tenantId, action: "password_reset.completed", success: true, createdAt: now });
     await expect(stores.authAudit.list(tenant.tenantId)).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ id: "auth-audit-1", success: true })]));
+  });
+
+  it("pushes owner policies into reads and conditional mutations", async () => {
+    let id = 0;
+    const runtime = createRuntime(app, {
+      repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
+      idGenerator: () => String(++id).padStart(8, "0")
+    });
+    const alice = { ...tenant, userId: "alice", roles: [], permissions: [] };
+    const bob = { ...tenant, userId: "bob", roles: [], permissions: [] };
+    const manager = { ...tenant, userId: "manager", roles: ["manager"], permissions: ["records.transfer"] };
+    const outsider = { ...alice, tenantId: `${tenant.tenantId}_other` };
+    const aliceRecord = await runtime.create(alice, "secured_record", { title: "Alice", code: "alice-code" });
+    const bobRecord = await runtime.create(bob, "secured_record", { title: "Bob", code: "bob-code" });
+    expect(aliceRecord.ownerId).toBe("alice");
+    expect((await runtime.list(alice, "secured_record")).map((record) => record.id)).toEqual([aliceRecord.id]);
+    const captured: Array<{ sql: string; params: unknown[] }> = [];
+    const policyRepository = new PostgresDocumentRepository({ connectionString: connectionString!, onQuery: (query) => { captured.push(query); } });
+    try {
+      await policyRepository.listPage(alice, securedDocType);
+      expect(captured[0]!.sql).toContain("owner_id");
+      expect(captured[0]!.sql).not.toContain(alice.userId);
+      expect(captured[0]!.params).toContain(alice.userId);
+    } finally {
+      await (policyRepository as unknown as { db: { $client: { end(options?: { timeout?: number }): Promise<void> } } }).db.$client.end({ timeout: 1 });
+    }
+    expect(await runtime.list(manager, "secured_record")).toHaveLength(2);
+    await expect(runtime.get(alice, "secured_record", bobRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.get(outsider, "secured_record", aliceRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.update(alice, "secured_record", bobRecord.id, { title: "stolen" })).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.delete(alice, "secured_record", bobRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.transition(alice, "secured_record", bobRecord.id, "finish")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.submit(alice, "secured_record", bobRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.create(bob, "secured_reference", { target: aliceRecord.id })).rejects.toMatchObject({ code: "LINK_NOT_FOUND" });
+    await expect(runtime.create(bob, "secured_record", { title: "Hidden duplicate", code: "alice-code" })).rejects.toMatchObject({ code: "UNIQUE_CONSTRAINT_FAILED" });
+    let rollbackId = 0;
+    const rollbackRuntime = createRuntime(defineApp({ name: app.name, modules: [defineModule({
+      id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType, securedDocType, securedReferenceDocType],
+      hooks: {
+        beforeOwnerTransfer: { secured_record: [({ document }) => { if (document?.data.title === "Mutation") { document.revision = 999; document.ownerId = "mallory"; document.data.title = "mutated"; } }] },
+        afterOwnerTransfer: { secured_record: [({ document }) => {
+          if (document?.data.title === "Rollback" && document.ownerId === "bob") throw new Error("injected transfer hook failure");
+          if (document?.data.title === "Mutation") { document.revision = 999; document.ownerId = "mallory"; document.data.title = "mutated"; }
+        }] }
+      }
+    })] }), {
+      repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
+      idGenerator: () => `x${String(++rollbackId).padStart(7, "0")}`
+    });
+    const rollbackRecord = await rollbackRuntime.create(alice, "secured_record", { title: "Rollback", code: "rollback-code" });
+    await expect(rollbackRuntime.transferOwner(manager, "secured_record", rollbackRecord.id, "bob", { expectedRevision: 1 })).rejects.toThrow("injected transfer hook failure");
+    const rollbackRows = await sql<{ ownerId: string; revision: number; title: string }[]>`
+      select owner_id as "ownerId", revision, data ->> 'title' as title from framekit_documents
+      where tenant_id = ${tenant.tenantId} and id = ${rollbackRecord.id}
+    `;
+    expect(rollbackRows).toEqual([{ ownerId: "alice", revision: 1, title: "Rollback" }]);
+    await expect(rollbackRuntime.get(alice, "secured_record", rollbackRecord.id)).resolves.toMatchObject({ ownerId: "alice", revision: 1 });
+    await expect(rollbackRuntime.get(bob, "secured_record", rollbackRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    const mutationRecord = await rollbackRuntime.create(alice, "secured_record", { title: "Mutation", code: "mutation-code" });
+    const mutationTransfer = await rollbackRuntime.transferOwner(manager, "secured_record", mutationRecord.id, "bob", { expectedRevision: 1, idempotencyKey: "pg-transfer-mutation" });
+    expect(mutationTransfer).toEqual({ id: mutationRecord.id, ownerId: "bob", revision: 2, updatedAt: expect.any(String) });
+    const mutationRows = await sql<{ ownerId: string; revision: number; title: string }[]>`
+      select owner_id as "ownerId", revision, data ->> 'title' as title from framekit_documents where tenant_id = ${tenant.tenantId} and id = ${mutationRecord.id}
+    `;
+    expect(mutationRows).toEqual([{ ownerId: "bob", revision: 2, title: "Mutation" }]);
+    const transferOutbox = await sql<{ payload: Record<string, unknown> }[]>`
+      select payload from framekit_outbox_events where tenant_id = ${tenant.tenantId} and type = 'secured_record.owner.transferred' and payload ->> 'id' = ${mutationRecord.id}
+    `;
+    expect(transferOutbox[0]?.payload).toEqual({ doctype: "secured_record", ...mutationTransfer });
+    expect(transferOutbox[0]?.payload).not.toHaveProperty("data");
+    await expect(rollbackRuntime.transferOwner(manager, "secured_record", mutationRecord.id, "bob", { expectedRevision: 1, idempotencyKey: "pg-transfer-mutation" })).resolves.toEqual(mutationTransfer);
+    const transferred = await runtime.transferOwner(manager, "secured_record", aliceRecord.id, "bob", { expectedRevision: aliceRecord.revision });
+    expect(transferred).toMatchObject({ ownerId: "bob", revision: 2 });
+    const rows = await sql<{ ownerId: string }[]>`select owner_id as "ownerId" from framekit_documents where tenant_id = ${tenant.tenantId} and id = ${aliceRecord.id}`;
+    expect(rows).toEqual([{ ownerId: "bob" }]);
+    await expect(runtime.get(alice, "secured_record", aliceRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.get(bob, "secured_record", aliceRecord.id)).resolves.toMatchObject({ ownerId: "bob" });
   });
 
   it("serializes executable migrations, rolls back atomically, detects drift, and upgrades legacy uniqueness", async () => {

@@ -76,6 +76,7 @@ export const dealDocType = defineDocType({
   label: "Deal",
   description: "Revenue opportunities with a workflow.",
   naming: { prefix: "DEAL", series: true, digits: 5 },
+  ownership: { transferPermissions: ["crm.deal.transfer"] },
   fields: [
     { name: "title", label: "Title", type: "text", required: true, inList: true },
     { name: "customer", label: "Customer", type: "link", linkTo: "customer", inList: true },

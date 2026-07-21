@@ -21,6 +21,7 @@ Framekit follows the Dependency Rule: source dependencies point inward.
 - Permissions: role and permission checks evaluated before commands.
 
 Metadata invariants, business-document status, lifecycle ordering, and version guarantees are specified in [Metadata and Document Compatibility](./metadata-compatibility.md).
+Ownership, policy composition, and adapter enforcement are specified in [Ownership and Row Permissions](./row-permissions.md).
 
 ## Hostability
 

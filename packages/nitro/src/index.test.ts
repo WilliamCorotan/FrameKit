@@ -10,6 +10,7 @@ describe("createNitroHandler", () => {
     const invoice = defineDocType({
       name: "invoice",
       label: "Invoice",
+      ownership: { transferPermissions: ["invoice.transfer"] },
       fields: [{ name: "number", label: "Number", type: "text", required: true }],
       permissions: [
         { action: "create", permissions: ["invoice.write"] },
@@ -28,7 +29,7 @@ describe("createNitroHandler", () => {
     const fetch = toWebHandler(h3);
     const headers = {
       "x-user-id": "accountant",
-      "x-permissions": "invoice.write,invoice.read,invoice.submit,invoice.cancel"
+      "x-permissions": "invoice.write,invoice.read,invoice.submit,invoice.cancel,invoice.transfer"
     };
 
     const created = await json<{ id: string; revision: number; documentStatus: string }>(fetch, "/api/doctypes/invoice", {
@@ -46,6 +47,18 @@ describe("createNitroHandler", () => {
       method: "POST", headers: { ...headers, "if-match": String(submitted.revision) }
     });
     expect(cancelled).toMatchObject({ revision: submitted.revision + 1, documentStatus: "cancelled" });
+    await expect(json(fetch, `/api/doctypes/invoice/${created.id}/owner`, {
+      method: "POST", headers: { ...headers, "if-match": String(cancelled.revision) }, body: { ownerId: 123 }
+    })).rejects.toMatchObject({ code: "INVALID_OWNER" });
+    await expect(json(fetch, `/api/doctypes/invoice/${created.id}/owner`, {
+      method: "POST", headers: { ...headers, "if-match": String(cancelled.revision) }, body: { ownerId: "   " }
+    })).rejects.toMatchObject({ code: "INVALID_OWNER" });
+    const transferred = await json<{ revision: number; ownerId: string }>(fetch, `/api/doctypes/invoice/${created.id}/owner`, {
+      method: "POST", headers: { ...headers, "if-match": String(cancelled.revision) }, body: { ownerId: " reviewer " }
+    });
+    expect(transferred).toMatchObject({ revision: cancelled.revision + 1, ownerId: "reviewer" });
+    expect(transferred).not.toHaveProperty("data");
+    expect(transferred).not.toHaveProperty("documentStatus");
   });
 
   it("emits telemetry hooks and applies the optional rate limiter", async () => {

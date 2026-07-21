@@ -15,6 +15,8 @@ type JsonSchema = {
   items?: JsonSchema;
   description?: string;
   minimum?: number;
+  minLength?: number;
+  pattern?: string;
 };
 
 type Operation = {
@@ -61,6 +63,10 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         doctypes: { type: "array", items: { type: "object", additionalProperties: true } },
         warnings: { type: "array", items: { type: "string" } }
       }
+    },
+    OwnerTransferReceipt: {
+      type: "object", required: ["id", "ownerId", "revision", "updatedAt"], additionalProperties: false,
+      properties: { id: { type: "string" }, ownerId: { type: "string" }, revision: { type: "integer" }, updatedAt: { type: "string", format: "date-time" } }
     },
     AuthUser: {
       type: "object",
@@ -630,7 +636,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
     const patchName = schemaName(doctype, "Patch");
     schemas[inputName] = doctypeInputSchema(doctype, false);
     schemas[patchName] = doctypeInputSchema(doctype, true);
-    schemas[recordName] = documentRecordSchema(ref(inputName));
+    schemas[recordName] = documentRecordSchema(ref(inputName), Boolean(doctype.ownership));
 
     const collectionPath = `${basePath}/doctypes/${doctype.name}`;
     const itemPath = `${collectionPath}/{id}`;
@@ -712,6 +718,18 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
           tags: [doctype.label],
           parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
           responses: okResponse(ref(recordName))
+        }
+      };
+    }
+    if (doctype.ownership) {
+      paths[`${itemPath}/owner`] = {
+        post: {
+          operationId: `transfer${pascal(doctype.name)}Owner`,
+          summary: `Transfer ownership of a ${doctype.label} document`,
+          tags: [doctype.label],
+          parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
+          requestBody: jsonBody({ type: "object", required: ["ownerId"], properties: { ownerId: { type: "string", minLength: 1, pattern: ".*\\S.*" } } }, true),
+          responses: okResponse(ref("OwnerTransferReceipt"))
         }
       };
     }
@@ -817,16 +835,17 @@ function roleWriteSchema(creating: boolean): JsonSchema {
   };
 }
 
-function documentRecordSchema(dataSchema: JsonSchema): JsonSchema {
+function documentRecordSchema(dataSchema: JsonSchema, owned: boolean): JsonSchema {
   return {
     type: "object",
-    required: ["id", "doctype", "tenantId", "revision", "documentStatus", "data", "createdAt", "updatedAt"],
+    required: ["id", "doctype", "tenantId", "revision", "documentStatus", ...(owned ? ["ownerId"] : []), "data", "createdAt", "updatedAt"],
     properties: {
       id: { type: "string" },
       doctype: { type: "string" },
       tenantId: { type: "string" },
       revision: { type: "integer" },
       documentStatus: { type: "string", enum: ["draft", "submitted", "cancelled"] },
+      ownerId: { type: "string" },
       data: dataSchema,
       state: { type: "string" },
       createdAt: { type: "string", format: "date-time" },

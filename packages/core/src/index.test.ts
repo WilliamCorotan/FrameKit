@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineApp, defineDocType, defineModule, FramekitError, getDocType } from "./index.js";
+import { defineApp, defineDocType, defineModule, FramekitError, getDocType, hasRowAccess, rowPolicyScope } from "./index.js";
 
 describe("core metadata", () => {
   it("defines an app with modules and doctypes", () => {
@@ -93,5 +93,33 @@ describe("core metadata", () => {
     expect(() => defineApp({ name: "Bad", version: "v1" })).toThrow(/valid SemVer/);
     expect(() => defineModule({ id: "bad", name: "Bad", version: "1.0" })).toThrow(/valid SemVer/);
     expect(defineApp({ name: "RC", version: "1.2.3-rc.1+build.5" }).version).toBe("1.2.3-rc.1+build.5");
+  });
+
+  it("validates and composes ownership row policies", () => {
+    expect(() => defineDocType({
+      name: "private_note", label: "Private Note", fields: [],
+      rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] }
+    })).toThrow(/without ownership metadata/);
+    expect(() => defineDocType({
+      name: "typo_policy", label: "Typo Policy", fields: [], ownership: {},
+      rowPolicy: { read: [{ owner: "any", permisisons: ["notes.read"] }], write: [{ owner: "self" }] }
+    } as never)).toThrow(/unrecognized key/i);
+    expect(() => defineDocType({
+      name: "typo_policy", label: "Typo Policy", fields: [], ownership: { transferPermissions: [], typo: true },
+      rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] }
+    } as never)).toThrow(/unrecognized key/i);
+    const note = defineDocType({
+      name: "private_note", label: "Private Note", fields: [], ownership: { transferPermissions: ["note.transfer"] },
+      rowPolicy: {
+        read: [{ owner: "self" }, { owner: "any", roles: ["manager"] }],
+        write: [{ owner: "self" }, { owner: "any", permissions: ["note.manage"] }]
+      }
+    });
+    const alice = { tenantId: "t", userId: "alice", roles: [], permissions: [] };
+    expect(rowPolicyScope(alice, note, "read")).toBe("self");
+    expect(hasRowAccess(alice, note, "read", "alice")).toBe(true);
+    expect(hasRowAccess(alice, note, "read", "bob")).toBe(false);
+    expect(rowPolicyScope({ ...alice, roles: ["manager"] }, note, "read")).toBe("all");
+    expect(rowPolicyScope({ ...alice, permissions: ["note.manage"] }, note, "write")).toBe("all");
   });
 });

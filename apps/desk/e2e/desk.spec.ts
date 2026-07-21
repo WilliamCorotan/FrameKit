@@ -8,6 +8,7 @@ type RecordItem = {
   revision: number;
   state?: string;
   documentStatus: "draft" | "submitted" | "cancelled";
+  ownerId?: string;
   data: Record<string, unknown>;
   updatedAt: string;
 };
@@ -104,6 +105,20 @@ test("covers document list, create, edit, delete, pagination, search, and workfl
   await page.getByRole("button", { name: "Cancel" }).click();
   expect((await cancelRequest).headers()["if-match"]).toBe("4");
   await expect(page.getByText("Cancelled")).toBeVisible();
+  await page.getByLabel("Owner").fill("new-owner");
+  const ownerRequest = page.waitForRequest((request) => request.url().endsWith("/owner"));
+  await page.getByRole("button", { name: "Transfer owner" }).click();
+  expect((await ownerRequest).headers()["if-match"]).toBe("5");
+  await expect(page.getByText("Owner transferred")).toBeVisible();
+  await expect(page.getByLabel("Owner")).toHaveValue("new-owner");
+  await expect(page.getByText("Revision 6")).toBeVisible();
+  await page.getByLabel("Owner").fill("hidden-owner");
+  const hiddenOwnerRequest = page.waitForRequest((request) => request.url().endsWith("/owner"));
+  await page.getByRole("button", { name: "Transfer owner" }).click();
+  expect((await hiddenOwnerRequest).headers()["if-match"]).toBe("6");
+  await expect(page.getByText("Owner transferred; document is no longer readable")).toBeVisible();
+  await expect(page.getByText("New document")).toBeVisible();
+  await expect(page.getByText("Acme Browser Co")).toBeHidden();
 
   await page.getByLabel("Filter records").fill("");
   for (let index = 0; index < 5; index += 1) {
@@ -224,6 +239,7 @@ async function mockDeskApi(page: Page) {
       revision: 1,
       state: "Lead",
       documentStatus: "draft",
+      ownerId: "admin",
       data: {
         name: "Northwind Traders",
         status: "active",
@@ -284,13 +300,19 @@ async function mockDeskApi(page: Page) {
         revision: 1,
         state: "Lead",
         documentStatus: "draft" as const,
+        ownerId: "admin",
         data: body,
         updatedAt: now
       };
       customers.unshift(record);
       return json(route, record);
     }
-    const customerMatch = path.match(/^\/api\/doctypes\/customer\/([^/]+)(?:\/(transition|submit|cancel))?$/);
+    const customerMatch = path.match(/^\/api\/doctypes\/customer\/([^/]+)(?:\/(transition|submit|cancel|owner))?$/);
+    if (customerMatch && !customerMatch[2] && method === "GET") {
+      const record = customers.find((item) => item.id === customerMatch[1]);
+      if (!record || record.ownerId === "hidden-owner") return jsonError(route, 404, "DOCUMENT_NOT_FOUND", "Document is no longer readable");
+      return json(route, record);
+    }
     if (customerMatch && method === "PATCH" && body) {
       const record = customers.find((item) => item.id === customerMatch[1]);
       Object.assign(record!.data, body);
@@ -312,6 +334,12 @@ async function mockDeskApi(page: Page) {
       record!.documentStatus = customerMatch[2] === "submit" ? "submitted" : "cancelled";
       record!.revision += 1;
       return json(route, record);
+    }
+    if (customerMatch?.[2] === "owner" && method === "POST" && body) {
+      const record = customers.find((item) => item.id === customerMatch[1]);
+      record!.ownerId = String(body.ownerId);
+      record!.revision += 1;
+      return json(route, { id: record!.id, ownerId: record!.ownerId, revision: record!.revision, updatedAt: record!.updatedAt });
     }
 
     if (path === "/api/auth/users" && method === "GET") {
@@ -403,6 +431,10 @@ function empty(route: Route) {
   return route.fulfill({ status: 204 });
 }
 
+function jsonError(route: Route, status: number, code: string, message: string) {
+  return route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: true, code, message }) });
+}
+
 const metadata = {
   name: "Framekit CRM",
   version: "0.1.0",
@@ -415,6 +447,7 @@ const metadata = {
           name: "customer",
           label: "Customer",
           description: "Customer profile",
+          ownership: { transferRoles: [], transferPermissions: ["customer.transfer"] },
           fields: [
             { name: "name", label: "Name", type: "text", required: true, inList: true },
             { name: "status", label: "Status", type: "select", options: ["lead", "active", "closed"], inList: true },
