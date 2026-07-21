@@ -1,4 +1,4 @@
-import { defineEventHandler, getCookie, getQuery, getRouterParam, readBody, setCookie, setResponseStatus, type EventHandler, type H3Event } from "h3";
+import { defineEventHandler, getCookie, getQuery, getRouterParam, readBody, sendRedirect, setCookie, setResponseStatus, type EventHandler, type H3Event } from "h3";
 import { assertSecureAuthSecret, bearerToken, type PasswordAuthService } from "@framekit/auth";
 import { FramekitError, type TenantContext } from "@framekit/core";
 import { createOpenApiDocument } from "@framekit/openapi";
@@ -194,6 +194,50 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         setSessionCookie(event, session.token, session.expiresAt, authCookie);
         return session;
       }
+      const providerAuthorization = matchProviderAuthorizationPath(path, basePath);
+      if (method === "GET" && providerAuthorization?.action === "authorize") {
+        const auth = requireAuth(options.auth);
+        const query = getQuery(event);
+        const started = await auth.beginProviderAuthorization(providerAuthorization.providerId, {
+          tenantId: event.req.headers.get("x-tenant-id") ?? "default",
+          returnTo: typeof query.returnTo === "string" ? query.returnTo : "/"
+        });
+        return sendRedirect(event, started.authorizationUrl, 302);
+      }
+      if (method === "GET" && providerAuthorization?.action === "callback") {
+        const auth = requireAuth(options.auth);
+        const query = getQuery(event);
+        if (typeof query.code !== "string" || typeof query.state !== "string") {
+          throw new FramekitError("VALIDATION_FAILED", "code and state are required.", 422);
+        }
+        const completed = await auth.completeProviderAuthorization(providerAuthorization.providerId, { code: query.code, state: query.state });
+        setSessionCookie(event, completed.session.token, completed.session.expiresAt, authCookie);
+        return sendRedirect(event, completed.returnTo, 303);
+      }
+      if (method === "POST" && path === basePath + "/auth/invitations/accept") {
+        const auth = requireAuth(options.auth);
+        const body = ((await readBody(event)) ?? {}) as { token?: string; password?: string };
+        if (!body.token || !body.password) throw new FramekitError("VALIDATION_FAILED", "token and password are required.", 422);
+        const session = await auth.acceptInvitation({ tenantId: event.req.headers.get("x-tenant-id") ?? "default", token: body.token, password: body.password });
+        setSessionCookie(event, session.token, session.expiresAt, authCookie);
+        return session;
+      }
+      if (method === "POST" && path === basePath + "/auth/password/reset/request") {
+        const auth = requireAuth(options.auth);
+        const body = ((await readBody(event)) ?? {}) as { email?: string };
+        if (!body.email) throw new FramekitError("VALIDATION_FAILED", "email is required.", 422);
+        await auth.requestPasswordReset(event.req.headers.get("x-tenant-id") ?? "default", body.email);
+        setResponseStatus(event, 202);
+        return { accepted: true };
+      }
+      if (method === "POST" && path === basePath + "/auth/password/reset/complete") {
+        const auth = requireAuth(options.auth);
+        const body = ((await readBody(event)) ?? {}) as { token?: string; newPassword?: string };
+        if (!body.token || !body.newPassword) throw new FramekitError("VALIDATION_FAILED", "token and newPassword are required.", 422);
+        await auth.completePasswordRecovery({ tenantId: event.req.headers.get("x-tenant-id") ?? "default", token: body.token, newPassword: body.newPassword });
+        setResponseStatus(event, 204);
+        return null;
+      }
       if (method === "GET" && path === basePath + "/auth/me") {
         if (!options.auth) {
           throw new FramekitError("AUTH_NOT_CONFIGURED", "Auth is not configured for this app.", 501);
@@ -266,6 +310,32 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
         assertAuthManager(tenant);
         return await auth.authAuditEvents(tenant.tenantId);
+      }
+      if (method === "POST" && path === basePath + "/auth/invitations") {
+        const auth = requireAuth(options.auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
+        assertAuthManager(tenant);
+        const body = ((await readBody(event)) ?? {}) as { email?: string; name?: string; roles?: string[]; permissions?: string[]; expiresAt?: string };
+        if (!body.email || !body.name || !Array.isArray(body.roles) || !Array.isArray(body.permissions)) throw new FramekitError("VALIDATION_FAILED", "email, name, roles, and permissions are required.", 422);
+        setResponseStatus(event, 201);
+        return await auth.createInvitation({ tenantId: tenant.tenantId, email: body.email, name: body.name, roles: body.roles, permissions: body.permissions, expiresAt: body.expiresAt });
+      }
+      if (method === "POST" && path === basePath + "/auth/identity-links") {
+        const auth = requireAuth(options.auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
+        assertAuthManager(tenant);
+        const body = ((await readBody(event)) ?? {}) as { providerId?: string; subject?: string; userId?: string; email?: string };
+        if (!body.providerId || !body.subject || !body.userId) throw new FramekitError("VALIDATION_FAILED", "providerId, subject, and userId are required.", 422);
+        setResponseStatus(event, 201);
+        return await auth.linkProviderIdentity({ tenantId: tenant.tenantId, providerId: body.providerId, subject: body.subject, userId: body.userId, email: body.email });
+      }
+      const recoveryPath = matchUserRecoveryPath(path, basePath);
+      if (method === "POST" && recoveryPath) {
+        const auth = requireAuth(options.auth);
+        const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
+        assertAuthManager(tenant);
+        setResponseStatus(event, 201);
+        return await auth.createRecoveryToken(tenant.tenantId, recoveryPath.userId);
       }
       const authAction = matchAuthManagementPath(path, basePath);
       if (authAction) {
@@ -602,6 +672,13 @@ function matchProviderLoginPath(path: string, basePath: string): { providerId: s
   return providerId && operation === "login" ? { providerId } : undefined;
 }
 
+function matchProviderAuthorizationPath(path: string, basePath: string): { providerId: string; action: "authorize" | "callback" } | undefined {
+  const prefix = `${basePath}/auth/providers/`;
+  if (!path.startsWith(prefix)) return undefined;
+  const [providerId, action] = path.slice(prefix.length).split("/").filter(Boolean);
+  return providerId && (action === "authorize" || action === "callback") ? { providerId, action } : undefined;
+}
+
 function matchUserPasswordPath(path: string, basePath: string): { userId: string } | undefined {
   const prefix = `${basePath}/auth/users/`;
   if (!path.startsWith(prefix)) {
@@ -609,6 +686,13 @@ function matchUserPasswordPath(path: string, basePath: string): { userId: string
   }
   const [userId, operation] = path.slice(prefix.length).split("/").filter(Boolean);
   return userId && operation === "password" ? { userId } : undefined;
+}
+
+function matchUserRecoveryPath(path: string, basePath: string): { userId: string } | undefined {
+  const prefix = `${basePath}/auth/users/`;
+  if (!path.startsWith(prefix)) return undefined;
+  const [userId, operation] = path.slice(prefix.length).split("/").filter(Boolean);
+  return userId && operation === "recovery" ? { userId } : undefined;
 }
 
 function isOutboxStatus(value: unknown): value is "pending" | "dispatched" | "failed" {
@@ -818,6 +902,7 @@ function isCookieIssuingAuthRoute(method: string, path: string, basePath: string
   }
   return path === `${basePath}/auth/login`
     || path === `${basePath}/auth/refresh`
+    || path === `${basePath}/auth/invitations/accept`
     || Boolean(matchProviderLoginPath(path, basePath));
 }
 

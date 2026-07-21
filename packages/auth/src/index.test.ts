@@ -1,10 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import {
+  createOidcAuthorizationCodeProvider,
   createOidcProvider,
   hashPassword,
   InMemoryApiTokenStore,
   InMemoryAuthAuditStore,
   InMemoryAuthIdentityLinkStore,
+  InMemoryAuthLifecycleTokenStore,
+  InMemoryOidcAuthorizationStateStore,
   InMemoryRoleStore,
   InMemoryUserStore,
   PasswordAuthService
@@ -203,6 +207,7 @@ describe("PasswordAuthService", () => {
       secret: "test-secret-with-enough-length",
       userStore: store,
       audit,
+      identityLinkingPolicy: { mode: "email", autoLink: true },
       providers: [
         {
           id: "test",
@@ -289,6 +294,163 @@ describe("PasswordAuthService", () => {
     expect(link).toMatchObject({ userId: "u1", email: "admin@example.com" });
   });
 
+  it("enforces tenant-safe identity collisions and audits the failed link", async () => {
+    const audit = new InMemoryAuthAuditStore();
+    const users = new InMemoryUserStore([
+      { id: "u1", tenantId: "t1", email: "one@example.com", name: "One", passwordHash: await hashPassword("password one"), roles: [], permissions: [] },
+      { id: "u2", tenantId: "t1", email: "two@example.com", name: "Two", passwordHash: await hashPassword("password two"), roles: [], permissions: [] }
+    ]);
+    const auth = new PasswordAuthService({ secret: "test-secret-with-enough-length", userStore: users, audit, identityLinks: new InMemoryAuthIdentityLinkStore([]) });
+    await auth.linkProviderIdentity({ tenantId: "t1", providerId: "oidc", subject: "subject", userId: "u1" });
+    await expect(auth.linkProviderIdentity({ tenantId: "t1", providerId: "oidc", subject: "subject", userId: "u2" }))
+      .rejects.toMatchObject({ code: "PROVIDER_IDENTITY_COLLISION" });
+    expect(await auth.authAuditEvents("t1")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "provider_identity.link_failed", success: false, details: expect.objectContaining({ reason: "subject_collision" }) })
+    ]));
+  });
+
+  it("binds provider resolution to the selected route before cross-provider link lookup", async () => {
+    const audit = new InMemoryAuthAuditStore();
+    const links = new InMemoryAuthIdentityLinkStore([]);
+    const users = new InMemoryUserStore([
+      { id: "u1", tenantId: "t1", email: "one@example.com", name: "One", passwordHash: await hashPassword("password one"), roles: [], permissions: [] },
+      { id: "u2", tenantId: "t1", email: "two@example.com", name: "Two", passwordHash: await hashPassword("password two"), roles: [], permissions: [] }
+    ]);
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length", userStore: users, identityLinks: links, identityLinkingPolicy: { mode: "linked" }, audit,
+      providers: [
+        { id: "provider-a", authenticate: async ({ tenantId }) => ({ providerId: "provider-b", subject: "shared-subject", tenantId, email: "two@example.com" }) },
+        { id: "provider-b", authenticate: async ({ tenantId }) => ({ providerId: "provider-b", subject: "shared-subject", tenantId, email: "two@example.com" }) }
+      ]
+    });
+    await auth.linkProviderIdentity({ tenantId: "t1", providerId: "provider-a", subject: "shared-subject", userId: "u1" });
+    await auth.linkProviderIdentity({ tenantId: "t1", providerId: "provider-b", subject: "shared-subject", userId: "u2" });
+
+    await expect(auth.loginWithProvider("provider-a", "token", "t1")).rejects.toMatchObject({ code: "PROVIDER_ID_MISMATCH" });
+    await expect(auth.loginWithProvider("provider-b", "token", "t1")).resolves.toMatchObject({ context: { userId: "u2" } });
+    expect(await auth.authAuditEvents("t1")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "provider_login.failed", success: false, details: expect.objectContaining({ providerId: "provider-a", returnedProviderId: "provider-b", reason: "provider_mismatch" }) })
+    ]));
+  });
+
+  it("issues expiring single-use invitations and password recovery tokens", async () => {
+    const audit = new InMemoryAuthAuditStore();
+    const users = new InMemoryUserStore([]);
+    const delivered: string[] = [];
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length", userStore: users, audit, lifecycleTokens: new InMemoryAuthLifecycleTokenStore([]),
+      lifecycleDelivery: ({ token }) => { delivered.push(token); }
+    });
+    const invitation = await auth.createInvitation({ tenantId: "t1", email: "invitee@example.com", name: "Invitee", roles: ["member"], permissions: ["notes.read"] });
+    await expect(auth.acceptInvitation({ tenantId: "t1", token: invitation.token, password: "invited password" })).resolves.toMatchObject({ context: { tenantId: "t1" } });
+    await expect(auth.acceptInvitation({ tenantId: "t1", token: invitation.token, password: "replay password" })).rejects.toMatchObject({ code: "INVALID_LIFECYCLE_TOKEN" });
+
+    const reset = await auth.requestPasswordReset("t1", "invitee@example.com");
+    expect(reset.token).toBeTruthy();
+    expect(delivered).toEqual([reset.token]);
+    await auth.completePasswordRecovery({ tenantId: "t1", token: reset.token!, newPassword: "recovered password" });
+    await expect(auth.completePasswordRecovery({ tenantId: "t1", token: reset.token!, newPassword: "replayed password" })).rejects.toMatchObject({ code: "INVALID_LIFECYCLE_TOKEN" });
+    await expect(auth.login("invitee@example.com", "recovered password", "t1")).resolves.toMatchObject({ context: { tenantId: "t1" } });
+    expect((await auth.authAuditEvents("t1")).map((event) => event.action)).toEqual(expect.arrayContaining([
+      "invitation.created", "invitation.accepted", "invitation.failed", "password_reset.requested", "password_reset.completed", "password_reset.failed"
+    ]));
+
+    const expiring = new PasswordAuthService({ secret: "test-secret-with-enough-length", userStore: new InMemoryUserStore([]),
+      lifecycleTokens: new InMemoryAuthLifecycleTokenStore([]), invitationTtlSeconds: -1 });
+    const expired = await expiring.createInvitation({ tenantId: "t1", email: "expired@example.com", name: "Expired", roles: [], permissions: [] });
+    await expect(expiring.acceptInvitation({ tenantId: "t1", token: expired.token, password: "password" })).rejects.toMatchObject({ code: "INVALID_LIFECYCLE_TOKEN" });
+
+    const disabled = new PasswordAuthService({ secret: "test-secret-with-enough-length", userStore: new InMemoryUserStore([{
+      id: "disabled", tenantId: "t1", email: "disabled@example.com", name: "Disabled", passwordHash: await hashPassword("password"),
+      roles: [], permissions: [], disabledAt: new Date().toISOString()
+    }]), lifecycleTokens: new InMemoryAuthLifecycleTokenStore([]) });
+    await expect(disabled.requestPasswordReset("t1", "disabled@example.com")).resolves.toEqual({});
+    await expect(disabled.createRecoveryToken("t1", "disabled")).rejects.toMatchObject({ code: "USER_DISABLED" });
+  });
+
+  it("runs signed OIDC authorization code with discovery, PKCE, nonce, state, and replay protection", async () => {
+    const issuer = "https://issuer.example";
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwk = { ...(await exportJWK(publicKey)), kid: "test-key", use: "sig", alg: "RS256" };
+    let nonce = "";
+    let expectedChallenge = "";
+    let forgeSignature = false;
+    let audience: string | string[] = "framekit";
+    let authorizedParty: string | undefined;
+    let mappedProviderId = "oidc";
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/openid-configuration")) return Response.json({
+        issuer, authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`, jwks_uri: `${issuer}/jwks`,
+        code_challenge_methods_supported: ["S256"], id_token_signing_alg_values_supported: ["RS256"]
+      });
+      if (url.endsWith("/jwks")) return Response.json({ keys: [jwk] });
+      if (url.endsWith("/token")) {
+        const body = new URLSearchParams(String(init?.body));
+        const challenge = base64Url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body.get("code_verifier")!)));
+        expect(challenge).toBe(expectedChallenge);
+        const idToken = forgeSignature ? "forged.jwt.signature" : await new SignJWT({ email: "admin@example.com", nonce, ...(authorizedParty ? { azp: authorizedParty } : {}) }).setProtectedHeader({ alg: "RS256", kid: "test-key" })
+          .setIssuer(issuer).setAudience(audience).setSubject("external-admin").setIssuedAt().setExpirationTime("5m").sign(privateKey);
+        return Response.json({ id_token: idToken, token_type: "Bearer" });
+      }
+      throw new Error(`Unexpected OIDC request ${url}`);
+    };
+    const links = new InMemoryAuthIdentityLinkStore([]);
+    const provider = createOidcAuthorizationCodeProvider({
+      id: "oidc", issuer, clientId: "framekit", redirectUri: "https://app.example/api/auth/providers/oidc/callback",
+      flowSecret: "oidc-flow-secret-at-least-thirty-two-characters", stateStore: new InMemoryOidcAuthorizationStateStore(), fetch: fetcher,
+      mapIdentity: (claims, { tenantId }) => ({ providerId: mappedProviderId, subject: String(claims.sub), tenantId, email: String(claims.email) })
+    });
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length", identityLinks: links, identityLinkingPolicy: { mode: "linked" }, providers: [provider],
+      userStore: new InMemoryUserStore([{ id: "u1", tenantId: "t1", email: "admin@example.com", name: "Admin", passwordHash: await hashPassword("password"), roles: [], permissions: [] }])
+    });
+    await auth.linkProviderIdentity({ tenantId: "t1", providerId: "oidc", subject: "external-admin", userId: "u1" });
+    const started = await auth.beginProviderAuthorization("oidc", { tenantId: "t1", returnTo: "/desk" });
+    const authorization = new URL(started.authorizationUrl);
+    nonce = authorization.searchParams.get("nonce")!;
+    expectedChallenge = authorization.searchParams.get("code_challenge")!;
+    expect(authorization.searchParams.get("code_challenge_method")).toBe("S256");
+    const state = authorization.searchParams.get("state")!;
+    await expect(auth.completeProviderAuthorization("oidc", { code: "authorization-code", state })).resolves.toMatchObject({ session: { context: { userId: "u1", tenantId: "t1" } }, returnTo: "/desk" });
+    await expect(auth.completeProviderAuthorization("oidc", { code: "replay", state })).rejects.toMatchObject({ code: "OIDC_STATE_INVALID" });
+
+    const completeAudienceCase = async (nextAudience: string | string[], azp: string | undefined, code: string) => {
+      audience = nextAudience;
+      authorizedParty = azp;
+      const startedCase = await auth.beginProviderAuthorization("oidc", { tenantId: "t1" });
+      const url = new URL(startedCase.authorizationUrl);
+      nonce = url.searchParams.get("nonce")!;
+      expectedChallenge = url.searchParams.get("code_challenge")!;
+      return auth.completeProviderAuthorization("oidc", { code, state: url.searchParams.get("state")! });
+    };
+    await expect(completeAudienceCase("framekit", undefined, "single-no-azp")).resolves.toMatchObject({ session: { context: { userId: "u1" } } });
+    await expect(completeAudienceCase("framekit", "framekit", "single-matching-azp")).resolves.toMatchObject({ session: { context: { userId: "u1" } } });
+    await expect(completeAudienceCase("framekit", "different-client", "single-wrong-azp")).rejects.toMatchObject({ code: "OIDC_AUTHORIZED_PARTY_MISMATCH" });
+    await expect(completeAudienceCase(["framekit", "another-api"], undefined, "multi-no-azp")).rejects.toMatchObject({ code: "OIDC_AUTHORIZED_PARTY_MISMATCH" });
+    await expect(completeAudienceCase(["framekit", "another-api"], "different-client", "multi-wrong-azp")).rejects.toMatchObject({ code: "OIDC_AUTHORIZED_PARTY_MISMATCH" });
+    await expect(completeAudienceCase(["framekit", "another-api"], "framekit", "multi-matching-azp")).resolves.toMatchObject({ session: { context: { userId: "u1" } } });
+
+    mappedProviderId = "different-provider";
+    await expect(completeAudienceCase("framekit", undefined, "mapped-provider-attack")).rejects.toMatchObject({ code: "PROVIDER_ID_MISMATCH" });
+    mappedProviderId = "oidc";
+
+    const nonceAttack = await auth.beginProviderAuthorization("oidc", { tenantId: "t1" });
+    const nonceAttackUrl = new URL(nonceAttack.authorizationUrl);
+    expectedChallenge = nonceAttackUrl.searchParams.get("code_challenge")!;
+    nonce = "attacker-controlled-nonce";
+    await expect(auth.completeProviderAuthorization("oidc", { code: "nonce-attack", state: nonceAttackUrl.searchParams.get("state")! }))
+      .rejects.toMatchObject({ code: "OIDC_NONCE_MISMATCH" });
+
+    const signatureAttack = await auth.beginProviderAuthorization("oidc", { tenantId: "t1" });
+    const signatureAttackUrl = new URL(signatureAttack.authorizationUrl);
+    nonce = signatureAttackUrl.searchParams.get("nonce")!;
+    expectedChallenge = signatureAttackUrl.searchParams.get("code_challenge")!;
+    forgeSignature = true;
+    await expect(auth.completeProviderAuthorization("oidc", { code: "signature-attack", state: signatureAttackUrl.searchParams.get("state")! }))
+      .rejects.toMatchObject({ code: "OIDC_ID_TOKEN_INVALID" });
+  });
+
   it("authenticates OIDC identities through token introspection", async () => {
     const requests: Array<{ url: string; body: string }> = [];
     const provider = createOidcProvider({
@@ -322,6 +484,7 @@ describe("PasswordAuthService", () => {
     const auth = new PasswordAuthService({
       secret: "test-secret-with-enough-length",
       userStore: store,
+      identityLinkingPolicy: { mode: "email", autoLink: true },
       providers: [provider]
     });
 
@@ -421,3 +584,7 @@ describe("PasswordAuthService", () => {
     ).rejects.toMatchObject({ code: "VALIDATION_FAILED" });
   });
 });
+
+function base64Url(buffer: ArrayBuffer): string {
+  return Buffer.from(buffer).toString("base64url");
+}

@@ -22,7 +22,8 @@
     "prepack": "pnpm build"
   },
   "dependencies": {
-    "@framekit/core": "workspace:*"
+    "@framekit/core": "workspace:*",
+    "jose": "^6.2.3"
   },
   "description": "Framekit authentication stores and services.",
   "files": [

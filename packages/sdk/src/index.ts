@@ -48,6 +48,8 @@ export type AuthAuditEvent = {
   details?: Record<string, unknown>;
 };
 
+export type IssuedLifecycleToken = { token: string; expiresAt: string };
+
 export type FramekitClientOptions = {
   baseUrl: string;
   tenant?: Partial<TenantContext>;
@@ -140,6 +142,13 @@ export const FRAMEKIT_HTTP_ENDPOINTS = [
   ["upsertView", "POST", "/api/views"],
   ["login", "POST", "/api/auth/login"],
   ["loginWithProvider", "POST", "/api/auth/providers/:providerId/login"],
+  ["providerAuthorizationUrl", "GET", "/api/auth/providers/:providerId/authorize"],
+  ["createInvitation", "POST", "/api/auth/invitations"],
+  ["linkProviderIdentity", "POST", "/api/auth/identity-links"],
+  ["acceptInvitation", "POST", "/api/auth/invitations/accept"],
+  ["requestPasswordReset", "POST", "/api/auth/password/reset/request"],
+  ["completePasswordReset", "POST", "/api/auth/password/reset/complete"],
+  ["createRecoveryToken", "POST", "/api/auth/users/:userId/recovery"],
   ["me", "GET", "/api/auth/me"],
   ["refresh", "POST", "/api/auth/refresh"],
   ["logout", "POST", "/api/auth/logout"],
@@ -299,6 +308,35 @@ export class FramekitClient {
       this.token = session.token;
     }
     return session;
+  }
+
+  providerAuthorizationUrl(providerId: string, returnTo = "/"): string {
+    const query = new URLSearchParams({ returnTo });
+    return `${this.baseUrl}/api/auth/providers/${encodeURIComponent(providerId)}/authorize?${query}`;
+  }
+
+  createInvitation(input: { email: string; name: string; roles: string[]; permissions: string[]; expiresAt?: string }): Promise<IssuedLifecycleToken> {
+    return this.request("/api/auth/invitations", { method: "POST", body: input });
+  }
+
+  linkProviderIdentity(input: { providerId: string; subject: string; userId: string; email?: string }): Promise<unknown> {
+    return this.request("/api/auth/identity-links", { method: "POST", body: input });
+  }
+
+  acceptInvitation(token: string, password: string): Promise<{ token: string }> {
+    return this.request("/api/auth/invitations/accept", { method: "POST", body: { token, password }, skipAuth: true });
+  }
+
+  requestPasswordReset(email: string): Promise<{ accepted: true }> {
+    return this.request("/api/auth/password/reset/request", { method: "POST", body: { email }, skipAuth: true });
+  }
+
+  completePasswordReset(token: string, newPassword: string): Promise<void> {
+    return this.request("/api/auth/password/reset/complete", { method: "POST", body: { token, newPassword }, skipAuth: true });
+  }
+
+  createRecoveryToken(userId: string): Promise<IssuedLifecycleToken> {
+    return this.request(`/api/auth/users/${userId}/recovery`, { method: "POST" });
   }
 
   me<T = unknown>(): Promise<T> {

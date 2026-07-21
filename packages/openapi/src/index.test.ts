@@ -37,6 +37,14 @@ describe("createOpenApiDocument", () => {
     expect(doc.paths["/api/auth/refresh"]).toBeDefined();
     expect(doc.paths["/api/auth/logout"]).toBeDefined();
     expect(doc.paths["/api/auth/providers/{id}/login"]).toBeDefined();
+    expect(doc.paths["/api/auth/providers/{id}/authorize"]).toBeDefined();
+    expect(doc.paths["/api/auth/providers/{id}/callback"]).toBeDefined();
+    expect(doc.paths["/api/auth/invitations"]).toBeDefined();
+    expect(doc.paths["/api/auth/identity-links"]).toBeDefined();
+    expect(doc.paths["/api/auth/invitations/accept"]).toBeDefined();
+    expect(doc.paths["/api/auth/password/reset/request"]).toBeDefined();
+    expect(doc.paths["/api/auth/password/reset/complete"]).toBeDefined();
+    expect(doc.paths["/api/auth/users/{id}/recovery"]).toBeDefined();
     expect(doc.paths["/api/auth/audit"]).toBeDefined();
     expect(doc.paths["/api/auth/password/change"]).toBeDefined();
     expect(doc.paths["/api/auth/users"]).toBeDefined();

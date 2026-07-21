@@ -54,6 +54,23 @@ describe("generateSdkTypes", () => {
     ]);
   });
 
+  it("covers identity linking, invitations, and recovery endpoint parity", async () => {
+    vi.mocked(ofetch).mockResolvedValue({} as never);
+    const client = createClient({ baseUrl: "https://app.example", token: "session" });
+    expect(client.providerAuthorizationUrl("work oidc", "/desk?view=mine")).toBe("https://app.example/api/auth/providers/work%20oidc/authorize?returnTo=%2Fdesk%3Fview%3Dmine");
+    await client.linkProviderIdentity({ providerId: "oidc", subject: "subject", userId: "user-1" });
+    await client.createInvitation({ email: "invitee@example.com", name: "Invitee", roles: [], permissions: [] });
+    await client.acceptInvitation("invitation-token", "password");
+    await client.requestPasswordReset("invitee@example.com");
+    await client.completePasswordReset("reset-token", "new password");
+    await client.createRecoveryToken("user-1");
+    expect(vi.mocked(ofetch).mock.calls.map(([url, options]) => [url, options?.method])).toEqual([
+      ["https://app.example/api/auth/identity-links", "POST"], ["https://app.example/api/auth/invitations", "POST"],
+      ["https://app.example/api/auth/invitations/accept", "POST"], ["https://app.example/api/auth/password/reset/request", "POST"],
+      ["https://app.example/api/auth/password/reset/complete", "POST"], ["https://app.example/api/auth/users/user-1/recovery", "POST"]
+    ]);
+  });
+
   it("keeps SDK migration plans structurally and behaviorally compatible with the runtime contract", async () => {
     const current = defineApp({ name: "SDK migration parity", modules: [] });
     const next = defineApp({ name: current.name, modules: [defineModule({

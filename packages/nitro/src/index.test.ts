@@ -67,6 +67,36 @@ describe("createNitroHandler", () => {
     });
   });
 
+  it("executes browser-facing provider redirects and establishes the callback session cookie", async () => {
+    const runtime = createRuntime(defineApp({ name: "OIDC browser", modules: [] }));
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      identityLinkingPolicy: { mode: "email", autoLink: true },
+      userStore: new InMemoryUserStore([{ tenantId: "default", id: "admin", email: "admin@example.com", name: "Admin",
+        passwordHash: await hashPassword("password"), roles: [], permissions: [] }]),
+      providers: [{
+        id: "oidc",
+        authenticate: async () => { throw new Error("code flow only"); },
+        beginAuthorization: async () => ({ authorizationUrl: "https://issuer.example/authorize?state=browser-state" }),
+        completeAuthorization: async ({ code, state }) => {
+          expect({ code, state }).toEqual({ code: "browser-code", state: "browser-state" });
+          return { identity: { providerId: "oidc", subject: "admin", tenantId: "default", email: "admin@example.com" }, returnTo: "/desk" };
+        }
+      }]
+    });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { auth, authCookie: { name: "fk_session", secure: false } }));
+    const fetch = toWebHandler(h3);
+
+    const authorize = await fetch(new Request("http://localhost/api/auth/providers/oidc/authorize?returnTo=%2Fdesk", { headers: { "x-tenant-id": "default" } }));
+    expect(authorize.status).toBe(302);
+    expect(authorize.headers.get("location")).toBe("https://issuer.example/authorize?state=browser-state");
+    const callback = await fetch(new Request("http://localhost/api/auth/providers/oidc/callback?code=browser-code&state=browser-state"));
+    expect(callback.status).toBe(303);
+    expect(callback.headers.get("location")).toBe("/desk");
+    expect(callback.headers.get("set-cookie")).toContain("fk_session=");
+  });
+
   it("supports cookie-backed signed sessions while preserving bearer auth", async () => {
     const runtime = createRuntime(defineApp({ name: "Cookie Auth", modules: [] }));
     const auth = new PasswordAuthService({
@@ -178,6 +208,7 @@ describe("createNitroHandler", () => {
         roles: ["administrator"],
         permissions: ["*"]
       }]),
+      identityLinkingPolicy: { mode: "email", autoLink: true },
       providers: [{
         id: "test",
         authenticate: async ({ tenantId }) => ({
@@ -611,6 +642,7 @@ describe("createNitroHandler", () => {
       roleStore: new InMemoryRoleStore([{ tenantId: "default", id: "administrator", name: "Administrator", permissions: ["*"] }]),
       apiTokenStore: new InMemoryApiTokenStore([]),
       audit: authAudit,
+      identityLinkingPolicy: { mode: "email", autoLink: true },
       providers: [
         {
           id: "test",

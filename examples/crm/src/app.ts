@@ -1,8 +1,11 @@
-import { InMemoryApiTokenStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
+import { createOidcAuthorizationCodeProvider, InMemoryApiTokenStore, InMemoryOidcAuthorizationStateStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService, type OidcAuthorizationStateStore } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
 import { createRuntime } from "@framekit/runtime";
 import {
   PostgresApiTokenStore,
+  PostgresAuthAuditStore,
+  PostgresAuthIdentityLinkStore,
+  PostgresAuthLifecycleTokenStore,
   PostgresAuditStore,
   PostgresCustomizationStore,
   PostgresDocumentRepository,
@@ -11,6 +14,7 @@ import {
   PostgresNamingSeriesStore,
   PostgresOutboxStore,
   PostgresRealtimePublisher,
+  PostgresOidcAuthorizationStateStore,
   PostgresRoleStore,
   PostgresSessionRevocationStore,
   PostgresUserStore
@@ -138,6 +142,10 @@ const userStore = await createUserStore();
 const roleStore = await createRoleStore();
 const apiTokenStore = await createApiTokenStore();
 const sessionRevocations = await createSessionRevocationStore();
+const identityLinks = await createAuthIdentityLinkStore();
+const lifecycleTokens = await createAuthLifecycleTokenStore();
+const authAudit = await createAuthAuditStore();
+const oidcStateStore = await createOidcStateStore();
 export const eventBus = await createRealtimePublisher();
 export const runtime = createRuntime(app, {
   ...(repository ? { repository } : {}),
@@ -161,7 +169,12 @@ export const auth = new PasswordAuthService({
   userStore,
   roleStore,
   apiTokenStore,
-  sessionRevocations
+  sessionRevocations,
+  ...(identityLinks ? { identityLinks } : {}),
+  ...(lifecycleTokens ? { lifecycleTokens } : {}),
+  ...(authAudit ? { audit: authAudit } : {}),
+  providers: createOidcProviders(oidcStateStore),
+  identityLinkingPolicy: { mode: "linked" }
 });
 
 const admin: TenantContext = {
@@ -328,4 +341,44 @@ async function createSessionRevocationStore() {
   });
   await store.migrate();
   return store;
+}
+
+async function createAuthIdentityLinkStore() {
+  if (!process.env.DATABASE_URL) return undefined;
+  const store = new PostgresAuthIdentityLinkStore({ connectionString: process.env.DATABASE_URL });
+  await store.migrate();
+  return store;
+}
+
+async function createAuthLifecycleTokenStore() {
+  if (!process.env.DATABASE_URL) return undefined;
+  const store = new PostgresAuthLifecycleTokenStore({ connectionString: process.env.DATABASE_URL });
+  await store.migrate();
+  return store;
+}
+
+async function createAuthAuditStore() {
+  if (!process.env.DATABASE_URL) return undefined;
+  const store = new PostgresAuthAuditStore({ connectionString: process.env.DATABASE_URL });
+  await store.migrate();
+  return store;
+}
+
+async function createOidcStateStore(): Promise<OidcAuthorizationStateStore> {
+  if (!process.env.DATABASE_URL) return new InMemoryOidcAuthorizationStateStore();
+  const store = new PostgresOidcAuthorizationStateStore({ connectionString: process.env.DATABASE_URL });
+  await store.migrate();
+  return store;
+}
+
+function createOidcProviders(stateStore: OidcAuthorizationStateStore) {
+  const issuer = process.env.FRAMEKIT_OIDC_ISSUER;
+  const clientId = process.env.FRAMEKIT_OIDC_CLIENT_ID;
+  const redirectUri = process.env.FRAMEKIT_OIDC_REDIRECT_URI;
+  if (!issuer && !clientId && !redirectUri) return [];
+  if (!issuer || !clientId || !redirectUri) throw new Error("FRAMEKIT_OIDC_ISSUER, FRAMEKIT_OIDC_CLIENT_ID, and FRAMEKIT_OIDC_REDIRECT_URI must be configured together.");
+  return [createOidcAuthorizationCodeProvider({
+    id: "oidc", issuer, clientId, redirectUri, clientSecret: process.env.FRAMEKIT_OIDC_CLIENT_SECRET,
+    flowSecret: authSecret, stateStore
+  })];
 }

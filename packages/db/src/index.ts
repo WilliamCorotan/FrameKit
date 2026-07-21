@@ -2,7 +2,11 @@ import { and, asc, desc, eq, gt, gte, lt, lte, ne, or, sql as drizzleSql, type S
 import { integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres, { type Sql } from "postgres";
-import type { ApiTokenRecord, ApiTokenStore, AuthRole, AuthUser, RoleStore, SessionRevocationStore, UserStore } from "@framekit/auth";
+import type {
+  ApiTokenRecord, ApiTokenStore, AuthAuditEvent, AuthAuditSink, AuthIdentityLink, AuthIdentityLinkStore,
+  AuthLifecycleToken, AuthLifecycleTokenKind, AuthLifecycleTokenStore, AuthRole, AuthUser,
+  OidcAuthorizationState, OidcAuthorizationStateStore, RoleStore, SessionRevocationStore, UserStore
+} from "@framekit/auth";
 import type { CustomFieldDefinition, DocTypeDefinition, DocumentRecord, TenantContext, ViewDefinition } from "@framekit/core";
 import { FramekitError } from "@framekit/core";
 import {
@@ -113,6 +117,34 @@ export const framekitSessionRevocations = pgTable("framekit_session_revocations"
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   revokedAt: timestamp("revoked_at", { withTimezone: true }).notNull()
 });
+
+export const framekitAuthIdentityLinks = pgTable("framekit_auth_identity_links", {
+  tenantId: text("tenant_id").notNull(), providerId: text("provider_id").notNull(), subject: text("subject").notNull(),
+  userId: text("user_id").notNull(), email: text("email"), createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull()
+}, (table) => [uniqueIndex("framekit_auth_identity_links_subject").on(table.tenantId, table.providerId, table.subject)]);
+
+export const framekitAuthLifecycleTokens = pgTable("framekit_auth_lifecycle_tokens", {
+  id: text("id").notNull(), tenantId: text("tenant_id").notNull(), kind: text("kind").notNull().$type<AuthLifecycleTokenKind>(),
+  tokenHash: text("token_hash").notNull(), email: text("email"), userId: text("user_id"), name: text("name"),
+  roles: jsonb("roles").$type<string[]>(), permissions: jsonb("permissions").$type<string[]>(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(), expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  usedAt: timestamp("used_at", { withTimezone: true })
+}, (table) => [uniqueIndex("framekit_auth_lifecycle_tokens_hash").on(table.tokenHash)]);
+
+export const framekitOidcAuthorizationStates = pgTable("framekit_oidc_authorization_states", {
+  id: text("id").notNull(), providerId: text("provider_id").notNull(), tenantId: text("tenant_id").notNull(),
+  stateHash: text("state_hash").notNull(), nonceHash: text("nonce_hash").notNull(), encryptedCodeVerifier: text("encrypted_code_verifier").notNull(),
+  returnTo: text("return_to").notNull(), redirectUri: text("redirect_uri").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(), expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  usedAt: timestamp("used_at", { withTimezone: true })
+}, (table) => [uniqueIndex("framekit_oidc_authorization_states_hash").on(table.providerId, table.stateHash)]);
+
+export const framekitAuthAuditEvents = pgTable("framekit_auth_audit_events", {
+  id: text("id").notNull(), tenantId: text("tenant_id").notNull(), actorUserId: text("actor_user_id"), targetUserId: text("target_user_id"),
+  action: text("action").notNull(), success: integer("success").notNull(), createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  details: jsonb("details").$type<Record<string, unknown>>()
+}, (table) => [uniqueIndex("framekit_auth_audit_events_identity").on(table.tenantId, table.id)]);
 
 export const framekitAuditEvents = pgTable("framekit_audit_events", {
   tenantId: text("tenant_id").notNull(),
@@ -713,6 +745,80 @@ export class PostgresSessionRevocationStore implements SessionRevocationStore {
       .limit(1);
     const row = rows[0];
     return Boolean(row && row.expiresAt.getTime() > Date.now());
+  }
+}
+
+export class PostgresAuthIdentityLinkStore implements AuthIdentityLinkStore {
+  private readonly db: PostgresJsDatabase;
+  constructor(options: PostgresRepositoryOptions) { this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 })); }
+  async migrate(): Promise<void> { await this.db.execute(drizzleSql.raw(createAuthIdentityLifecycleTablesSql())); }
+  async find(tenantId: string, providerId: string, subject: string): Promise<AuthIdentityLink | undefined> {
+    const rows = await this.db.select().from(framekitAuthIdentityLinks).where(and(
+      eq(framekitAuthIdentityLinks.tenantId, tenantId), eq(framekitAuthIdentityLinks.providerId, providerId), eq(framekitAuthIdentityLinks.subject, subject)
+    )).limit(1);
+    const row = rows[0];
+    return row ? { ...row, email: row.email ?? undefined, createdAt: row.createdAt.toISOString(), updatedAt: row.updatedAt.toISOString() } : undefined;
+  }
+  async upsert(link: AuthIdentityLink): Promise<AuthIdentityLink> {
+    const existing = await this.find(link.tenantId, link.providerId, link.subject);
+    if (existing && existing.userId !== link.userId) throw new FramekitError("PROVIDER_IDENTITY_COLLISION", "Provider subject is already linked to another user in this tenant.", 409);
+    await this.db.insert(framekitAuthIdentityLinks).values({ ...link, email: link.email ?? null, createdAt: new Date(link.createdAt), updatedAt: new Date(link.updatedAt) })
+      .onConflictDoNothing({ target: [framekitAuthIdentityLinks.tenantId, framekitAuthIdentityLinks.providerId, framekitAuthIdentityLinks.subject] });
+    const saved = await this.find(link.tenantId, link.providerId, link.subject);
+    if (!saved || saved.userId !== link.userId) throw new FramekitError("PROVIDER_IDENTITY_COLLISION", "Provider subject is already linked to another user in this tenant.", 409);
+    return saved;
+  }
+}
+
+export class PostgresAuthLifecycleTokenStore implements AuthLifecycleTokenStore {
+  private readonly sql: Sql;
+  constructor(options: PostgresRepositoryOptions) { this.sql = postgres(options.connectionString, { max: options.max ?? 5 }); }
+  async migrate(): Promise<void> { await this.sql.unsafe(createAuthIdentityLifecycleTablesSql()); }
+  async create(token: AuthLifecycleToken): Promise<AuthLifecycleToken> {
+    await this.sql`insert into framekit_auth_lifecycle_tokens
+      (id, tenant_id, kind, token_hash, email, user_id, name, roles, permissions, created_at, expires_at, used_at)
+      values (${token.id}, ${token.tenantId}, ${token.kind}, ${token.tokenHash}, ${token.email ?? null}, ${token.userId ?? null}, ${token.name ?? null},
+        ${this.sql.json(token.roles ?? [])}, ${this.sql.json(token.permissions ?? [])}, ${new Date(token.createdAt)}, ${new Date(token.expiresAt)}, null)`;
+    return { ...token };
+  }
+  async consume(tenantId: string, kind: AuthLifecycleTokenKind, tokenHash: string, usedAt: string): Promise<AuthLifecycleToken | undefined> {
+    const rows = await this.sql<Record<string, unknown>[]>`update framekit_auth_lifecycle_tokens set used_at = ${new Date(usedAt)}
+      where tenant_id = ${tenantId} and kind = ${kind} and token_hash = ${tokenHash} and used_at is null and expires_at > ${new Date(usedAt)} returning *`;
+    return rows[0] ? lifecycleTokenFromSql(rows[0]) : undefined;
+  }
+}
+
+export class PostgresOidcAuthorizationStateStore implements OidcAuthorizationStateStore {
+  private readonly sql: Sql;
+  constructor(options: PostgresRepositoryOptions) { this.sql = postgres(options.connectionString, { max: options.max ?? 5 }); }
+  async migrate(): Promise<void> { await this.sql.unsafe(createAuthIdentityLifecycleTablesSql()); }
+  async create(state: OidcAuthorizationState): Promise<OidcAuthorizationState> {
+    await this.sql`insert into framekit_oidc_authorization_states
+      (id, provider_id, tenant_id, state_hash, nonce_hash, encrypted_code_verifier, return_to, redirect_uri, created_at, expires_at, used_at)
+      values (${state.id}, ${state.providerId}, ${state.tenantId}, ${state.stateHash}, ${state.nonceHash}, ${state.encryptedCodeVerifier},
+        ${state.returnTo}, ${state.redirectUri}, ${new Date(state.createdAt)}, ${new Date(state.expiresAt)}, null)`;
+    return { ...state };
+  }
+  async consume(providerId: string, stateHash: string, usedAt: string): Promise<OidcAuthorizationState | undefined> {
+    const rows = await this.sql<Record<string, unknown>[]>`update framekit_oidc_authorization_states set used_at = ${new Date(usedAt)}
+      where provider_id = ${providerId} and state_hash = ${stateHash} and used_at is null and expires_at > ${new Date(usedAt)} returning *`;
+    return rows[0] ? oidcStateFromSql(rows[0]) : undefined;
+  }
+}
+
+export class PostgresAuthAuditStore implements AuthAuditSink {
+  private readonly db: PostgresJsDatabase;
+  constructor(options: PostgresRepositoryOptions) { this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 })); }
+  async migrate(): Promise<void> { await this.db.execute(drizzleSql.raw(createAuthIdentityLifecycleTablesSql())); }
+  async record(event: AuthAuditEvent): Promise<void> {
+    await this.db.insert(framekitAuthAuditEvents).values({ ...event, actorUserId: event.actorUserId ?? null, targetUserId: event.targetUserId ?? null,
+      success: event.success ? 1 : 0, createdAt: new Date(event.createdAt), details: event.details ?? null });
+  }
+  async list(tenantId: string): Promise<AuthAuditEvent[]> {
+    const rows = await this.db.select().from(framekitAuthAuditEvents).where(eq(framekitAuthAuditEvents.tenantId, tenantId));
+    return rows.map((row) => ({ id: row.id, tenantId: row.tenantId, actorUserId: row.actorUserId ?? undefined,
+      targetUserId: row.targetUserId ?? undefined, action: row.action, success: row.success === 1,
+      createdAt: row.createdAt.toISOString(), details: row.details ?? undefined })).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 }
 
@@ -1415,6 +1521,36 @@ create index if not exists framekit_session_revocations_expiry on framekit_sessi
 `;
 }
 
+export function createAuthIdentityLifecycleTablesSql(): string {
+  return `
+create table if not exists framekit_auth_identity_links (
+  tenant_id text not null, provider_id text not null, subject text not null, user_id text not null, email text,
+  created_at timestamptz not null, updated_at timestamptz not null,
+  constraint framekit_auth_identity_links_subject unique (tenant_id, provider_id, subject)
+);
+create index if not exists framekit_auth_identity_links_user on framekit_auth_identity_links (tenant_id, user_id);
+create table if not exists framekit_auth_lifecycle_tokens (
+  id text not null, tenant_id text not null, kind text not null, token_hash text not null, email text, user_id text, name text,
+  roles jsonb, permissions jsonb, created_at timestamptz not null, expires_at timestamptz not null, used_at timestamptz,
+  constraint framekit_auth_lifecycle_tokens_hash unique (token_hash)
+);
+create index if not exists framekit_auth_lifecycle_tokens_lookup on framekit_auth_lifecycle_tokens (tenant_id, kind, expires_at);
+create table if not exists framekit_oidc_authorization_states (
+  id text not null, provider_id text not null, tenant_id text not null, state_hash text not null, nonce_hash text not null,
+  encrypted_code_verifier text not null, return_to text not null, redirect_uri text not null,
+  created_at timestamptz not null, expires_at timestamptz not null, used_at timestamptz,
+  constraint framekit_oidc_authorization_states_hash unique (provider_id, state_hash)
+);
+create index if not exists framekit_oidc_authorization_states_expiry on framekit_oidc_authorization_states (expires_at);
+create table if not exists framekit_auth_audit_events (
+  id text not null, tenant_id text not null, actor_user_id text, target_user_id text, action text not null,
+  success integer not null, created_at timestamptz not null, details jsonb,
+  constraint framekit_auth_audit_events_identity unique (tenant_id, id)
+);
+create index if not exists framekit_auth_audit_events_lookup on framekit_auth_audit_events (tenant_id, created_at desc);
+`;
+}
+
 export function createAuditTableSql(): string {
   return `
 create table if not exists framekit_audit_events (
@@ -1973,6 +2109,27 @@ function rowToApiToken(row: typeof framekitApiTokens.$inferSelect): ApiTokenReco
     revokedAt: row.revokedAt?.toISOString()
   };
 }
+
+function lifecycleTokenFromSql(row: Record<string, unknown>): AuthLifecycleToken {
+  return {
+    id: String(row.id), tenantId: String(row.tenant_id), kind: String(row.kind) as AuthLifecycleTokenKind,
+    tokenHash: String(row.token_hash), email: optionalString(row.email), userId: optionalString(row.user_id), name: optionalString(row.name),
+    roles: Array.isArray(row.roles) ? row.roles.map(String) : [], permissions: Array.isArray(row.permissions) ? row.permissions.map(String) : [],
+    createdAt: sqlDate(row.created_at), expiresAt: sqlDate(row.expires_at), usedAt: row.used_at ? sqlDate(row.used_at) : undefined
+  };
+}
+
+function oidcStateFromSql(row: Record<string, unknown>): OidcAuthorizationState {
+  return {
+    id: String(row.id), providerId: String(row.provider_id), tenantId: String(row.tenant_id), stateHash: String(row.state_hash),
+    nonceHash: String(row.nonce_hash), encryptedCodeVerifier: String(row.encrypted_code_verifier), returnTo: String(row.return_to),
+    redirectUri: String(row.redirect_uri), createdAt: sqlDate(row.created_at), expiresAt: sqlDate(row.expires_at),
+    usedAt: row.used_at ? sqlDate(row.used_at) : undefined
+  };
+}
+
+function optionalString(value: unknown): string | undefined { return typeof value === "string" ? value : undefined; }
+function sqlDate(value: unknown): string { return value instanceof Date ? value.toISOString() : new Date(String(value)).toISOString(); }
 
 function rowToMigration(row: typeof framekitMigrations.$inferSelect): MigrationRecord {
   return {
