@@ -468,6 +468,15 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         security: []
       }
     },
+    [`${basePath}/attachments/cleanup`]: {
+      post: {
+        operationId: "cleanupOrphanAttachments",
+        summary: "Delete unreferenced attachment objects for the tenant",
+        tags: ["System"],
+        "x-framekit-permission": "framekit.attachments.cleanup",
+        responses: okResponse({ type: "object", properties: { deleted: { type: "array", items: { type: "string" } } } })
+      }
+    },
     [`${basePath}/auth/login`]: {
       post: {
         operationId: "login",
@@ -779,6 +788,36 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         }
       }
     };
+    for (const field of doctype.fields.filter((candidate) => candidate.type === "attachments")) {
+      const collection = `${itemPath}/attachments/${field.name}`;
+      const item = `${collection}/{attachmentId}`;
+      paths[collection] = {
+        post: {
+          operationId: `upload${pascal(doctype.name)}${pascal(field.name)}Attachment`,
+          summary: `Upload a ${doctype.label} attachment`,
+          tags: [doctype.label],
+          parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
+          requestBody: jsonBody({ type: "object", required: ["name", "contentType", "data"], properties: { name: { type: "string" }, contentType: { type: "string" }, data: { type: "string", format: "byte" } } }, true),
+          responses: createdResponse(attachmentMetadataSchema())
+        }
+      };
+      paths[item] = {
+        get: {
+          operationId: `download${pascal(doctype.name)}${pascal(field.name)}Attachment`,
+          summary: `Download a ${doctype.label} attachment`,
+          tags: [doctype.label],
+          parameters: [pathParam("id"), pathParam("attachmentId")],
+          responses: okResponse({ type: "object", required: ["metadata", "data"], properties: { metadata: attachmentMetadataSchema(), data: { type: "string", format: "byte" } } })
+        },
+        delete: {
+          operationId: `delete${pascal(doctype.name)}${pascal(field.name)}Attachment`,
+          summary: `Delete a ${doctype.label} attachment`,
+          tags: [doctype.label],
+          parameters: [pathParam("id"), pathParam("attachmentId"), expectedRevisionParam(), idempotencyKeyParam()],
+          responses: { "204": { description: "Deleted" }, ...errorResponses() }
+        }
+      };
+    }
     if (doctype.workflow) {
       paths[`${itemPath}/transition`] = {
         post: {
@@ -855,7 +894,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
 function doctypeOutputSchema(doctype: DocTypeDefinition): JsonSchema {
   return {
     type: "object",
-    properties: Object.fromEntries(doctype.fields.map((field) => [field.name, fieldSchema(field)])),
+    properties: Object.fromEntries(doctype.fields.map((field) => [field.name, fieldSchema(field, "output")])),
     required: doctype.fields.filter((field) => field.required || field.computed).map((field) => field.name),
     additionalProperties: false
   };
@@ -865,10 +904,11 @@ function doctypeInputSchema(doctype: DocTypeDefinition, partial: boolean): JsonS
   const properties: Record<string, JsonSchema> = {};
   const required: string[] = [];
   for (const field of doctype.fields) {
+    if (field.type === "attachments") continue;
     if (field.computed || (field.readOnly && partial)) {
       continue;
     }
-    properties[field.name] = fieldSchema(field);
+    properties[field.name] = fieldSchema(field, "input");
     if (!partial && field.required) {
       required.push(field.name);
     }
@@ -881,7 +921,7 @@ function doctypeInputSchema(doctype: DocTypeDefinition, partial: boolean): JsonS
   };
 }
 
-function fieldSchema(field: FieldDefinition): JsonSchema {
+function fieldSchema(field: FieldDefinition, direction: "input" | "output" = "output"): JsonSchema {
   const description = field.description;
   let schema: JsonSchema;
   switch (field.type) {
@@ -913,6 +953,21 @@ function fieldSchema(field: FieldDefinition): JsonSchema {
     case "json":
       schema = { description };
       break;
+    case "children":
+      {
+        const childProperties = Object.fromEntries((field.fields ?? []).map((child) => [child.name, fieldSchema(child as FieldDefinition, direction)]));
+        const childRequired = (field.fields ?? []).filter((child) => child.required).map((child) => child.name);
+      return {
+        type: "array", description, items: {
+          type: "object", required: direction === "output" ? ["id", "position", "data"] : ["data"], properties: {
+            id: { type: "string" }, position: { type: "integer", minimum: 0 },
+            data: { type: "object", properties: childProperties, required: childRequired.length > 0 ? childRequired : undefined, additionalProperties: false }
+          }, additionalProperties: false
+        }
+      };
+      }
+    case "attachments":
+      return { type: "array", description, items: attachmentMetadataSchema() };
     default:
       schema = { type: "string", description };
   }
@@ -955,6 +1010,21 @@ function exactDecimalPattern(field: FieldDefinition): string {
   const integerDigits = precision - scale;
   const whole = integerDigits === 0 ? "0" : `(?:0|[1-9][0-9]{0,${integerDigits - 1}})`;
   return scale === 0 ? `^-?${whole}$` : `^-?${whole}(?:\\.[0-9]{1,${scale}})?$`;
+}
+
+function attachmentMetadataSchema(): JsonSchema {
+  return {
+    type: "object", required: ["id", "name", "contentType", "size", "sha256", "storageKey", "createdAt", "createdBy"],
+    properties: {
+      id: { type: "string" }, name: { type: "string" }, contentType: { type: "string" }, size: { type: "integer", minimum: 0 },
+      sha256: { type: "string", pattern: "^sha256:[A-Za-z0-9_-]{43}$" }, storageKey: { type: "string" },
+      createdAt: { type: "string", format: "date-time" }, createdBy: { type: "string" },
+      pendingDelete: {
+        type: "object", required: ["fingerprint", "requestedAt", "requestedBy"], additionalProperties: false,
+        properties: { fingerprint: { type: "string" }, requestedAt: { type: "string", format: "date-time" }, requestedBy: { type: "string" } }
+      }
+    }, additionalProperties: false
+  };
 }
 
 function userWriteSchema(creating: boolean): JsonSchema {

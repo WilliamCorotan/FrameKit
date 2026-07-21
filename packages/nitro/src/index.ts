@@ -606,6 +606,34 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.executeDocumentCommand(tenant, commandId, request as DocumentCommandRequest);
       }
 
+      if (method === "POST" && path === basePath + "/attachments/cleanup") {
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        return { deleted: await runtime.cleanupOrphanAttachments(tenant) };
+      }
+
+      const attachment = matchAttachmentPath(path, basePath);
+      if (attachment) {
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        if (method === "POST" && !attachment.attachmentId) {
+          const body = ((await readBody(event)) ?? {}) as { name?: string; contentType?: string; data?: string };
+          if (!body.name || !body.contentType || !body.data) throw new FramekitError("VALIDATION_FAILED", "name, contentType, and base64 data are required.", 422);
+          setResponseStatus(event, 201);
+          return await runtime.uploadAttachment(tenant, attachment.doctype, attachment.id, attachment.field, {
+            name: body.name, contentType: body.contentType, bytes: decodeBase64(body.data)
+          }, mutationOptions(event.req));
+        }
+        if (method === "GET" && attachment.attachmentId) {
+          const downloaded = await runtime.downloadAttachment(tenant, attachment.doctype, attachment.id, attachment.field, attachment.attachmentId);
+          return { metadata: downloaded.metadata, data: encodeBase64(downloaded.bytes) };
+        }
+        if (method === "DELETE" && attachment.attachmentId) {
+          await runtime.deleteAttachment(tenant, attachment.doctype, attachment.id, attachment.field, attachment.attachmentId, mutationOptions(event.req));
+          setResponseStatus(event, 204);
+          return null;
+        }
+        throw new FramekitError("METHOD_NOT_ALLOWED", "Method not allowed", 405);
+      }
+
       const match = matchDocumentPath(path, basePath);
       if (!match) {
         throw new FramekitError("NOT_FOUND", "Route not found", 404);
@@ -711,6 +739,42 @@ function matchCommandPath(path: string, basePath: string): string | undefined {
   if (!path.startsWith(prefix)) return undefined;
   const id = path.slice(prefix.length);
   return id && !id.includes("/") ? decodeURIComponent(id) : undefined;
+}
+
+function matchAttachmentPath(path: string, basePath: string): { doctype: string; id: string; field: string; attachmentId?: string } | undefined {
+  const prefix = `${basePath}/doctypes/`;
+  if (!path.startsWith(prefix)) return undefined;
+  const encoded = path.slice(prefix.length).split("/");
+  if ((encoded.length !== 4 && encoded.length !== 5) || encoded.some((part) => !part)) return undefined;
+  const [doctype, id, resource, field, attachmentId] = encoded.map(decodePathSegment);
+  if (resource !== "attachments") return undefined;
+  return { doctype: doctype!, id: id!, field: field!, ...(attachmentId ? { attachmentId } : {}) };
+}
+
+function decodePathSegment(value: string): string {
+  try {
+    const decoded = decodeURIComponent(value);
+    if (!decoded || decoded.includes("\0")) throw new Error("invalid segment");
+    return decoded;
+  } catch {
+    throw new FramekitError("INVALID_PATH", "Request path contains a malformed identifier.", 400);
+  }
+}
+
+function decodeBase64(value: string): Uint8Array {
+  try {
+    return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
+  } catch {
+    throw new FramekitError("INVALID_ATTACHMENT", "Attachment data must be valid base64.", 422);
+  }
+}
+
+function encodeBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
 }
 
 function matchOutboxPath(path: string, basePath: string): { id: string; action: "dispatch" | "fail" } | undefined {

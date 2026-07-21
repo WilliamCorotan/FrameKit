@@ -15,6 +15,7 @@ Framekit 1.0 treats metadata as a versioned contract shared by core, runtime, pe
 - Submit and cancel are permission-checked, revision-aware, idempotency-aware atomic commands. They write the document, audit event, and outbox event together and invoke their lifecycle hooks.
 - Mutation ordering is `beforeValidate`, coercion/reference/unique validation, command-specific `before*`, atomic write, then command-specific `after*`. Read-only values already stored on a document cannot be overwritten by update input.
 - Existing Postgres rows gain `document_status = 'draft'` during adapter migration.
+- `children` fields persist stable-ID, position-normalized rows inside their parent document transaction. `attachments` fields persist authorized metadata in the parent while bytes live behind the attachment storage port.
 
 ## Version policy
 
@@ -26,13 +27,14 @@ App and module metadata use semantic versions.
 
 The migration planner fingerprint remains the authority for deployed DocType schema drift. Framework-owned storage migrations, such as `document_status`, are applied by the adapter and must preserve legacy data. New readers must tolerate records written by the previous minor version; new writers must not depend on a feature until all participating runtime/adapters support that version. Deprecations remain supported for at least one minor release and are removed only in a major release.
 
-## Deferred primitives
+## Additional tracked primitives
 
 The following are deliberately outside the bounded 1.0 metadata slice and have separate acceptance criteria:
 
 | Priority | Primitive | Tracking |
 | --- | --- | --- |
-| P2 | Child/repeating records and attachments | [#39](https://github.com/WilliamCorotan/FrameKit/issues/39) |
+| Implemented | Child/repeating records and attachments | [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [policy](children-and-attachments.md) |
+| Implemented | Exact decimals, computed fields, and richer validators | [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), [policy](domain-fields.md) |
 | Implemented | Ownership and row-level policies | [#41](https://github.com/WilliamCorotan/FrameKit/issues/41), [policy](row-permissions.md) |
 | P2 | Localization and typed settings | [#42](https://github.com/WilliamCorotan/FrameKit/issues/42) |
 

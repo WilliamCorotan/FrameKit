@@ -83,6 +83,36 @@ describe("generateSdkTypes", () => {
     expect(receipt).not.toHaveProperty("data");
   });
 
+  it("uploads, downloads, deletes, and cleans attachment objects", async () => {
+    vi.mocked(ofetch)
+      .mockResolvedValueOnce({ id: "attachment-1", name: "note.txt", contentType: "text/plain", size: 3, storageKey: "key", createdAt: "now", createdBy: "sdk" } as never)
+      .mockResolvedValueOnce({ metadata: { id: "attachment-1", name: "note.txt", contentType: "text/plain", size: 3, storageKey: "key", createdAt: "now", createdBy: "sdk" }, data: "AQID" } as never)
+      .mockResolvedValue({ deleted: ["orphan"] } as never);
+    const client = createClient({ baseUrl: "http://localhost:3000" });
+    await client.uploadAttachment("note", "note-1", "files", { name: "note.txt", contentType: "text/plain", bytes: new Uint8Array([1, 2, 3]) }, { expectedRevision: 1 });
+    await expect(client.downloadAttachment("note", "note-1", "files", "attachment-1")).resolves.toMatchObject({ bytes: new Uint8Array([1, 2, 3]) });
+    await client.deleteAttachment("note", "note-1", "files", "attachment-1", { expectedRevision: 2 });
+    await client.cleanupOrphanAttachments();
+    expect(vi.mocked(ofetch).mock.calls.map(([url, options]) => [url, options?.method, options?.body])).toEqual([
+      ["http://localhost:3000/api/doctypes/note/note-1/attachments/files", "POST", { name: "note.txt", contentType: "text/plain", data: "AQID" }],
+      ["http://localhost:3000/api/doctypes/note/note-1/attachments/files/attachment-1", "GET", undefined],
+      ["http://localhost:3000/api/doctypes/note/note-1/attachments/files/attachment-1", "DELETE", undefined],
+      ["http://localhost:3000/api/attachments/cleanup", "POST", undefined]
+    ]);
+  });
+
+  it("encodes every attachment path segment exactly once", async () => {
+    vi.mocked(ofetch).mockResolvedValue({ metadata: {}, data: "" } as never);
+    const client = createClient({ baseUrl: "http://localhost:3000" });
+    await client.uploadAttachment("doc type/../%", "文 件/..", "proof %/s", { name: "x", contentType: "text/plain", bytes: new Uint8Array([1]) });
+    await client.downloadAttachment("doc type/../%", "文 件/..", "proof %/s", "att/../% ✓");
+    await client.deleteAttachment("doc type/../%", "文 件/..", "proof %/s", "att/../% ✓");
+    const prefix = "http://localhost:3000/api/doctypes/doc%20type%2F..%2F%25/%E6%96%87%20%E4%BB%B6%2F../attachments/proof%20%25%2Fs";
+    expect(vi.mocked(ofetch).mock.calls.map(([url]) => url)).toEqual([
+      prefix, `${prefix}/att%2F..%2F%25%20%E2%9C%93`, `${prefix}/att%2F..%2F%25%20%E2%9C%93`
+    ]);
+  });
+
   it("covers identity linking, invitations, and recovery endpoint parity", async () => {
     vi.mocked(ofetch).mockResolvedValue({} as never);
     const client = createClient({ baseUrl: "https://app.example", token: "session" });
@@ -135,6 +165,7 @@ describe("generateSdkTypes", () => {
                 { name: "risk", label: "Risk", type: "text", validators: [{ kind: "domain", values: ["low", "high"] }] },
                 { name: "approved", label: "Approved", type: "boolean", validators: [{ kind: "domain", values: [true] }] },
                 { name: "rating", label: "Rating", type: "number", validators: [{ kind: "domain", values: [1, 2] }] },
+                { name: "lines", label: "Lines", type: "children", fields: [{ name: "sku", label: "SKU", type: "text", required: true }] },
                 { name: "total", label: "Total", type: "currency", computed: { operation: "sum", dependencies: ["amount", "amount"] } }
               ],
               workflow: {
@@ -159,6 +190,8 @@ describe("generateSdkTypes", () => {
     expect(generated).toContain("approved?: true;");
     expect(generated).toContain("rating?: 1 | 2;");
     expect(generated.match(/total: string;/g)).toHaveLength(1);
+    expect(generated).toContain("lines?: Array<{ id?: string; position?: number; data: { sku: string } }>;");
+    expect(generated).toContain("lines?: Array<{ id: string; position: number; data: { sku: string } }>;");
     expect(generated).toContain('export type DealWorkflowAction = "win";');
     expect(generated).toContain("FramekitValidationError");
     expect(generated).toContain("FramekitClientConfigV2");

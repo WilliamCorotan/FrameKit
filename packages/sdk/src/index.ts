@@ -1,5 +1,5 @@
 import { ofetch } from "ofetch";
-import { listDocTypes, type AppDefinition, type DocumentCommandOperation, type DocumentData, type DocumentRecord, type FieldDefinition, type OwnerTransferReceipt, type TenantContext } from "@framekit/core";
+import { listDocTypes, type AppDefinition, type AttachmentMetadata, type DocumentCommandOperation, type DocumentData, type DocumentRecord, type FieldDefinition, type OwnerTransferReceipt, type TenantContext } from "@framekit/core";
 
 export type AuthUser = {
   id: string;
@@ -135,6 +135,8 @@ export type DocumentCommandResult = {
   documents: Array<DocumentRecord | undefined>;
 };
 
+export type AttachmentDownload = { metadata: AttachmentMetadata; bytes: Uint8Array };
+
 export type HealthResponse = {
   ok: true;
   app: string;
@@ -147,7 +149,7 @@ export type DependencyHealthResponse = {
 };
 
 export type MigrationChange = {
-  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy";
+  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "change_collection_schema" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy";
   doctype: string;
   field: string;
   destructive: boolean;
@@ -230,7 +232,11 @@ export const FRAMEKIT_HTTP_ENDPOINTS = [
   ["submit", "POST", "/api/doctypes/:doctype/:id/submit"],
   ["cancel", "POST", "/api/doctypes/:doctype/:id/cancel"],
   ["transferOwner", "POST", "/api/doctypes/:doctype/:id/owner"],
-  ["executeDocumentCommand", "POST", "/api/commands/:command"]
+  ["executeDocumentCommand", "POST", "/api/commands/:command"],
+  ["uploadAttachment", "POST", "/api/doctypes/:doctype/:id/attachments/:field"],
+  ["downloadAttachment", "GET", "/api/doctypes/:doctype/:id/attachments/:field/:attachmentId"],
+  ["deleteAttachment", "DELETE", "/api/doctypes/:doctype/:id/attachments/:field/:attachmentId"],
+  ["cleanupOrphanAttachments", "POST", "/api/attachments/cleanup"]
 ] as const;
 
 export class FramekitClient {
@@ -552,6 +558,25 @@ export class FramekitClient {
     });
   }
 
+  uploadAttachment(doctype: string, id: string, field: string, input: { name: string; contentType: string; bytes: Uint8Array }, options: MutationRequestOptions = {}): Promise<AttachmentMetadata> {
+    return this.request(`/api/doctypes/${pathSegment(doctype)}/${pathSegment(id)}/attachments/${pathSegment(field)}`, {
+      method: "POST", body: { name: input.name, contentType: input.contentType, data: encodeBase64(input.bytes) }, headers: mutationHeaders(options), signal: options.signal
+    });
+  }
+
+  async downloadAttachment(doctype: string, id: string, field: string, attachmentId: string, options: { signal?: AbortSignal } = {}): Promise<AttachmentDownload> {
+    const response = await this.request<{ metadata: AttachmentMetadata; data: string }>(`/api/doctypes/${pathSegment(doctype)}/${pathSegment(id)}/attachments/${pathSegment(field)}/${pathSegment(attachmentId)}`, { signal: options.signal });
+    return { metadata: response.metadata, bytes: decodeBase64(response.data) };
+  }
+
+  deleteAttachment(doctype: string, id: string, field: string, attachmentId: string, options: MutationRequestOptions = {}): Promise<void> {
+    return this.request(`/api/doctypes/${pathSegment(doctype)}/${pathSegment(id)}/attachments/${pathSegment(field)}/${pathSegment(attachmentId)}`, { method: "DELETE", headers: mutationHeaders(options), signal: options.signal });
+  }
+
+  cleanupOrphanAttachments(options: { signal?: AbortSignal } = {}): Promise<{ deleted: string[] }> {
+    return this.request("/api/attachments/cleanup", { method: "POST", signal: options.signal });
+  }
+
   private request<T>(path: string, options: { method?: string; body?: unknown; skipAuth?: boolean; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<T> {
     const method = options.method ?? "GET";
     const headers = { ...this.headers(options.skipAuth), ...options.headers };
@@ -610,7 +635,7 @@ export function upgradeFramekitClientConfig(input: FramekitClientOptions): Frame
 
 export function generateSdkTypes(app: AppDefinition): string {
   const lines: string[] = [
-    "import type { DocumentRecord } from \"@framekit/core\";",
+    "import type { AttachmentMetadata, DocumentRecord } from \"@framekit/core\";",
     "export { FramekitSdkError, FramekitValidationError, FramekitAuthenticationError, FramekitAuthorizationError, FramekitNotFoundError, FramekitConflictError, FramekitRateLimitError, FramekitServerError, FramekitResponseError, FramekitTransportError, FramekitProtocolError, FramekitCancelledError } from \"@framekit/sdk\";",
     "export type { FramekitClientConfigV1, FramekitClientConfigV2, FramekitRetryPolicy } from \"@framekit/sdk\";",
     ""
@@ -618,14 +643,14 @@ export function generateSdkTypes(app: AppDefinition): string {
   for (const doctype of listDocTypes(app)) {
     const name = pascal(doctype.name);
     lines.push(`export type ${name}Input = {`);
-    for (const field of doctype.fields.filter((candidate) => !candidate.computed)) {
-      lines.push(`  ${field.name}${field.required ? "" : "?"}: ${tsType(field)};`);
+    for (const field of doctype.fields.filter((candidate) => !candidate.computed && candidate.type !== "attachments")) {
+      lines.push(`  ${field.name}${field.required ? "" : "?"}: ${tsType(field, "input")};`);
     }
     lines.push("};", "");
     lines.push(`export type ${name}Patch = Partial<${name}Input>;`);
     lines.push(`export type ${name}Data = {`);
     for (const field of doctype.fields) {
-      lines.push(`  ${field.name}${field.required || field.computed ? "" : "?"}: ${tsType(field)};`);
+      lines.push(`  ${field.name}${field.required || field.computed ? "" : "?"}: ${tsType(field, "output")};`);
     }
     lines.push("};", "");
     lines.push(`export type ${name}Record = DocumentRecord<${name}Data>;`);
@@ -770,7 +795,7 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function tsType(field: FieldDefinition): string {
+function tsType(field: FieldDefinition, direction: "input" | "output" = "output"): string {
   const domain = field.validators.find((validator) => validator.kind === "domain");
   if (domain?.kind === "domain") return domain.values.map((value) => JSON.stringify(value)).join(" | ");
   switch (field.type) {
@@ -785,9 +810,28 @@ function tsType(field: FieldDefinition): string {
       return "unknown";
     case "select":
       return field.options?.length ? field.options.map((option) => JSON.stringify(option)).join(" | ") : "string";
+    case "children":
+      return `Array<{ id${direction === "input" ? "?" : ""}: string; position${direction === "input" ? "?" : ""}: number; data: { ${(field.fields ?? []).map((child) => `${child.name}${child.required ? "" : "?"}: ${tsType(child as FieldDefinition, direction)}`).join("; ")} } }>`;
+    case "attachments":
+      return "AttachmentMetadata[]";
     default:
       return "string";
   }
+}
+
+function encodeBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return btoa(binary);
+}
+
+function pathSegment(value: string): string {
+  if (!value) throw new Error("URL path segments must not be empty.");
+  return encodeURIComponent(value);
+}
+
+function decodeBase64(value: string): Uint8Array {
+  return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
 }
 
 function pascal(value: string): string {

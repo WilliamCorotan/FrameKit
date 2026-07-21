@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type DocumentHook, type TenantContext } from "@framekit/core";
-import { applyFilters, assertDestructiveMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan } from "./index.js";
+import { applyFilters, assertDestructiveMigration, assertSupportedMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryAttachmentStorage, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan, type AttachmentStorage } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -804,6 +804,256 @@ describe("runtime document service", () => {
     expect(() => assertDestructiveMigration(plan, {})).toThrow(/destructive/i);
   });
 
+  it("owns ordered child rows transactionally and manages authorized attachment bytes", async () => {
+    const product = defineDocType({
+      name: "product", label: "Product", fields: [{ name: "name", label: "Name", type: "text" }]
+    });
+    const order = defineDocType({
+      name: "order", label: "Order",
+      ownership: {},
+      rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] },
+      fields: [
+        { name: "title", label: "Title", type: "text", required: true },
+        { name: "lines", label: "Lines", type: "children", required: true, fields: [
+          { name: "sku", label: "SKU", type: "text", required: true },
+          { name: "quantity", label: "Quantity", type: "number", required: true },
+          { name: "product", label: "Product", type: "link", linkTo: "product" }
+        ] },
+        { name: "files", label: "Files", type: "attachments" }
+      ],
+      permissions: [
+        { action: "create", permissions: ["orders.write"] }, { action: "read", permissions: ["orders.read"] },
+        { action: "update", permissions: ["orders.write"] }, { action: "delete", permissions: ["orders.write"] }
+      ]
+    });
+    let id = 0;
+    let storageTime = Date.now();
+    const storage = new InMemoryAttachmentStorage(() => storageTime);
+    const runtime = createRuntime(defineApp({ name: "Orders", modules: [defineModule({ id: "orders", name: "Orders", doctypes: [product, order] })] }), {
+      idGenerator: () => `id-${++id}`, attachmentStorage: storage
+    });
+    const writer = { tenantId: "tenant", userId: "writer", roles: [], permissions: ["orders.read", "orders.write", "framekit.attachments.cleanup"] };
+    const reader = { ...writer, permissions: ["orders.read"] };
+    await expect(runtime.create(writer, "order", { title: "Forged", lines: [], files: [{ id: "forged" }] }))
+      .rejects.toMatchObject({ code: "ATTACHMENTS_MANAGED" });
+    const created = await runtime.create(writer, "order", { title: "Order", lines: [{ sku: "A", quantity: "2" }, { sku: "B", quantity: 1 }] });
+    const initialLines = created.data.lines as Array<{ id: string; position: number; data: Record<string, unknown> }>;
+    expect(initialLines.map((line) => [line.position, line.data])).toEqual([[0, { sku: "A", quantity: 2 }], [1, { sku: "B", quantity: 1 }]]);
+    const reordered = await runtime.update(writer, "order", created.id, { lines: [initialLines[1], initialLines[0]] });
+    expect((reordered.data.lines as typeof initialLines).map((line) => [line.id, line.position])).toEqual([[initialLines[1]!.id, 0], [initialLines[0]!.id, 1]]);
+    await expect(runtime.update(writer, "order", created.id, { lines: [{ id: "foreign", data: { sku: "X", quantity: 1 } }] })).rejects.toMatchObject({ code: "INVALID_CHILD_ID" });
+    await expect(runtime.update(writer, "order", created.id, { lines: [{ ...initialLines[0], data: { ...initialLines[0]!.data, product: "missing" } }] }))
+      .rejects.toMatchObject({ code: "LINK_NOT_FOUND", details: { field: "lines.product" } });
+    await expect(runtime.get(writer, "order", created.id)).resolves.toMatchObject({ revision: 2, data: { lines: reordered.data.lines } });
+
+    await expect(runtime.uploadAttachment(reader, "order", created.id, "files", { name: "denied.txt", contentType: "text/plain", bytes: new Uint8Array([1]) }))
+      .rejects.toMatchObject({ code: "FORBIDDEN" });
+    const attachment = await runtime.uploadAttachment(writer, "order", created.id, "files", { name: "invoice.txt", contentType: "text/plain", bytes: new Uint8Array([1, 2, 3]) }, { expectedRevision: 2 });
+    expect(attachment).toMatchObject({ name: "invoice.txt", size: 3, createdBy: "writer" });
+    await expect(runtime.downloadAttachment(reader, "order", created.id, "files", attachment.id)).resolves.toMatchObject({ metadata: { id: attachment.id }, bytes: new Uint8Array([1, 2, 3]) });
+    await runtime.deleteAttachment(writer, "order", created.id, "files", attachment.id, { expectedRevision: 3 });
+    await expect(runtime.downloadAttachment(reader, "order", created.id, "files", attachment.id)).rejects.toMatchObject({ code: "ATTACHMENT_NOT_FOUND" });
+    const otherWriter = { ...writer, userId: "other-writer", permissions: ["orders.read", "orders.write"] };
+    const otherOrder = await runtime.create(otherWriter, "order", { title: "Other", lines: [{ sku: "PRIVATE", quantity: 1 }] });
+    const referencedHiddenAttachment = await runtime.uploadAttachment(otherWriter, "order", otherOrder.id, "files", { name: "private.txt", contentType: "text/plain", bytes: new Uint8Array([7]) });
+    await storage.put("tenant/Orders/orphan", new Uint8Array([9]), { contentType: "application/octet-stream" });
+    storageTime += 60_001;
+    await expect(runtime.cleanupOrphanAttachments(writer)).resolves.toEqual(["tenant/Orders/orphan"]);
+    expect(await storage.list("tenant/")).toEqual([referencedHiddenAttachment.storageKey]);
+  });
+
+  it("replays attachment receipts, authorizes writes before storage, and detects corruption", async () => {
+    const record = defineDocType({
+      name: "secure_record", label: "Secure record", ownership: {},
+      rowPolicy: { read: [{ owner: "any" }], write: [{ owner: "self" }] },
+      fields: [{ name: "title", label: "Title", type: "text" }, { name: "files", label: "Files", type: "attachments" }],
+      permissions: [
+        { action: "create", permissions: ["records.write"] }, { action: "read", permissions: ["records.read"] },
+        { action: "update", permissions: ["records.write"] }
+      ]
+    });
+    const storage = new InMemoryAttachmentStorage();
+    let putCount = 0;
+    let failLeaseRelease = true;
+    const counted: AttachmentStorage = {
+      put: async (...args) => { putCount += 1; await storage.put(...args); }, get: (...args) => storage.get(...args),
+      delete: (...args) => storage.delete(...args), list: (...args) => storage.list(...args),
+      releaseLease: async (...args) => { if (failLeaseRelease) { failLeaseRelease = false; throw new Error("lease release unavailable"); } await storage.releaseLease(...args); },
+      deleteIfUnleased: (...args) => storage.deleteIfUnleased(...args)
+    };
+    const runtime = createRuntime(defineApp({ name: "Secure files", modules: [defineModule({ id: "records", name: "Records", doctypes: [record] })] }), { attachmentStorage: counted });
+    const owner = { tenantId: "tenant", userId: "owner", roles: [], permissions: ["records.write"] };
+    const created = await runtime.create(owner, record.name, { title: "one" });
+    const upload = { name: "proof.txt", contentType: "text/plain", bytes: new Uint8Array([1, 2, 3]) };
+    const options = { expectedRevision: 1, idempotencyKey: "upload-proof" };
+    const receipt = await runtime.uploadAttachment(owner, record.name, created.id, "files", upload, options);
+    expect(receipt.sha256).toMatch(/^sha256:[A-Za-z0-9_-]{43}$/);
+    const changed = await runtime.update(owner, record.name, created.id, { title: "later" }, { expectedRevision: 2 });
+    await expect(runtime.uploadAttachment(owner, record.name, created.id, "files", upload, options)).resolves.toEqual(receipt);
+    expect(putCount).toBe(1);
+    await expect(runtime.uploadAttachment(owner, record.name, created.id, "files", { ...upload, name: "changed.txt" }, options)).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+
+    const outsider = { tenantId: "tenant", userId: "outsider", roles: [], permissions: ["records.read", "records.write"] };
+    await expect(runtime.uploadAttachment(outsider, record.name, created.id, "files", upload)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    expect(putCount).toBe(1);
+
+    await storage.put(receipt.storageKey, new Uint8Array([1, 2, 4]), { contentType: receipt.contentType });
+    const reader = { ...owner, permissions: ["records.read"] };
+    await expect(runtime.downloadAttachment(reader, record.name, created.id, "files", receipt.id)).rejects.toMatchObject({ code: "ATTACHMENT_INTEGRITY_FAILED" });
+    await storage.put(receipt.storageKey, new Uint8Array([1, 2]), { contentType: receipt.contentType });
+    await expect(runtime.downloadAttachment(reader, record.name, created.id, "files", receipt.id)).rejects.toMatchObject({ code: "ATTACHMENT_INTEGRITY_FAILED" });
+    await storage.put(receipt.storageKey, new Uint8Array([1, 2, 3, 4]), { contentType: receipt.contentType });
+    await expect(runtime.downloadAttachment(reader, record.name, created.id, "files", receipt.id)).rejects.toMatchObject({ code: "ATTACHMENT_INTEGRITY_FAILED" });
+    await storage.put(receipt.storageKey, upload.bytes, { contentType: receipt.contentType });
+
+    const deleteOptions = { expectedRevision: changed.revision, idempotencyKey: "delete-proof" };
+    await runtime.deleteAttachment(owner, record.name, created.id, "files", receipt.id, deleteOptions);
+    await runtime.update(owner, record.name, created.id, { title: "after delete" }, { expectedRevision: changed.revision + 2 });
+    await expect(runtime.deleteAttachment(owner, record.name, created.id, "files", receipt.id, deleteOptions)).resolves.toBeUndefined();
+  });
+
+  it("pins concurrent attachment metadata writes and compensates storage failures without UoW residue", async () => {
+    const record = defineDocType({ name: "race_record", label: "Race record", fields: [
+      { name: "title", label: "Title", type: "text" }, { name: "files", label: "Files", type: "attachments" }
+    ] });
+    const backing = new InMemoryAttachmentStorage();
+    let arrivals = 0;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => { release = resolve; });
+    const storage: AttachmentStorage = {
+      put: async (...args) => { await backing.put(...args); arrivals += 1; if (arrivals === 2) release(); await barrier; },
+      get: (...args) => backing.get(...args), delete: (...args) => backing.delete(...args), list: (...args) => backing.list(...args),
+      releaseLease: (...args) => backing.releaseLease(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args)
+    };
+    let id = 0;
+    const repository = new InMemoryDocumentRepository();
+    const runtime = createRuntime(defineApp({ name: "Race files", modules: [defineModule({ id: "race", name: "Race", doctypes: [record] })] }), {
+      attachmentStorage: storage, repository, idGenerator: () => `race-${++id}`
+    });
+    const actor = { tenantId: "tenant", userId: "writer", roles: [], permissions: [] };
+    const created = await runtime.create(actor, record.name, { title: "race" });
+    const requests = [
+      { upload: { name: "a", contentType: "text/plain", bytes: new Uint8Array([1]) }, options: { expectedRevision: 1, idempotencyKey: "race-a" } },
+      { upload: { name: "b", contentType: "text/plain", bytes: new Uint8Array([2]) }, options: { expectedRevision: 1, idempotencyKey: "race-b" } }
+    ];
+    const results = await Promise.allSettled(requests.map((request) => runtime.uploadAttachment(actor, record.name, created.id, "files", request.upload, request.options)));
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected").map((result) => (result as PromiseRejectedResult).reason.code)).toEqual(["REVISION_CONFLICT"]);
+    const saved = await runtime.get(actor, record.name, created.id);
+    expect(saved).toMatchObject({ revision: 2 });
+    expect(saved.data.files).toHaveLength(1);
+    expect(await backing.list("tenant/Race%20files/")).toHaveLength(1);
+    await expect(runtime.auditTrail(actor)).resolves.toHaveLength(2);
+    await expect(runtime.outboxEvents(actor)).resolves.toHaveLength(2);
+
+    const loserIndex = results.findIndex((result) => result.status === "rejected");
+    const loser = requests[loserIndex]!;
+    await expect(runtime.uploadAttachment(actor, record.name, created.id, "files", loser.upload, { ...loser.options, expectedRevision: 2 })).resolves.toMatchObject({ name: loser.upload.name });
+    await expect(runtime.auditTrail(actor)).resolves.toHaveLength(3);
+    await expect(runtime.outboxEvents(actor)).resolves.toHaveLength(3);
+
+    const winner = (saved.data.files as Array<{ id: string }>)[0]!;
+    let failDelete = true;
+    const failingStorage: AttachmentStorage = {
+      put: (...args) => backing.put(...args), get: (...args) => backing.get(...args), list: (...args) => backing.list(...args),
+      releaseLease: (...args) => backing.releaseLease(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args),
+      delete: async (key) => { if (failDelete) { failDelete = false; throw new Error("storage unavailable"); } await backing.delete(key); }
+    };
+    const restarted = createRuntime(runtime.app, { repository, attachmentStorage: failingStorage });
+    await expect(restarted.deleteAttachment(actor, record.name, created.id, "files", winner.id, { expectedRevision: 3, idempotencyKey: "delete-retry" })).rejects.toThrow("storage unavailable");
+    await expect(runtime.get(actor, record.name, created.id)).resolves.toMatchObject({ revision: 4, data: { files: expect.arrayContaining([expect.objectContaining({ id: winner.id, pendingDelete: expect.any(Object) })]) } });
+    await expect(restarted.deleteAttachment(actor, record.name, created.id, "files", winner.id, { expectedRevision: 3, idempotencyKey: "delete-retry" })).resolves.toBeUndefined();
+  });
+
+  it("isolates cleanup by tenant and app, honors custom fields, and leases in-flight objects", async () => {
+    const base = defineDocType({ name: "asset", label: "Asset", fields: [{ name: "title", label: "Title", type: "text" }] });
+    let storageTime = Date.now();
+    const storage = new InMemoryAttachmentStorage(() => storageTime);
+    const context = { tenantId: "tenant", userId: "admin", roles: [], permissions: ["*", "framekit.attachments.cleanup"] };
+    const definitionA = defineApp({ name: "App A", modules: [defineModule({ id: "assets", name: "Assets", doctypes: [base] })] });
+    const appA = createRuntime(definitionA, { attachmentStorage: storage });
+    const appB = createRuntime(defineApp({ name: "App B", modules: [defineModule({ id: "assets", name: "Assets", doctypes: [base] })] }), { attachmentStorage: storage });
+    await appA.addCustomField(context, { doctype: base.name, field: { name: "files", label: "Files", type: "attachments" } });
+    await appB.addCustomField(context, { doctype: base.name, field: { name: "files", label: "Files", type: "attachments" } });
+    const a = await appA.create(context, base.name, { title: "a" });
+    const b = await appB.create(context, base.name, { title: "b" });
+    const attachmentA = await appA.uploadAttachment(context, base.name, a.id, "files", { name: "a", contentType: "text/plain", bytes: new Uint8Array([1]) });
+    const attachmentB = await appB.uploadAttachment(context, base.name, b.id, "files", { name: "b", contentType: "text/plain", bytes: new Uint8Array([2]) });
+    await storage.put("tenant/App%20A/orphan", new Uint8Array([3]), { contentType: "text/plain" });
+    await storage.put("other/App%20A/orphan", new Uint8Array([4]), { contentType: "text/plain" });
+    storageTime += 60_001;
+    await expect(appA.cleanupOrphanAttachments(context)).resolves.toEqual(["tenant/App%20A/orphan"]);
+    expect(await storage.get(attachmentA.storageKey)).toBeDefined();
+    expect(await storage.get(attachmentB.storageKey)).toBeDefined();
+    expect(await storage.get("other/App%20A/orphan")).toBeDefined();
+    let staged!: () => void;
+    let promote!: () => void;
+    const stagedPromise = new Promise<void>((resolve) => { staged = resolve; });
+    const promotePromise = new Promise<void>((resolve) => { promote = resolve; });
+    const leaseStorage: AttachmentStorage = {
+      put: async (...args) => { await storage.put(...args); staged(); await promotePromise; }, get: (...args) => storage.get(...args),
+      delete: (...args) => storage.delete(...args), list: (...args) => storage.list(...args),
+      releaseLease: (...args) => storage.releaseLease(...args), deleteIfUnleased: (...args) => storage.deleteIfUnleased(...args)
+    };
+    const inFlightRuntime = createRuntime(definitionA, { attachmentStorage: leaseStorage });
+    await inFlightRuntime.addCustomField(context, { doctype: base.name, field: { name: "files", label: "Files", type: "attachments" } });
+    const pendingDocument = await inFlightRuntime.create(context, base.name, { title: "pending" });
+    const pendingUpload = inFlightRuntime.uploadAttachment(context, base.name, pendingDocument.id, "files", { name: "pending", contentType: "text/plain", bytes: new Uint8Array([5]) });
+    await stagedPromise;
+    storageTime += 60_001;
+    await expect(appA.cleanupOrphanAttachments(context)).resolves.toEqual([]);
+    promote();
+    const pendingReceipt = await pendingUpload;
+    expect(await storage.get(pendingReceipt.storageKey)).toBeDefined();
+  });
+
+  it("resolves a barrier-controlled upload/delete race without orphan bytes or stale metadata", async () => {
+    const record = defineDocType({ name: "upload_delete", label: "Upload delete", fields: [{ name: "files", label: "Files", type: "attachments" }] });
+    const backing = new InMemoryAttachmentStorage();
+    let holdUpload = false;
+    let uploaded!: () => void;
+    let release!: () => void;
+    const uploadedPromise = new Promise<void>((resolve) => { uploaded = resolve; });
+    const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+    const storage: AttachmentStorage = {
+      put: async (...args) => { await backing.put(...args); if (holdUpload) { uploaded(); await releasePromise; } },
+      get: (...args) => backing.get(...args), delete: (...args) => backing.delete(...args), list: (...args) => backing.list(...args),
+      releaseLease: (...args) => backing.releaseLease(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args)
+    };
+    const runtime = createRuntime(defineApp({ name: "Upload delete", modules: [defineModule({ id: "files", name: "Files", doctypes: [record] })] }), { attachmentStorage: storage });
+    const actor = { tenantId: "tenant", userId: "writer", roles: [], permissions: [] };
+    const created = await runtime.create(actor, record.name, {});
+    const existing = await runtime.uploadAttachment(actor, record.name, created.id, "files", { name: "old", contentType: "text/plain", bytes: new Uint8Array([1]) }, { expectedRevision: 1 });
+    holdUpload = true;
+    const losingUpload = runtime.uploadAttachment(actor, record.name, created.id, "files", { name: "new", contentType: "text/plain", bytes: new Uint8Array([2]) }, { expectedRevision: 2 });
+    await uploadedPromise;
+    await runtime.deleteAttachment(actor, record.name, created.id, "files", existing.id, { expectedRevision: 2 });
+    release();
+    await expect(losingUpload).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+    await expect(runtime.get(actor, record.name, created.id)).resolves.toMatchObject({ revision: 4, data: { files: [] } });
+    await expect(backing.list("tenant/Upload%20delete/")).resolves.toEqual([]);
+  });
+
+  it("rejects child envelope typos and unsupported collection-schema apply and rollback", async () => {
+    const rows = defineDocType({ name: "rows", label: "Rows", fields: [{ name: "lines", label: "Lines", type: "children", fields: [
+      { name: "sku", label: "SKU", type: "text", required: true }
+    ] }] });
+    const runtime = createRuntime(defineApp({ name: "Rows", modules: [defineModule({ id: "rows", name: "Rows", doctypes: [rows] })] }));
+    await expect(runtime.create(tenant, rows.name, { lines: [{ data: { sku: "A" }, typo: true }] }, { idempotencyKey: "child-validation" })).rejects.toMatchObject({ code: "FIELD_VALIDATION_FAILED" });
+    await expect(runtime.auditTrail(tenant)).resolves.toEqual([]);
+    await expect(runtime.outboxEvents(tenant)).resolves.toEqual([]);
+    await expect(runtime.create(tenant, rows.name, { lines: [{ data: { sku: "A" } }] }, { idempotencyKey: "child-validation" })).resolves.toMatchObject({ revision: 1 });
+    const current = defineApp({ name: "Collections", modules: [defineModule({ id: "rows", name: "Rows", doctypes: [rows] })] });
+    const changed = defineApp({ name: "Collections", modules: [defineModule({ id: "rows", name: "Rows", doctypes: [defineDocType({
+      ...rows, fields: [{ name: "lines", label: "Lines", type: "children", fields: [{ name: "sku", label: "SKU", type: "text", required: true }, { name: "qty", label: "Qty", type: "number" }] }]
+    })] })] });
+    const migrationRuntime = createRuntime(current, { idGenerator: () => "collection-change" });
+    const plan = await migrationRuntime.planMigration(tenant, changed);
+    expect(() => assertSupportedMigration(plan)).toThrow(/collection-schema conversion/);
+    await expect(migrationRuntime.applyMigration(tenant, plan, { allowDestructive: true })).rejects.toMatchObject({ code: "UNSUPPORTED_MIGRATION_CONVERSION" });
+    await expect(migrationRuntime.migrationHistory(tenant)).resolves.toEqual([]);
+  });
+
   it("reports runtime diagnostics", async () => {
     const app = defineApp({
       name: "Diagnostics",
@@ -833,6 +1083,25 @@ describe("runtime document service", () => {
       realtime: { kind: "none", durable: false },
       doctypes: [{ name: "customer", workflow: false }]
     });
+  });
+
+  it("plans child schema changes explicitly and guards incompatible collection migrations", async () => {
+    const currentDocType = defineDocType({ name: "order", label: "Order", fields: [
+      { name: "lines", label: "Lines", type: "children", fields: [{ name: "sku", label: "SKU", type: "text" }] }
+    ] });
+    const nextDocType = defineDocType({ name: "order", label: "Order", fields: [
+      { name: "lines", label: "Lines", type: "children", fields: [{ name: "sku", label: "SKU", type: "text", required: true }] },
+      { name: "files", label: "Files", type: "attachments" }
+    ] });
+    const current = defineApp({ name: "Collections", modules: [defineModule({ id: "orders", name: "Orders", doctypes: [currentDocType] })] });
+    const next = defineApp({ name: "Collections", modules: [defineModule({ id: "orders", name: "Orders", doctypes: [nextDocType] })] });
+    const plan = await createRuntime(current, { idGenerator: () => "collection-migration" }).planMigration(tenant, next);
+    expect(plan.changes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "change_collection_schema", field: "lines", destructive: true }),
+      expect.objectContaining({ kind: "add_field", field: "files", destructive: false })
+    ]));
+    await expect(validateMigrationPlan(plan)).resolves.toBeUndefined();
+    expect(() => assertDestructiveMigration(plan, {})).toThrow(/destructive/i);
   });
 
   it("records audit events for mutations", async () => {

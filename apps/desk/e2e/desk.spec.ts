@@ -165,6 +165,28 @@ test("covers document list, create, edit, delete, pagination, search, and workfl
   await expect(page.getByText("Deleted")).toBeVisible();
 });
 
+test("edits ordered child rows and uploads and deletes attachment metadata", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("button", { name: "New document" }).click();
+  await page.getByLabel("Name *").fill("Collection customer");
+  await page.getByRole("button", { name: "Add child row" }).click();
+  await page.getByLabel("Contact name").fill("Alice");
+  await page.getByRole("spinbutton", { name: "Quantity" }).fill("2");
+  await page.getByRole("button", { name: "Add child row" }).click();
+  await page.getByLabel("Contact name").nth(1).fill("Bob");
+  await page.getByRole("button", { name: "Move row 2 up" }).click();
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByText("Saved")).toBeVisible();
+  await expect(page.getByLabel("Contact name").first()).toHaveValue("Bob");
+
+  await page.getByLabel("Upload Files").setInputFiles({ name: "proof.txt", mimeType: "text/plain", buffer: Buffer.from("proof") });
+  await expect(page.getByText("Uploaded")).toBeVisible();
+  await expect(page.getByText("proof.txt · 5 bytes")).toBeVisible();
+  await page.getByRole("button", { name: "Delete proof.txt attachment" }).click();
+  await expect(page.getByText("Attachment deleted")).toBeVisible();
+  await expect(page.getByText("proof.txt · 5 bytes")).toBeHidden();
+});
+
 test("covers auth administration screens", async ({ page }) => {
   await signIn(page);
 
@@ -315,6 +337,9 @@ async function mockDeskApi(page: Page) {
       return json(route, list.slice(offset, offset + limit));
     }
     if (path === "/api/doctypes/customer" && method === "POST" && body) {
+      const data = { ...body };
+      if (Array.isArray(data.contacts)) data.contacts = data.contacts.map((row, position) => ({ ...(row as object), id: `child-${position + 1}`, position }));
+      data.files = [];
       const record = {
         id: `CUSTOMER-${String(customers.length + 1).padStart(3, "0")}`,
         doctype: "customer",
@@ -322,13 +347,25 @@ async function mockDeskApi(page: Page) {
         state: "Lead",
         documentStatus: "draft" as const,
         ownerId: "admin",
-        data: { ...body, display_name: `${String(body.name)} ${String(body.status ?? "lead")}` },
+        data: { ...data, display_name: `${String(body.name)} ${String(body.status ?? "lead")}` },
         updatedAt: now
       };
       customers.unshift(record);
       return json(route, record);
     }
     const customerMatch = path.match(/^\/api\/doctypes\/customer\/([^/]+)(?:\/(transition|submit|cancel|owner))?$/);
+    const attachmentMatch = path.match(/^\/api\/doctypes\/customer\/([^/]+)\/attachments\/files(?:\/([^/]+))?$/);
+    if (attachmentMatch && method === "POST" && body) {
+      const record = customers.find((item) => item.id === attachmentMatch[1])!;
+      const attachment = { id: `attachment-${record.revision}`, name: String(body.name), contentType: String(body.contentType), size: 5, storageKey: "mock/key", createdAt: now, createdBy: "admin" };
+      record.data.files = [...((record.data.files as unknown[]) ?? []), attachment]; record.revision += 1;
+      return json(route, attachment);
+    }
+    if (attachmentMatch?.[2] && method === "DELETE") {
+      const record = customers.find((item) => item.id === attachmentMatch[1])!;
+      record.data.files = ((record.data.files as Array<{ id: string }>) ?? []).filter((item) => item.id !== attachmentMatch[2]); record.revision += 1;
+      return empty(route);
+    }
     if (customerMatch && !customerMatch[2] && method === "GET") {
       const record = customers.find((item) => item.id === customerMatch[1]);
       if (!record || record.ownerId === "hidden-owner") return jsonError(route, 404, "DOCUMENT_NOT_FOUND", "Document is no longer readable");
@@ -477,11 +514,16 @@ const metadata = {
             { name: "notes", label: "Notes", type: "long_text" },
             { name: "is_active", label: "Active", type: "boolean" },
             { name: "approved", label: "Approved", type: "boolean", validators: [{ kind: "domain", values: [true, false] }] },
-            { name: "rating", label: "Rating", type: "number", validators: [{ kind: "domain", values: [1, 2] }] }
+            { name: "rating", label: "Rating", type: "number", validators: [{ kind: "domain", values: [1, 2] }] },
+            { name: "contacts", label: "Contacts", type: "children", fields: [
+              { name: "contact_name", label: "Contact name", type: "text", required: true },
+              { name: "quantity", label: "Quantity", type: "number" }
+            ] },
+            { name: "files", label: "Files", type: "attachments" }
           ],
           views: [
             { id: "customer-list", doctype: "customer", type: "list", fields: ["name", "status", "revenue"] },
-            { id: "customer-form", doctype: "customer", type: "form", fields: ["name", "status", "revenue", "display_name", "notes", "is_active", "approved", "rating"] }
+            { id: "customer-form", doctype: "customer", type: "form", fields: ["name", "status", "revenue", "display_name", "notes", "is_active", "approved", "rating", "contacts", "files"] }
           ],
           workflow: {
             field: "state",

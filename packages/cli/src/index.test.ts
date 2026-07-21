@@ -195,6 +195,30 @@ describe("framekit CLI", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("fails closed on collection-schema apply and rollback before opening a database", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "framekit-cli-collection-"));
+    const operator = { tenantId: "tenant", userId: "migration", roles: ["administrator"], permissions: ["*"] };
+    const rows = defineDocType({ name: "rows", label: "Rows", fields: [{ name: "lines", label: "Lines", type: "children", fields: [
+      { name: "sku", label: "SKU", type: "text" }
+    ] }] });
+    const current = defineApp({ name: "CLI Collections", modules: [defineModule({ id: "rows", name: "Rows", doctypes: [rows] })] });
+    const next = defineApp({ name: current.name, modules: [defineModule({ id: "rows", name: "Rows", doctypes: [defineDocType({
+      ...rows, fields: [{ name: "lines", label: "Lines", type: "children", fields: [
+        { name: "sku", label: "SKU", type: "text" }, { name: "quantity", label: "Quantity", type: "number", required: true }
+      ] }]
+    })] })] });
+    try {
+      const plan = await createRuntime(current, { idGenerator: () => "collection-schema" }).planMigration(operator, next);
+      const path = join(directory, "collection.json");
+      await writeFile(path, JSON.stringify(createExecutableMigrationArtifact(plan)));
+      const args = [path, "--tenant-id", operator.tenantId, "--app-name", current.name, "--allow-destructive"];
+      await expect(runCli(["apply-migration", ...args])).rejects.toMatchObject({ code: "UNSUPPORTED_MIGRATION_CONVERSION" });
+      await expect(runCli(["rollback-migration", ...args])).rejects.toMatchObject({ code: "UNSUPPORTED_MIGRATION_CONVERSION" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 async function inTemporaryDirectory(run: (directory: string) => Promise<void>): Promise<void> {

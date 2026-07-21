@@ -171,4 +171,19 @@ describe("core metadata", () => {
     }] });
     expect(canonical.fields[0]).toMatchObject({ default: "1.00", validators: [{ min: "0.00", max: "2.00" }, { values: ["1.00"] }] });
   });
+
+  it("validates child and attachment collection metadata", () => {
+    expect(() => defineDocType({ name: "order", label: "Order", fields: [{ name: "lines", label: "Lines", type: "children" }] })).toThrow(/requires child fields/);
+    expect(() => defineDocType({ name: "order", label: "Order", fields: [{ name: "files", label: "Files", type: "attachments", unique: true }] })).toThrow(/unsupported metadata/);
+    const order = defineDocType({
+      name: "order", label: "Order", fields: [
+        { name: "lines", label: "Lines", type: "children", required: true, fields: [
+          { name: "sku", label: "SKU", type: "text", required: true },
+          { name: "quantity", label: "Quantity", type: "number", required: true }
+        ] },
+        { name: "files", label: "Files", type: "attachments" }
+      ]
+    });
+    expect(order.fields[0]?.fields?.map((field) => field.name)).toEqual(["sku", "quantity"]);
+  });
 });

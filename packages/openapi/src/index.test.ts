@@ -20,7 +20,9 @@ describe("createOpenApiDocument", () => {
                 { name: "amount", label: "Amount", type: "currency", precision: 20, scale: 4, validators: [{ kind: "range", min: "0.0000" }] },
                 { name: "tax", label: "Tax", type: "currency", precision: 20, scale: 4 },
                 { name: "total", label: "Total", type: "currency", precision: 20, scale: 4, computed: { operation: "sum", dependencies: ["amount", "tax"] } },
-                { name: "stage", label: "Stage", type: "select", options: ["open", "won"] }
+                { name: "stage", label: "Stage", type: "select", options: ["open", "won"] },
+                { name: "lines", label: "Lines", type: "children", fields: [{ name: "description", label: "Description", type: "text", required: true }] },
+                { name: "files", label: "Files", type: "attachments" }
               ],
               workflow: {
                 field: "stage",
@@ -66,6 +68,9 @@ describe("createOpenApiDocument", () => {
     expect(doc.components.schemas.OwnerTransferReceipt).toMatchObject({ required: ["id", "ownerId", "revision", "updatedAt"], additionalProperties: false });
     expect(doc.components.schemas.OwnerTransferReceipt?.properties).not.toHaveProperty("data");
     expect(doc.paths["/api/doctypes/deal/{id}/owner"]?.post?.operationId).toBe("transferDealOwner");
+    expect(doc.paths["/api/doctypes/deal/{id}/attachments/files"]?.post?.operationId).toBe("uploadDealFilesAttachment");
+    expect(doc.paths["/api/doctypes/deal/{id}/attachments/files/{attachmentId}"]?.get).toBeDefined();
+    expect(doc.paths["/api/attachments/cleanup"]?.post?.["x-framekit-permission"]).toBe("framekit.attachments.cleanup");
     const listDeal = doc.paths["/api/doctypes/deal"]?.get;
     expect(JSON.stringify(listDeal?.parameters)).toContain("cursor");
     expect(JSON.stringify(listDeal?.parameters)).toContain("fields");
@@ -101,6 +106,13 @@ describe("createOpenApiDocument", () => {
     expect(amountPattern.test("+1.0000")).toBe(false);
     expect(dealInput?.properties).not.toHaveProperty("total");
     expect(doc.components.schemas.DealData?.properties?.total).toMatchObject({ type: ["string", "null"], readOnly: true, "x-framekit-computed": { operation: "sum" } });
+    expect(dealInput?.properties).not.toHaveProperty("files");
+    expect(dealInput?.properties?.lines?.items?.properties?.data?.properties?.description).toEqual({ type: "string", description: undefined });
+    expect(dealInput?.properties?.lines?.items).toMatchObject({ required: ["data"], additionalProperties: false });
+    expect(dealInput?.properties?.lines?.items?.properties?.data).toMatchObject({ required: ["description"], additionalProperties: false });
+    expect(doc.components.schemas.DealData?.properties?.lines?.items).toMatchObject({ required: ["id", "position", "data"], additionalProperties: false });
+    expect(doc.components.schemas.DealData?.properties?.files?.items?.required).toContain("storageKey");
+    expect(doc.components.schemas.DealData?.properties?.files?.items?.required).toContain("sha256");
     expect(doc.components.schemas.DealRecord?.required).toContain("documentStatus");
     expect(doc.components.schemas.DealRecord?.properties?.documentStatus).toEqual({ type: "string", enum: ["draft", "submitted", "cancelled"] });
     expect(doc.components.schemas.DealRecord?.properties?.ownerId).toEqual({ type: "string" });

@@ -376,7 +376,7 @@ Postgres query pushdown and stable opaque cursor semantics are documented in [do
 
 ## Roadmap Status
 
-Framekit is currently assessed as a beta: 85% implemented toward a production-ready 1.0. Exact decimals, computed fields, and declarative validators are implemented; remaining metadata primitives are tracked in issues #39, #41, and #42. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
+Framekit is currently assessed as a beta: 86% implemented toward a production-ready 1.0. Exact decimals, computed fields, declarative validators, ordered child records, and managed attachments are implemented; localization and typed settings remain tracked in issue #42. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
 
 ## License
 

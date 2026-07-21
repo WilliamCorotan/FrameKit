@@ -13,6 +13,8 @@ import {
   hasAccess,
   ViewSchema,
   type AppDefinition,
+  type AttachmentMetadata,
+  type ChildRecord,
   type CustomFieldDefinition,
   type DocTypeDefinition,
   type DocumentData,
@@ -69,6 +71,7 @@ export type LifecycleResource = {
 export type DocumentRepository = LifecycleResource & {
   list(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentRecord[]>;
   listPage?(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentPage>;
+  listForMaintenance?(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentPage>;
   get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options?: { access?: "read" | "write" }): Promise<DocumentRecord | undefined>;
   getForOwnerTransfer(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined>;
   create(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord>;
@@ -198,7 +201,7 @@ export type NamingSeriesStore = LifecycleResource & {
 };
 
 export type MigrationChange = {
-  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy";
+  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "change_collection_schema" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy";
   doctype: string;
   field: string;
   destructive: boolean;
@@ -327,9 +330,23 @@ export type RuntimeOptions = {
   mutations?: MutationUnitOfWork;
   commandRowPolicy?: CommandRowPolicy;
   resources?: LifecycleResource[];
+  attachmentStorage?: AttachmentStorage;
   idGenerator?: () => string;
   now?: () => Date;
 };
+
+export type AttachmentStorage = {
+  put(key: string, bytes: Uint8Array, metadata: { contentType: string; lease?: { owner: string; durationMs: number } }): Promise<void>;
+  get(key: string): Promise<Uint8Array | undefined>;
+  delete(key: string): Promise<void>;
+  list(prefix: string): Promise<string[]>;
+  releaseLease?(key: string, owner: string): Promise<void>;
+  deleteIfUnleased?(key: string, options: { minimumAgeMs: number }): Promise<boolean>;
+  describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
+  close?(): Promise<void>;
+};
+
+export type AttachmentUpload = { name: string; contentType: string; bytes: Uint8Array };
 
 export class FramekitRuntime {
   readonly app: AppDefinition;
@@ -342,8 +359,10 @@ export class FramekitRuntime {
   private readonly realtime: RealtimePublisher;
   private readonly mutations?: MutationUnitOfWork;
   private readonly commandRowPolicy?: CommandRowPolicy;
+  private readonly attachmentStorage: AttachmentStorage;
   private readonly idGenerator: () => string;
   private readonly now: () => Date;
+  private readonly activeAttachmentKeys = new Set<string>();
   private readonly resources: LifecycleResource[];
   private lifecycleState: "created" | "started" | "closing" | "closed" = "created";
   private startPromise?: Promise<void>;
@@ -361,6 +380,7 @@ export class FramekitRuntime {
     this.namingSeries = options.namingSeries ?? new InMemoryNamingSeriesStore();
     this.migrations = options.migrations ?? new InMemoryMigrationStore();
     this.realtime = options.realtime ?? new NoopRealtimePublisher();
+    this.attachmentStorage = options.attachmentStorage ?? new InMemoryAttachmentStorage();
     this.mutations = options.mutations ?? (
       repository instanceof InMemoryDocumentRepository && audit instanceof InMemoryAuditStore && outbox instanceof InMemoryOutboxStore
         ? new InMemoryMutationUnitOfWork(repository, audit, outbox)
@@ -370,7 +390,7 @@ export class FramekitRuntime {
     this.idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
     this.now = options.now ?? (() => new Date());
     this.resources = uniqueLifecycleResources([
-      repository, audit, outbox, this.customization, this.namingSeries, this.migrations, this.realtime,
+      repository, audit, outbox, this.customization, this.namingSeries, this.migrations, this.realtime, this.attachmentStorage,
       ...(this.mutations ? [this.mutations] : []), ...(options.resources ?? [])
     ]);
   }
@@ -542,6 +562,8 @@ export class FramekitRuntime {
           if (field.unique) {
             changes.push(migrationChange({ kind: "add_unique_constraint", doctype: nextDocType.name, field: field.name, destructive: false, to: field.name }));
           }
+        } else if ((field.type === "children" || field.type === "attachments") && currentField.type === field.type && stableJson(currentField) !== stableJson(field)) {
+          changes.push(migrationChange({ kind: "change_collection_schema", doctype: nextDocType.name, field: field.name, destructive: true, from: currentField, to: field }));
         } else if (fieldStorageContract(currentField) !== fieldStorageContract(field)) {
           changes.push(migrationChange({
             kind: "change_field_type",
@@ -738,6 +760,8 @@ export class FramekitRuntime {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "create");
     if (doctype.ownership && Object.hasOwn(input, "ownerId")) throw new FramekitError("OWNER_IMMUTABLE", "Owner is assigned from the authenticated creator", 403);
+    const directManagedField = doctype.fields.find((field) => field.type === "attachments" && Object.hasOwn(input, field.name));
+    if (directManagedField) throw new FramekitError("ATTACHMENTS_MANAGED", `Field "${directManagedField.label}" can only change through attachment commands`, 422);
     const fingerprint = mutationFingerprint("create", doctype.name, input);
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
     if (replay) return replay;
@@ -788,18 +812,32 @@ export class FramekitRuntime {
   }
 
   async update(tenant: TenantContext, doctypeName: string, id: string, input: DocumentData, options: MutationOptions = {}): Promise<DocumentRecord> {
+    return this.updateDocument(tenant, doctypeName, id, input, options);
+  }
+
+  private async updateDocument(
+    tenant: TenantContext,
+    doctypeName: string,
+    id: string,
+    input: DocumentData,
+    options: MutationOptions = {},
+    managedFields = new Set<string>(),
+    fingerprintOverride?: string
+  ): Promise<DocumentRecord> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "update");
     if (doctype.ownership && Object.hasOwn(input, "ownerId")) throw new FramekitError("OWNER_IMMUTABLE", "Owner changes require transferOwner", 403);
     requireExpectedRevisionForRetry(options);
-    const fingerprint = mutationFingerprint("update", doctype.name, { id, input, expectedRevision: options.expectedRevision });
+    const fingerprint = fingerprintOverride ?? mutationFingerprint("update", doctype.name, { id, input, expectedRevision: options.expectedRevision });
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
     if (replay) return replay;
     const existing = await this.getForWrite(tenant, doctype, id);
     assertDraftDocument(existing, "update");
+    const directManagedField = doctype.fields.find((field) => field.type === "attachments" && Object.hasOwn(input, field.name) && !managedFields.has(field.name));
+    if (directManagedField) throw new FramekitError("ATTACHMENTS_MANAGED", `Field "${directManagedField.label}" can only change through attachment commands`, 422);
     const candidate = { ...existing.data, ...input };
     await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
-    const data = this.prepareInput(doctype, candidate, false, existing.data, input);
+    const data = this.prepareInput(doctype, candidate, false, existing.data, input, managedFields);
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data, id);
     const expectedRevision = options.expectedRevision ?? existing.revision;
@@ -833,6 +871,8 @@ export class FramekitRuntime {
     if ((await this.replayMutation(tenant, options.idempotencyKey, fingerprint)) !== undefined) return;
     const existing = await this.getForWrite(tenant, doctype, id);
     assertDraftDocument(existing, "delete");
+    const attachmentKeys = doctype.fields.filter((field) => field.type === "attachments")
+      .flatMap((field) => attachmentList(existing.data[field.name]).map((attachment) => attachment.storageKey));
     const expectedRevision = options.expectedRevision ?? existing.revision;
     await this.runHooks("beforeDelete", tenant, doctype, existing, existing.data);
     const audit = this.createAuditEvent(tenant, "delete", existing);
@@ -854,6 +894,7 @@ export class FramekitRuntime {
       await this.deleteWithoutUnitOfWork(tenant, doctype, existing, expectedRevision, audit, outbox);
     }
     await this.publishDocumentEvent(tenant, "deleted", existing);
+    await Promise.allSettled(attachmentKeys.map((key) => this.attachmentStorage.delete(key)));
   }
 
   async transition(tenant: TenantContext, doctypeName: string, id: string, action: string, options: MutationOptions = {}): Promise<DocumentRecord> {
@@ -1171,6 +1212,159 @@ export class FramekitRuntime {
     return authorized;
   }
 
+  async uploadAttachment(tenant: TenantContext, doctypeName: string, id: string, fieldName: string, upload: AttachmentUpload, options: MutationOptions = {}): Promise<AttachmentMetadata> {
+    const doctype = await this.getEffectiveDocType(tenant, doctypeName);
+    assertPermission(tenant, doctype, "update");
+    const field = attachmentField(doctype, fieldName);
+    if (!upload.name.trim() || !upload.contentType.trim() || upload.bytes.length === 0 || upload.bytes.length > 10 * 1024 * 1024) {
+      throw new FramekitError("INVALID_ATTACHMENT", "Attachment name, content type, and 1-10485760 bytes are required", 422);
+    }
+    requireExpectedRevisionForRetry(options);
+    const sha256 = await sha256Digest(upload.bytes);
+    const fingerprint = mutationFingerprint("attachment:upload", doctype.name, {
+      actor: { tenantId: tenant.tenantId, userId: tenant.userId }, id, field: field.name,
+      name: upload.name, contentType: upload.contentType, size: upload.bytes.length, sha256,
+      expectedRevision: options.expectedRevision
+    });
+    const existing = await this.getForWrite(tenant, doctype, id);
+    const attachmentId = options.idempotencyKey
+      ? `att_${(await sha256Digest(new TextEncoder().encode(`${options.idempotencyKey}\0${fingerprint}`))).slice(7, 31)}`
+      : this.idGenerator();
+    const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
+    if (replay) {
+      const receipt = attachmentList(replay.data[field.name]).find((attachment) => attachment.id === attachmentId);
+      if (!receipt) throw new FramekitError("IDEMPOTENCY_RESULT_INVALID", "Stored attachment upload receipt is invalid.", 409);
+      return receipt;
+    }
+    assertDraftDocument(existing, "upload attachments to");
+    const storageKey = [tenant.tenantId, this.app.name, doctype.name, id, field.name, attachmentId].map(encodeURIComponent).join("/");
+    const metadata: AttachmentMetadata = {
+      id: attachmentId, name: upload.name, contentType: upload.contentType, size: upload.bytes.length,
+      sha256, storageKey, createdAt: this.now().toISOString(), createdBy: tenant.userId
+    };
+    const leaseOwner = `upload:${attachmentId}`;
+    this.activeAttachmentKeys.add(storageKey);
+    let committed = false;
+    try {
+      await this.attachmentStorage.put(storageKey, upload.bytes, { contentType: upload.contentType, lease: { owner: leaseOwner, durationMs: 5 * 60_000 } });
+      const attachments = attachmentList(existing.data[field.name]);
+      const saved = await this.updateDocument(
+        tenant, doctypeName, id, { [field.name]: [...attachments, metadata] },
+        { ...options, expectedRevision: options.expectedRevision ?? existing.revision }, new Set([field.name]), fingerprint
+      );
+      const receipt = attachmentList(saved.data[field.name]).find((attachment) => attachment.id === attachmentId);
+      if (!receipt) throw new FramekitError("IDEMPOTENCY_RESULT_INVALID", "Stored attachment upload receipt is invalid.", 409);
+      committed = true;
+      return receipt;
+    } catch (error) {
+      await this.attachmentStorage.delete(storageKey).catch(() => undefined);
+      throw error;
+    } finally {
+      if (committed) await this.attachmentStorage.releaseLease?.(storageKey, leaseOwner).catch(() => undefined);
+      this.activeAttachmentKeys.delete(storageKey);
+    }
+  }
+
+  async downloadAttachment(tenant: TenantContext, doctypeName: string, id: string, fieldName: string, attachmentId: string): Promise<{ metadata: AttachmentMetadata; bytes: Uint8Array }> {
+    const doctype = await this.getEffectiveDocType(tenant, doctypeName);
+    attachmentField(doctype, fieldName);
+    const document = await this.get(tenant, doctypeName, id);
+    const metadata = attachmentList(document.data[fieldName]).find((attachment) => attachment.id === attachmentId);
+    if (!metadata) throw new FramekitError("ATTACHMENT_NOT_FOUND", `Attachment "${attachmentId}" does not exist`, 404);
+    const bytes = await this.attachmentStorage.get(metadata.storageKey);
+    if (!bytes) throw new FramekitError("ATTACHMENT_BYTES_MISSING", `Attachment "${attachmentId}" bytes are unavailable`, 410);
+    const sha256 = await sha256Digest(bytes);
+    if (bytes.length !== metadata.size || sha256 !== metadata.sha256) {
+      throw new FramekitError("ATTACHMENT_INTEGRITY_FAILED", `Attachment "${attachmentId}" bytes do not match their metadata`, 409, {
+        expectedSize: metadata.size, actualSize: bytes.length, expectedSha256: metadata.sha256, actualSha256: sha256
+      });
+    }
+    return { metadata, bytes };
+  }
+
+  async deleteAttachment(tenant: TenantContext, doctypeName: string, id: string, fieldName: string, attachmentId: string, options: MutationOptions = {}): Promise<void> {
+    const doctype = await this.getEffectiveDocType(tenant, doctypeName);
+    assertPermission(tenant, doctype, "update");
+    const field = attachmentField(doctype, fieldName);
+    requireExpectedRevisionForRetry(options);
+    const fingerprint = mutationFingerprint("attachment:delete", doctype.name, {
+      actor: { tenantId: tenant.tenantId, userId: tenant.userId }, id, field: field.name, attachmentId,
+      expectedRevision: options.expectedRevision
+    });
+    const document = await this.getForWrite(tenant, doctype, id);
+    if ((await this.replayMutation(tenant, options.idempotencyKey, fingerprint)) !== undefined) return;
+    assertDraftDocument(document, "delete attachments from");
+    let workingDocument = document;
+    let attachments = attachmentList(document.data[field.name]);
+    let metadata = attachments.find((attachment) => attachment.id === attachmentId);
+    if (!metadata) throw new FramekitError("ATTACHMENT_NOT_FOUND", `Attachment "${attachmentId}" does not exist`, 404);
+    if (metadata.pendingDelete && metadata.pendingDelete.fingerprint !== fingerprint) {
+      throw new FramekitError("ATTACHMENT_DELETE_PENDING", `Attachment "${attachmentId}" already has a different delete operation pending`, 409);
+    }
+    if (!metadata.pendingDelete) {
+      const bytes = await this.attachmentStorage.get(metadata.storageKey);
+      if (!bytes) throw new FramekitError("ATTACHMENT_BYTES_MISSING", `Attachment "${attachmentId}" bytes are unavailable`, 410);
+      const pendingMetadata: AttachmentMetadata = {
+        ...metadata,
+        pendingDelete: { fingerprint, requestedAt: this.now().toISOString(), requestedBy: tenant.userId }
+      };
+      workingDocument = await this.updateDocument(
+        tenant, doctypeName, id,
+        { [field.name]: attachments.map((attachment) => attachment.id === attachmentId ? pendingMetadata : attachment) },
+        { expectedRevision: options.expectedRevision ?? document.revision }, new Set([field.name])
+      );
+      attachments = attachmentList(workingDocument.data[field.name]);
+      metadata = attachments.find((attachment) => attachment.id === attachmentId)!;
+    }
+    this.activeAttachmentKeys.add(metadata.storageKey);
+    try {
+      await this.attachmentStorage.delete(metadata.storageKey);
+      await this.updateDocument(
+        tenant, doctypeName, id, { [field.name]: attachments.filter((attachment) => attachment.id !== attachmentId) },
+        { expectedRevision: workingDocument.revision, idempotencyKey: options.idempotencyKey }, new Set([field.name]), fingerprint
+      );
+    } finally {
+      this.activeAttachmentKeys.delete(metadata.storageKey);
+    }
+  }
+
+  async cleanupOrphanAttachments(tenant: TenantContext): Promise<string[]> {
+    if (!tenant.permissions.includes("*") && !tenant.permissions.includes("framekit.attachments.cleanup")) {
+      throw new FramekitError("FORBIDDEN", "Missing framekit.attachments.cleanup permission", 403);
+    }
+    const referenced = new Set<string>();
+    for (const baseDoctype of this.app.modules.flatMap((module) => module.doctypes)) {
+      const doctype = await this.getEffectiveDocType(tenant, baseDoctype.name);
+      const attachmentFields = doctype.fields.filter((field) => field.type === "attachments");
+      if (attachmentFields.length === 0) continue;
+      if (doctype.rowPolicy && !this.repository.listForMaintenance) {
+        throw new FramekitError("ATTACHMENT_CLEANUP_UNSUPPORTED", `Repository cannot safely scan row-protected ${doctype.name} attachments`, 501);
+      }
+      let cursor: string | undefined;
+      do {
+        const page = this.repository.listForMaintenance
+          ? await this.repository.listForMaintenance(tenant, doctype, { cursor, limit: 100 })
+          : this.repository.listPage
+          ? await this.repository.listPage(tenant, doctype, { cursor, limit: 100 })
+          : { items: await this.repository.list(tenant, doctype, { cursor, limit: 100 }), nextCursor: undefined };
+        for (const document of page.items) {
+          for (const field of attachmentFields) for (const attachment of attachmentList(document.data[field.name])) referenced.add(attachment.storageKey);
+        }
+        cursor = page.nextCursor;
+      } while (cursor);
+    }
+    const prefix = `${encodeURIComponent(tenant.tenantId)}/${encodeURIComponent(this.app.name)}/`;
+    const candidates = (await this.attachmentStorage.list(prefix)).filter((key) => !referenced.has(key) && !this.activeAttachmentKeys.has(key));
+    if (candidates.length > 0 && !this.attachmentStorage.deleteIfUnleased) {
+      throw new FramekitError("ATTACHMENT_CLEANUP_UNSUPPORTED", "Attachment storage must support atomic age-and-lease-guarded deletion for safe cleanup.", 501);
+    }
+    const orphaned: string[] = [];
+    for (const key of candidates) {
+      if (await this.attachmentStorage.deleteIfUnleased?.(key, { minimumAgeMs: 60_000 })) orphaned.push(key);
+    }
+    return orphaned;
+  }
+
   private async changeDocumentStatus(
     tenant: TenantContext,
     doctypeName: string,
@@ -1231,7 +1425,8 @@ export class FramekitRuntime {
     input: DocumentData,
     inserting: boolean,
     protectedData: DocumentData = {},
-    clientInput: DocumentData = input
+    clientInput: DocumentData = input,
+    managedFields = new Set<string>()
   ): DocumentData {
     const output: DocumentData = {};
     const fieldNames = new Set(doctype.fields.map((field) => field.name));
@@ -1250,7 +1445,27 @@ export class FramekitRuntime {
         });
       }
     }
-    for (const field of doctype.fields.filter((candidate) => !candidate.computed)) {
+    for (const field of doctype.fields) {
+      const value = input[field.name] ?? field.default;
+      if (field.type === "attachments") {
+        if (inserting && value !== undefined && (!Array.isArray(value) || value.length > 0)) {
+          throw new FramekitError("ATTACHMENTS_MANAGED", `Field "${field.label}" can only change through attachment commands`, 422);
+        }
+        output[field.name] = managedFields.has(field.name) ? value ?? [] : protectedData[field.name] ?? [];
+        continue;
+      }
+      if (field.type === "children") {
+        output[field.name] = this.normalizeChildren(doctype, field, value ?? [], inserting ? [] : protectedData[field.name]);
+        if (field.required && (output[field.name] as ChildRecord[]).length === 0) {
+          throw new FramekitError("VALIDATION_FAILED", `Field "${field.label}" requires at least one child row`, 422);
+        }
+        continue;
+      }
+      if (field.required && (value === undefined || value === null || value === "")) {
+        throw new FramekitError("VALIDATION_FAILED", `Field "${field.label}" is required`, 422);
+      }
+    }
+    for (const field of doctype.fields.filter((candidate) => !candidate.computed && candidate.type !== "children" && candidate.type !== "attachments")) {
       const value = input[field.name] ?? field.default;
       if (field.readOnly && !inserting) {
         if (protectedData[field.name] !== undefined) output[field.name] = protectedData[field.name];
@@ -1267,7 +1482,8 @@ export class FramekitRuntime {
       output[field.name] = computeFieldValue(doctype.name, field, output);
       pending.delete(field.name);
     }
-    const violations = doctype.fields.flatMap((field) => validateFieldValue(doctype.name, field, output[field.name]));
+    const violations = doctype.fields.filter((field) => field.type !== "children" && field.type !== "attachments")
+      .flatMap((field) => validateFieldValue(doctype.name, field, output[field.name]));
     if (violations.length > 0) {
       throw new FramekitError("FIELD_VALIDATION_FAILED", "One or more fields failed validation.", 422, { violations });
     }
@@ -1278,6 +1494,53 @@ export class FramekitRuntime {
     const document = await this.repository.get(tenant, doctype, id, { access: "write" });
     if (!document) throw new FramekitError("DOCUMENT_NOT_FOUND", `No ${doctype.name} document with id "${id}"`, 404);
     return document;
+  }
+
+  private normalizeChildren(doctype: DocTypeDefinition, field: DocTypeDefinition["fields"][number], value: unknown, existingValue: unknown): ChildRecord[] {
+    if (!Array.isArray(value)) throw new FramekitError("VALIDATION_FAILED", `${doctype.name}.${field.name} must be an array`, 422);
+    const existing = new Map((Array.isArray(existingValue) ? existingValue : []).map((row) => [(row as ChildRecord).id, row as ChildRecord]));
+    const seen = new Set<string>();
+    return value.map((candidate, position) => {
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) throw new FramekitError("VALIDATION_FAILED", `${doctype.name}.${field.name}[${position}] must be an object`, 422);
+      const supplied = candidate as Record<string, unknown>;
+      if (Object.hasOwn(supplied, "data")) {
+        const unknownEnvelopeFields = Object.keys(supplied).filter((key) => !["id", "position", "data"].includes(key));
+        if (unknownEnvelopeFields.length > 0) {
+          throw new FramekitError("FIELD_VALIDATION_FAILED", "One or more child fields failed validation.", 422, {
+            violations: unknownEnvelopeFields.map((name) => ({ field: `${field.name}.${name}`, rule: "schema", code: "unknown_field" }))
+          });
+        }
+      }
+      if (Object.hasOwn(supplied, "id") && typeof supplied.id !== "string") {
+        throw new FramekitError("VALIDATION_FAILED", `${doctype.name}.${field.name}[${position}].id must be a string`, 422);
+      }
+      if (Object.hasOwn(supplied, "position") && (!Number.isInteger(supplied.position) || Number(supplied.position) < 0)) {
+        throw new FramekitError("VALIDATION_FAILED", `${doctype.name}.${field.name}[${position}].position must be a non-negative integer`, 422);
+      }
+      const id = typeof supplied.id === "string" ? supplied.id : undefined;
+      if (id && (!existing.has(id) || seen.has(id))) throw new FramekitError("INVALID_CHILD_ID", `Child row "${id}" does not belong to this parent`, 422);
+      if (id) seen.add(id);
+      const rawData = supplied.data && typeof supplied.data === "object" && !Array.isArray(supplied.data) ? supplied.data as DocumentData : supplied;
+      const childNames = new Set((field.fields ?? []).map((childField) => childField.name));
+      const unknownFields = Object.keys(rawData).filter((key) => !childNames.has(key) && !(rawData === supplied && ["id", "position"].includes(key)));
+      if (unknownFields.length > 0) {
+        throw new FramekitError("FIELD_VALIDATION_FAILED", "One or more child fields failed validation.", 422, {
+          violations: unknownFields.map((name) => ({ field: `${field.name}.${name}`, rule: "schema", code: "unknown_field" }))
+        });
+      }
+      const data: DocumentData = {};
+      for (const childField of field.fields ?? []) {
+        const childValue = rawData[childField.name] ?? childField.default;
+        if (childField.required && (childValue === undefined || childValue === null || childValue === "")) {
+          throw new FramekitError("VALIDATION_FAILED", `Child field "${childField.label}" is required`, 422);
+        }
+        const nestedField = { ...childField, name: `${field.name}.${childField.name}` } as FieldDefinition;
+        if (childValue !== undefined) data[childField.name] = coerceFieldValue(doctype.name, nestedField, childValue);
+        const violations = validateFieldValue(doctype.name, nestedField, data[childField.name]);
+        if (violations.length > 0) throw new FramekitError("FIELD_VALIDATION_FAILED", "One or more child fields failed validation.", 422, { violations });
+      }
+      return { id: id ?? this.idGenerator(), position, data };
+    });
   }
 
   private assertListOptions(doctype: DocTypeDefinition, options: ListOptions = {}): void {
@@ -1299,6 +1562,25 @@ export class FramekitRuntime {
           linkTo: linkedDocType.name,
           value
         });
+      }
+    }
+    for (const field of doctype.fields.filter((candidate) => candidate.type === "children")) {
+      const rows = Array.isArray(data[field.name]) ? data[field.name] as ChildRecord[] : [];
+      for (const childField of (field.fields ?? []).filter((candidate) => candidate.type === "link" && candidate.linkTo)) {
+        const linkedDocType = await this.getEffectiveDocType(tenant, childField.linkTo!);
+        for (const row of rows) {
+          const value = row.data[childField.name];
+          if (value === undefined || value === null || value === "") continue;
+          const linked = await this.repository.get(tenant, linkedDocType, String(value));
+          if (!linked) {
+            throw new FramekitError("LINK_NOT_FOUND", `${doctype.name}.${field.name}.${childField.name} references missing ${linkedDocType.name} "${String(value)}"`, 422, {
+              doctype: doctype.name,
+              field: `${field.name}.${childField.name}`,
+              linkTo: linkedDocType.name,
+              value
+            });
+          }
+        }
       }
     }
   }
@@ -1572,6 +1854,12 @@ export class InMemoryDocumentRepository implements DocumentRepository {
     return applyListOptionsPage(records, options, doctype);
   }
 
+  async listForMaintenance(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentPage> {
+    validateListOptions(doctype, options);
+    const records = [...this.records.values()].filter((record) => record.tenantId === tenant.tenantId && record.doctype === doctype.name);
+    return applyListOptionsPage(records, options, doctype);
+  }
+
   async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { access?: "read" | "write" } = {}): Promise<DocumentRecord | undefined> {
     const record = this.records.get(keyFor(tenant.tenantId, doctype.name, id));
     if (record && !hasRowAccess(tenant, doctype, options.access ?? "read", record.ownerId)) return undefined;
@@ -1655,6 +1943,54 @@ export class InMemoryDocumentRepository implements DocumentRepository {
         });
       }
     }
+  }
+}
+
+export class InMemoryAttachmentStorage implements AttachmentStorage {
+  private readonly objects = new Map<string, { bytes: Uint8Array; createdAt: number; leaseOwner?: string; leaseUntil?: number }>();
+
+  constructor(private readonly currentTime: () => number = Date.now) {}
+
+  describe(): RepositoryDiagnostics {
+    return { kind: "memory-attachments", durable: false, features: ["put", "get", "delete", "list", "leases", "conditional-delete"] };
+  }
+
+  async put(key: string, bytes: Uint8Array, metadata: { contentType: string; lease?: { owner: string; durationMs: number } }): Promise<void> {
+    const now = this.currentTime();
+    this.objects.set(key, {
+      bytes: new Uint8Array(bytes), createdAt: now,
+      ...(metadata.lease ? { leaseOwner: metadata.lease.owner, leaseUntil: now + metadata.lease.durationMs } : {})
+    });
+  }
+
+  async get(key: string): Promise<Uint8Array | undefined> {
+    const object = this.objects.get(key);
+    return object ? new Uint8Array(object.bytes) : undefined;
+  }
+
+  async delete(key: string): Promise<void> {
+    this.objects.delete(key);
+  }
+
+  async list(prefix: string): Promise<string[]> {
+    return [...this.objects.keys()].filter((key) => key.startsWith(prefix)).sort();
+  }
+
+  async releaseLease(key: string, owner: string): Promise<void> {
+    const object = this.objects.get(key);
+    if (object?.leaseOwner === owner) {
+      delete object.leaseOwner;
+      delete object.leaseUntil;
+    }
+  }
+
+  async deleteIfUnleased(key: string, options: { minimumAgeMs: number }): Promise<boolean> {
+    const object = this.objects.get(key);
+    if (!object) return false;
+    const now = this.currentTime();
+    if (now - object.createdAt < options.minimumAgeMs || (object.leaseUntil !== undefined && object.leaseUntil > now)) return false;
+    this.objects.delete(key);
+    return true;
   }
 }
 
@@ -2099,6 +2435,10 @@ function mutationFingerprint(operation: string, doctype: string, value: unknown)
   });
 }
 
+async function sha256Digest(bytes: Uint8Array): Promise<string> {
+  return `sha256:${base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new Uint8Array(bytes))))}`;
+}
+
 function commandFingerprint(tenant: TenantContext, commandId: string, operations: DocumentCommandOperation[]): string {
   return mutationFingerprint(`command:${commandId}`, commandId, {
     principal: commandPrincipal(tenant),
@@ -2126,6 +2466,20 @@ function assertDraftDocument(document: DocumentRecord, action: string): void {
   if (document.documentStatus !== "draft") {
     throw new FramekitError("DOCUMENT_NOT_DRAFT", `Cannot ${action} ${document.doctype} "${document.id}" after submission`, 409);
   }
+}
+
+function attachmentField(doctype: DocTypeDefinition, fieldName: string): DocTypeDefinition["fields"][number] {
+  const field = doctype.fields.find((candidate) => candidate.name === fieldName && candidate.type === "attachments");
+  if (!field) throw new FramekitError("ATTACHMENT_FIELD_NOT_FOUND", `${doctype.name}.${fieldName} is not an attachment field`, 404);
+  return field;
+}
+
+function attachmentList(value: unknown): AttachmentMetadata[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((candidate): candidate is AttachmentMetadata => Boolean(
+    candidate && typeof candidate === "object" && typeof (candidate as AttachmentMetadata).id === "string" &&
+    typeof (candidate as AttachmentMetadata).storageKey === "string"
+  ));
 }
 
 function requireExpectedRevisionForRetry(options: MutationOptions): void {
@@ -2165,6 +2519,8 @@ function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollba
       throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing field ${change.doctype}.${change.field} cannot restore deleted values automatically.`, 409);
     case "change_field_type":
       return { kind: "change_field_type", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
+    case "change_collection_schema":
+      return { kind: "change_collection_schema", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
     case "add_index":
       return { kind: "remove_index", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
     case "remove_index":
@@ -2198,7 +2554,7 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration plan identity, schema checksums, uniqueness metadata, and changes are required.", 422);
   }
   const identifier = /^[a-z][a-z0-9_]*$/;
-  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint", "change_row_policy"]);
+  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "change_collection_schema", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint", "change_row_policy"]);
   const constraints = [...plan.fromUniqueConstraints, ...plan.toUniqueConstraints];
   if (constraints.some((constraint) => !constraint || !identifier.test(constraint.doctype) || !identifier.test(constraint.field))) {
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration uniqueness metadata contains an invalid DocType or field identifier.", 422);
@@ -2393,13 +2749,13 @@ export function assertDestructiveMigration(plan: MigrationPlan, options: { allow
 }
 
 export function migrationChangeIsDestructive(change: Pick<MigrationChange, "kind"> | MigrationRollback): boolean {
-  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type" || change.kind === "change_row_policy";
+  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type" || change.kind === "change_collection_schema" || change.kind === "change_row_policy";
 }
 
 export function assertSupportedMigration(plan: MigrationPlan): void {
-  const unsupported = plan.changes.filter((change) => change.kind === "change_field_type");
+  const unsupported = plan.changes.filter((change) => change.kind === "change_field_type" || change.kind === "change_collection_schema");
   if (unsupported.length > 0) {
-    throw new FramekitError("UNSUPPORTED_MIGRATION_CONVERSION", "Automatic field type conversion is not supported; provide an operator-reviewed data migration.", 422, unsupported);
+    throw new FramekitError("UNSUPPORTED_MIGRATION_CONVERSION", "Automatic field or collection-schema conversion is not supported; provide an operator-reviewed data migration.", 422, unsupported);
   }
 }
 

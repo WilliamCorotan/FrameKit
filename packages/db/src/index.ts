@@ -312,6 +312,14 @@ export class PostgresDocumentRepository implements DocumentRepository {
   }
 
   async listPage(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentPage> {
+    return this.listPageWithPolicy(tenant, doctype, options, true);
+  }
+
+  async listForMaintenance(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentPage> {
+    return this.listPageWithPolicy(tenant, doctype, options, false);
+  }
+
+  private async listPageWithPolicy(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions, enforceRowPolicy: boolean): Promise<DocumentPage> {
     validateListOptions(doctype, options);
     const sort = normalizedDocumentSort(options.sort);
     const sortField = doctype.fields.find((field) => field.name === sort.field);
@@ -320,9 +328,9 @@ export class PostgresDocumentRepository implements DocumentRepository {
     const conditions: SQL[] = [
       eq(framekitDocuments.tenantId, tenant.tenantId),
       eq(framekitDocuments.doctype, doctype.name),
-      compileRowPolicy(tenant, doctype, "read"),
       ...compileDocumentFilters(doctype, options.filters)
     ];
+    if (enforceRowPolicy) conditions.push(compileRowPolicy(tenant, doctype, "read"));
     if (options.search) {
       const pattern = containsPattern(options.search.toLowerCase());
       const searchableFields = doctype.fields.filter((field) => field.type !== "json");
@@ -2204,6 +2212,8 @@ function statementsForChange(tenantId: string, change: MigrationChange | Migrati
       ];
     case "change_field_type":
       return [`-- change_field_type ${change.doctype}.${change.field}: no safe automatic JSONB cast generated`];
+    case "change_collection_schema":
+      return [`-- change_collection_schema ${change.doctype}.${change.field}: validate or backfill existing JSONB values before deployment`];
     case "add_index":
       return [`create index if not exists ${indexIdentifier(change, "idx")} on framekit_documents (tenant_id, doctype, ${indexExpressions(change.field).join(", ")}) where doctype = ${sqlLiteral(change.doctype)};`];
     case "remove_index":
@@ -2604,6 +2614,8 @@ function rollbackFromChange(change: MigrationChange): MigrationRollback {
       throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing field ${change.doctype}.${change.field} cannot restore deleted values automatically.`, 409);
     case "change_field_type":
       return { kind: "change_field_type", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
+    case "change_collection_schema":
+      return { kind: "change_collection_schema", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
     case "add_index":
       return { kind: "remove_index", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
     case "remove_index":
