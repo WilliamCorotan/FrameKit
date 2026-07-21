@@ -4,6 +4,8 @@ Framekit document records expose an integer `revision` that starts at `1`. Every
 
 Production Postgres runtimes should configure `PostgresMutationUnitOfWork` alongside the read stores. It commits the document change, durable unique-value reservations, audit event, outbox event, and idempotency result in one transaction. Post-write hook failures abort that transaction. Realtime publication happens only after commit; a publication failure is returned to the caller while the pending durable outbox event remains available for dispatch.
 
+The mutation migration creates the durable unique-reservation table for new UOW writes. It cannot infer DocType metadata to backfill rows written by older releases. Before enabling concurrent writes on an upgraded database, retain the existing generated JSONB unique indexes or backfill reservations for legacy records.
+
 ## Idempotent retries
 
 Send `Idempotency-Key` for commands that may be retried. Keys are scoped to a tenant and retained in `framekit_idempotency_keys` until explicitly removed by an operator retention policy.
