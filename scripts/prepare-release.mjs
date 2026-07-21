@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isValidSemVer } from "./semver.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = process.argv.slice(2);
@@ -11,7 +12,7 @@ const write = args.includes("--write");
 const tag = args.includes("--tag");
 const packageDirectories = ["auth", "cli", "core", "db", "jobs", "nitro", "openapi", "realtime", "runtime", "sdk"];
 
-if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+if (!isValidSemVer(version)) {
   throw new Error("Usage: pnpm release:prepare -- --version <semver> [--write] [--tag]");
 }
 if (tag && !write) throw new Error("--tag requires --write.");

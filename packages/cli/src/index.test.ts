@@ -2,14 +2,20 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createExecutableMigrationArtifact, createRuntime, migrationChecksum } from "@framekit/runtime";
-import { runCli } from "./index.js";
+import { isValidSemVer, runCli } from "./index.js";
+import { isValidSemVer as isValidReleaseSemVer } from "../../../scripts/semver.mjs";
 
 describe("framekit CLI", () => {
+  it.each([
+    ["0.0.0", true], ["1.2.3", true], ["1.2.3-alpha.1", true], ["1.2.3+build.5", true],
+    ["1.2.3-alpha.1+build.5", true], ["01.2.3", false], ["1.02.3", false], ["1.2.03", false],
+    ["1.2.3-01", false], ["1.2.3-..", false], ["1.2.3-", false], ["1.2.3+", false], ["1.2.3+a..b", false]
+  ] as const)("validates strict SemVer 2.0 version %s", (version, valid) => {
+    expect(isValidSemVer(version)).toBe(valid);
+    expect(isValidReleaseSemVer(version)).toBe(valid);
+  });
   it("creates a standalone server scaffold with published dependencies and a local TypeScript config", async () => {
     await inTemporaryDirectory(async (directory) => {
       await runCli(["create-app", "Standalone Notes"], { log: () => undefined });

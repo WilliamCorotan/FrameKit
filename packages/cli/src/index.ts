@@ -354,10 +354,15 @@ async function pathExists(path: string): Promise<boolean> {
 
 async function framekitVersion(): Promise<string> {
   const manifest = JSON.parse(await readFile(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")) as { version?: unknown };
-  if (typeof manifest.version !== "string" || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(manifest.version)) {
+  if (!isValidSemVer(manifest.version)) {
     throw new Error("@framekit/cli package version is not valid semver.");
   }
   return manifest.version;
+}
+
+export function isValidSemVer(value: unknown): value is string {
+  return typeof value === "string"
+    && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.test(value);
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
