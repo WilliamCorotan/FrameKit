@@ -325,10 +325,16 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     let rollbackId = 0;
     const rollbackRuntime = createRuntime(defineApp({ name: app.name, modules: [defineModule({
       id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType, securedDocType, securedReferenceDocType],
-      hooks: { afterUpdate: { secured_record: [({ document }) => { if (document?.data.title === "Rollback" && document.ownerId === "bob") throw new Error("injected transfer hook failure"); }] } }
+      hooks: {
+        beforeOwnerTransfer: { secured_record: [({ document }) => { if (document?.data.title === "Mutation") { document.revision = 999; document.ownerId = "mallory"; document.data.title = "mutated"; } }] },
+        afterOwnerTransfer: { secured_record: [({ document }) => {
+          if (document?.data.title === "Rollback" && document.ownerId === "bob") throw new Error("injected transfer hook failure");
+          if (document?.data.title === "Mutation") { document.revision = 999; document.ownerId = "mallory"; document.data.title = "mutated"; }
+        }] }
+      }
     })] }), {
       repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
-      idGenerator: () => `rollback-${++rollbackId}`
+      idGenerator: () => `x${String(++rollbackId).padStart(7, "0")}`
     });
     const rollbackRecord = await rollbackRuntime.create(alice, "secured_record", { title: "Rollback", code: "rollback-code" });
     await expect(rollbackRuntime.transferOwner(manager, "secured_record", rollbackRecord.id, "bob", { expectedRevision: 1 })).rejects.toThrow("injected transfer hook failure");
@@ -339,6 +345,18 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     expect(rollbackRows).toEqual([{ ownerId: "alice", revision: 1, title: "Rollback" }]);
     await expect(rollbackRuntime.get(alice, "secured_record", rollbackRecord.id)).resolves.toMatchObject({ ownerId: "alice", revision: 1 });
     await expect(rollbackRuntime.get(bob, "secured_record", rollbackRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    const mutationRecord = await rollbackRuntime.create(alice, "secured_record", { title: "Mutation", code: "mutation-code" });
+    const mutationTransfer = await rollbackRuntime.transferOwner(manager, "secured_record", mutationRecord.id, "bob", { expectedRevision: 1, idempotencyKey: "pg-transfer-mutation" });
+    expect(mutationTransfer).toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "Mutation", code: "mutation-code" } });
+    const mutationRows = await sql<{ ownerId: string; revision: number; title: string }[]>`
+      select owner_id as "ownerId", revision, data ->> 'title' as title from framekit_documents where tenant_id = ${tenant.tenantId} and id = ${mutationRecord.id}
+    `;
+    expect(mutationRows).toEqual([{ ownerId: "bob", revision: 2, title: "Mutation" }]);
+    const transferOutbox = await sql<{ payload: Record<string, unknown> }[]>`
+      select payload from framekit_outbox_events where tenant_id = ${tenant.tenantId} and type = 'secured_record.owner.transferred' and payload ->> 'id' = ${mutationRecord.id}
+    `;
+    expect(transferOutbox[0]?.payload).toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "Mutation", code: "mutation-code" } });
+    await expect(rollbackRuntime.transferOwner(manager, "secured_record", mutationRecord.id, "bob", { expectedRevision: 1, idempotencyKey: "pg-transfer-mutation" })).resolves.toEqual(mutationTransfer);
     const transferred = await runtime.transferOwner(manager, "secured_record", aliceRecord.id, "bob", { expectedRevision: aliceRecord.revision });
     expect(transferred).toMatchObject({ ownerId: "bob", revision: 2 });
     const rows = await sql<{ ownerId: string }[]>`select owner_id as "ownerId" from framekit_documents where tenant_id = ${tenant.tenantId} and id = ${aliceRecord.id}`;

@@ -84,9 +84,8 @@ export type MutationCommand = {
   expectedRevision?: number;
   idempotencyKey?: string;
   idempotencyFingerprint: string;
-  audit: AuditEvent;
-  outbox: OutboxEvent;
-  afterWrite(): Promise<void>;
+  sideEffects: { audit: AuditEvent; outbox: OutboxEvent } | ((persisted: DocumentRecord) => { audit: AuditEvent; outbox: OutboxEvent });
+  afterWrite(persisted?: DocumentRecord): Promise<void>;
 };
 
 export type MutationUnitOfWork = LifecycleResource & {
@@ -678,8 +677,7 @@ export class FramekitRuntime {
           document,
           idempotencyKey: options.idempotencyKey,
           idempotencyFingerprint: fingerprint,
-          audit,
-          outbox,
+          sideEffects: { audit, outbox },
           afterWrite: () => this.runHooks("afterInsert", tenant, doctype, document, data)
         })
       : { document: await this.createWithoutUnitOfWork(tenant, doctype, document, data, audit, outbox), replayed: false };
@@ -717,8 +715,7 @@ export class FramekitRuntime {
           expectedRevision,
           idempotencyKey: options.idempotencyKey,
           idempotencyFingerprint: fingerprint,
-          audit,
-          outbox,
+          sideEffects: { audit, outbox },
           afterWrite: () => this.runHooks("afterUpdate", tenant, doctype, updated, data)
         })
       : { document: await this.updateWithoutUnitOfWork(tenant, doctype, updated, data, expectedRevision, audit, outbox), replayed: false };
@@ -748,8 +745,7 @@ export class FramekitRuntime {
         expectedRevision,
         idempotencyKey: options.idempotencyKey,
         idempotencyFingerprint: fingerprint,
-        audit,
-        outbox,
+        sideEffects: { audit, outbox },
         afterWrite: () => this.runHooks("afterDelete", tenant, doctype, existing, existing.data)
       });
       if (execution.replayed) return;
@@ -805,8 +801,7 @@ export class FramekitRuntime {
           expectedRevision,
           idempotencyKey: options.idempotencyKey,
           idempotencyFingerprint: fingerprint,
-          audit,
-          outbox,
+          sideEffects: { audit, outbox },
           afterWrite: () => this.runHooks("afterTransition", tenant, doctype, updated, data)
         })
       : { document: await this.updateWithoutUnitOfWork(tenant, doctype, updated, data, expectedRevision, audit, outbox, "afterTransition"), replayed: false };
@@ -840,16 +835,18 @@ export class FramekitRuntime {
     if (!existing) throw new FramekitError("DOCUMENT_NOT_FOUND", `No ${doctype.name} document with id "${id}"`, 404);
     const expectedRevision = options.expectedRevision ?? existing.revision;
     const updated: DocumentRecord = { ...existing, ownerId, revision: existing.revision + 1, updatedAt: this.now().toISOString() };
-    await this.runHooks("beforeUpdate", tenant, doctype, updated, updated.data);
-    const audit = this.createAuditEvent(tenant, "transfer_owner", updated);
-    const outbox = this.createOutboxEvent(tenant, "owner.transferred", updated);
+    await this.runImmutableHooks("beforeOwnerTransfer", tenant, doctype, updated);
     const execution = this.mutations
       ? await this.mutations.execute({
           operation: "transfer_owner", tenant, doctype, document: updated, expectedRevision,
-          idempotencyKey: options.idempotencyKey, idempotencyFingerprint: fingerprint, audit, outbox,
-          afterWrite: () => this.runHooks("afterUpdate", tenant, doctype, updated, updated.data)
+          idempotencyKey: options.idempotencyKey, idempotencyFingerprint: fingerprint,
+          sideEffects: (persisted) => ({
+            audit: this.createAuditEvent(tenant, "transfer_owner", persisted),
+            outbox: this.createOutboxEvent(tenant, "owner.transferred", persisted)
+          }),
+          afterWrite: (persisted) => this.runImmutableHooks("afterOwnerTransfer", tenant, doctype, persisted!)
         })
-      : { document: await this.transferOwnerWithoutUnitOfWork(tenant, doctype, updated, expectedRevision, audit, outbox), replayed: false };
+      : { document: await this.transferOwnerWithoutUnitOfWork(tenant, doctype, updated, expectedRevision), replayed: false };
     const saved = execution.document!;
     if (!execution.replayed) await this.publishDocumentEvent(tenant, "owner.transferred", saved);
     return saved;
@@ -901,8 +898,7 @@ export class FramekitRuntime {
           expectedRevision,
           idempotencyKey: options.idempotencyKey,
           idempotencyFingerprint: fingerprint,
-          audit,
-          outbox,
+          sideEffects: { audit, outbox },
           afterWrite: () => this.runHooks(afterHook, tenant, doctype, updated, data)
         })
       : { document: await this.updateWithoutUnitOfWork(tenant, doctype, updated, data, expectedRevision, audit, outbox, afterHook), replayed: false };
@@ -1034,6 +1030,15 @@ export class FramekitRuntime {
     }
   }
 
+  private async runImmutableHooks(name: "beforeOwnerTransfer" | "afterOwnerTransfer", tenant: TenantContext, doctype: DocTypeDefinition, document: DocumentRecord): Promise<void> {
+    for (const module of this.app.modules) {
+      for (const hook of module.hooks?.[name]?.[doctype.name] ?? []) {
+        const snapshot = structuredClone(document);
+        await hook({ app: this.app, doctype, tenant, document: snapshot, input: structuredClone(snapshot.data) });
+      }
+    }
+  }
+
   private createAuditEvent(tenant: TenantContext, action: string, document: DocumentRecord): AuditEvent {
     return {
       id: this.idGenerator(),
@@ -1100,11 +1105,11 @@ export class FramekitRuntime {
     return saved;
   }
 
-  private async transferOwnerWithoutUnitOfWork(tenant: TenantContext, doctype: DocTypeDefinition, document: DocumentRecord, expectedRevision: number, audit: AuditEvent, outbox: OutboxEvent): Promise<DocumentRecord> {
+  private async transferOwnerWithoutUnitOfWork(tenant: TenantContext, doctype: DocTypeDefinition, document: DocumentRecord, expectedRevision: number): Promise<DocumentRecord> {
     const saved = await this.repository.transferOwner(tenant, doctype, document.id, document.ownerId!, { expectedRevision, updatedAt: document.updatedAt });
-    await this.runHooks("afterUpdate", tenant, doctype, saved, saved.data);
-    await this.audit.record(audit);
-    await this.outbox.record(outbox);
+    await this.runImmutableHooks("afterOwnerTransfer", tenant, doctype, saved);
+    await this.audit.record(this.createAuditEvent(tenant, "transfer_owner", saved));
+    await this.outbox.record(this.createOutboxEvent(tenant, "owner.transferred", saved));
     return saved;
   }
 
@@ -1484,9 +1489,10 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
         await this.repository.delete(command.tenant, command.doctype, command.document.id, { expectedRevision: command.expectedRevision });
       }
       wrote = true;
-      await command.afterWrite();
-      await this.audit.record(command.audit);
-      await this.outbox.record(command.outbox);
+      await command.afterWrite(result);
+      const sideEffects = typeof command.sideEffects === "function" ? command.sideEffects(result!) : command.sideEffects;
+      await this.audit.record(sideEffects.audit);
+      await this.outbox.record(sideEffects.outbox);
       if (idempotencyKey) this.idempotency.set(idempotencyKey, { fingerprint: command.idempotencyFingerprint, result: result && cloneRecord(result) });
       return { document: result, replayed: false };
     } catch (error) {

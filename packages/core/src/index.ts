@@ -133,7 +133,9 @@ export const HookNames = [
   "beforeSubmit",
   "afterSubmit",
   "beforeCancel",
-  "afterCancel"
+  "afterCancel",
+  "beforeOwnerTransfer",
+  "afterOwnerTransfer"
 ] as const;
 
 export type HookName = (typeof HookNames)[number];

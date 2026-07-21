@@ -549,16 +549,17 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
           result = command.document;
           await replaceUniqueValues(tx, command);
         } else if (command.operation === "transfer_owner") {
-          const rows = await tx<{ revision: number }[]>`
+          const rows = await tx<typeof framekitDocuments.$inferSelect[]>`
             update framekit_documents
             set owner_id = ${command.document.ownerId!}, revision = ${command.document.revision}, updated_at = ${command.document.updatedAt}
             where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
               and id = ${command.document.id} and revision = ${command.expectedRevision!}
               and ${canTransferOwnership(command.tenant, command.doctype)}
-            returning revision
+            returning tenant_id as "tenantId", doctype, id, revision, document_status as "documentStatus", owner_id as "ownerId", state, data,
+                      created_at as "createdAt", updated_at as "updatedAt"
           `;
           if (!rows[0]) await throwMutationWriteFailure(tx, command);
-          result = command.document;
+          result = rowToRecord(rows[0]!);
         } else {
           const scope = rowPolicyScope(command.tenant, command.doctype, "write");
           const rows = await tx<{ revision: number }[]>`
@@ -576,18 +577,19 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
         }
 
         await this.faultInjector?.("document", command);
-        await command.afterWrite();
+        await command.afterWrite(result);
         await this.faultInjector?.("hooks", command);
+        const sideEffects = typeof command.sideEffects === "function" ? command.sideEffects(result!) : command.sideEffects;
         await tx`
           insert into framekit_audit_events (tenant_id, id, user_id, action, doctype, document_id, created_at)
-          values (${command.audit.tenantId}, ${command.audit.id}, ${command.audit.userId}, ${command.audit.action},
-                  ${command.audit.doctype}, ${command.audit.documentId}, ${command.audit.createdAt})
+          values (${sideEffects.audit.tenantId}, ${sideEffects.audit.id}, ${sideEffects.audit.userId}, ${sideEffects.audit.action},
+                  ${sideEffects.audit.doctype}, ${sideEffects.audit.documentId}, ${sideEffects.audit.createdAt})
         `;
         await this.faultInjector?.("audit", command);
         await tx`
           insert into framekit_outbox_events (tenant_id, id, type, topic, payload, status, attempts, created_at, processed_at, error)
-          values (${command.outbox.tenantId}, ${command.outbox.id}, ${command.outbox.type}, ${command.outbox.topic},
-                  ${tx.json(command.outbox.payload as postgres.JSONValue)}, ${command.outbox.status}, ${command.outbox.attempts}, ${command.outbox.createdAt}, null, null)
+          values (${sideEffects.outbox.tenantId}, ${sideEffects.outbox.id}, ${sideEffects.outbox.type}, ${sideEffects.outbox.topic},
+                  ${tx.json(sideEffects.outbox.payload as postgres.JSONValue)}, ${sideEffects.outbox.status}, ${sideEffects.outbox.attempts}, ${sideEffects.outbox.createdAt}, null, null)
         `;
         await this.faultInjector?.("outbox", command);
         if (command.idempotencyKey) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
+import { defineApp, defineDocType, defineModule, type DocumentHook, type TenantContext } from "@framekit/core";
 import { applyFilters, assertDestructiveMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan } from "./index.js";
 
 const tenant: TenantContext = {
@@ -497,7 +497,7 @@ describe("runtime document service", () => {
     });
     const runtime = createRuntime(defineApp({ name: "Transfer rollback", modules: [defineModule({
       id: "notes", name: "Notes", doctypes: [secured], hooks: {
-        afterUpdate: { owned_note: [({ document }) => { if (document?.ownerId === "bob") throw new Error("injected transfer failure"); }] }
+        afterOwnerTransfer: { owned_note: [({ document }) => { if (document?.ownerId === "bob") throw new Error("injected transfer failure"); }] }
       }
     })] }), { idGenerator: () => "owned-note-1" });
     const alice = { tenantId: "tenant", userId: "alice", roles: [], permissions: [] };
@@ -509,6 +509,32 @@ describe("runtime document service", () => {
     await expect(runtime.get(alice, "owned_note", created.id)).resolves.toMatchObject({ ownerId: "alice", revision: 1, data: { title: "Alice's note" } });
     await expect(runtime.get(bob, "owned_note", created.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
     expect(await runtime.auditTrail(manager)).not.toEqual(expect.arrayContaining([expect.objectContaining({ action: "transfer_owner" })]));
+  });
+
+  it("isolates owner-transfer hook mutation and replays the persisted result exactly", async () => {
+    const secured = defineDocType({
+      name: "transfer_note", label: "Transfer Note", ownership: { transferPermissions: ["notes.transfer"] },
+      fields: [{ name: "title", label: "Title", type: "text", required: true }],
+      rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] }
+    });
+    const mutateSnapshot: DocumentHook = ({ document }) => {
+      if (!document) return;
+      document.revision = 999; document.documentStatus = "cancelled"; document.ownerId = "mallory"; document.data.title = "hook mutation";
+    };
+    const runtime = createRuntime(defineApp({ name: "Transfer snapshot", modules: [defineModule({
+      id: "notes", name: "Notes", doctypes: [secured], hooks: {
+        beforeOwnerTransfer: { transfer_note: [mutateSnapshot] }, afterOwnerTransfer: { transfer_note: [mutateSnapshot] }
+      }
+    })] }), { idGenerator: (() => { let id = 0; return () => `transfer-${++id}`; })() });
+    const alice = { tenantId: "tenant", userId: "alice", roles: [], permissions: [] };
+    const bob = { ...alice, userId: "bob" };
+    const manager = { ...alice, userId: "manager", permissions: ["notes.transfer"] };
+    const created = await runtime.create(alice, "transfer_note", { title: "canonical" });
+    const transferred = await runtime.transferOwner(manager, "transfer_note", created.id, "bob", { expectedRevision: 1, idempotencyKey: "transfer-once" });
+    expect(transferred).toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "canonical" } });
+    await expect(runtime.get(bob, "transfer_note", created.id)).resolves.toEqual(transferred);
+    expect((await runtime.outboxEvents(manager)).find((event) => event.type === "transfer_note.owner.transferred")?.payload).toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "canonical" } });
+    await expect(runtime.transferOwner(manager, "transfer_note", created.id, "bob", { expectedRevision: 1, idempotencyKey: "transfer-once" })).resolves.toEqual(transferred);
   });
 
   it("plans row policy changes as explicit destructive migrations", async () => {
