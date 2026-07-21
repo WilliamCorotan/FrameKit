@@ -2378,7 +2378,12 @@ function indexIdentifier(change: Pick<MigrationChange, "doctype" | "field">, suf
 }
 
 function identifierPart(value: string): string {
-  return value.replaceAll(/[^a-zA-Z0-9_]+/g, "_").replaceAll(/^_+|_+$/g, "").toLowerCase();
+  const normalized = value.replaceAll(/[^a-zA-Z0-9_]+/g, "_");
+  let start = 0;
+  let end = normalized.length;
+  while (normalized[start] === "_") start += 1;
+  while (end > start && normalized[end - 1] === "_") end -= 1;
+  return normalized.slice(start, end).toLowerCase();
 }
 
 function indexExpressions(fields: string): string[] {
