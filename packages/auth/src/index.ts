@@ -309,6 +309,15 @@ export class PasswordAuthService {
 
   private async loginWithProviderIdentity(providerId: string, identity: AuthProviderIdentity, tenantId: string): Promise<AuthSession> {
     const resolvedTenantId = identity.tenantId ?? tenantId;
+    if (identity.providerId !== providerId) {
+      await this.recordAuthAudit({
+        tenantId: resolvedTenantId,
+        action: "provider_login.failed",
+        success: false,
+        details: { providerId, returnedProviderId: identity.providerId, subject: identity.subject, reason: "provider_mismatch" }
+      });
+      throw new FramekitError("PROVIDER_ID_MISMATCH", "Provider identity did not match the selected provider.", 401);
+    }
     const user = await this.resolveProviderUser(identity, resolvedTenantId);
     if (!user) {
       await this.recordAuthAudit({

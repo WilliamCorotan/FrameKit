@@ -309,6 +309,30 @@ describe("PasswordAuthService", () => {
     ]));
   });
 
+  it("binds provider resolution to the selected route before cross-provider link lookup", async () => {
+    const audit = new InMemoryAuthAuditStore();
+    const links = new InMemoryAuthIdentityLinkStore([]);
+    const users = new InMemoryUserStore([
+      { id: "u1", tenantId: "t1", email: "one@example.com", name: "One", passwordHash: await hashPassword("password one"), roles: [], permissions: [] },
+      { id: "u2", tenantId: "t1", email: "two@example.com", name: "Two", passwordHash: await hashPassword("password two"), roles: [], permissions: [] }
+    ]);
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length", userStore: users, identityLinks: links, identityLinkingPolicy: { mode: "linked" }, audit,
+      providers: [
+        { id: "provider-a", authenticate: async ({ tenantId }) => ({ providerId: "provider-b", subject: "shared-subject", tenantId, email: "two@example.com" }) },
+        { id: "provider-b", authenticate: async ({ tenantId }) => ({ providerId: "provider-b", subject: "shared-subject", tenantId, email: "two@example.com" }) }
+      ]
+    });
+    await auth.linkProviderIdentity({ tenantId: "t1", providerId: "provider-a", subject: "shared-subject", userId: "u1" });
+    await auth.linkProviderIdentity({ tenantId: "t1", providerId: "provider-b", subject: "shared-subject", userId: "u2" });
+
+    await expect(auth.loginWithProvider("provider-a", "token", "t1")).rejects.toMatchObject({ code: "PROVIDER_ID_MISMATCH" });
+    await expect(auth.loginWithProvider("provider-b", "token", "t1")).resolves.toMatchObject({ context: { userId: "u2" } });
+    expect(await auth.authAuditEvents("t1")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "provider_login.failed", success: false, details: expect.objectContaining({ providerId: "provider-a", returnedProviderId: "provider-b", reason: "provider_mismatch" }) })
+    ]));
+  });
+
   it("issues expiring single-use invitations and password recovery tokens", async () => {
     const audit = new InMemoryAuthAuditStore();
     const users = new InMemoryUserStore([]);
@@ -353,6 +377,7 @@ describe("PasswordAuthService", () => {
     let forgeSignature = false;
     let audience: string | string[] = "framekit";
     let authorizedParty: string | undefined;
+    let mappedProviderId = "oidc";
     const fetcher: typeof fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith("/.well-known/openid-configuration")) return Response.json({
@@ -373,7 +398,8 @@ describe("PasswordAuthService", () => {
     const links = new InMemoryAuthIdentityLinkStore([]);
     const provider = createOidcAuthorizationCodeProvider({
       id: "oidc", issuer, clientId: "framekit", redirectUri: "https://app.example/api/auth/providers/oidc/callback",
-      flowSecret: "oidc-flow-secret-at-least-thirty-two-characters", stateStore: new InMemoryOidcAuthorizationStateStore(), fetch: fetcher
+      flowSecret: "oidc-flow-secret-at-least-thirty-two-characters", stateStore: new InMemoryOidcAuthorizationStateStore(), fetch: fetcher,
+      mapIdentity: (claims, { tenantId }) => ({ providerId: mappedProviderId, subject: String(claims.sub), tenantId, email: String(claims.email) })
     });
     const auth = new PasswordAuthService({
       secret: "test-secret-with-enough-length", identityLinks: links, identityLinkingPolicy: { mode: "linked" }, providers: [provider],
@@ -404,6 +430,10 @@ describe("PasswordAuthService", () => {
     await expect(completeAudienceCase(["framekit", "another-api"], undefined, "multi-no-azp")).rejects.toMatchObject({ code: "OIDC_AUTHORIZED_PARTY_MISMATCH" });
     await expect(completeAudienceCase(["framekit", "another-api"], "different-client", "multi-wrong-azp")).rejects.toMatchObject({ code: "OIDC_AUTHORIZED_PARTY_MISMATCH" });
     await expect(completeAudienceCase(["framekit", "another-api"], "framekit", "multi-matching-azp")).resolves.toMatchObject({ session: { context: { userId: "u1" } } });
+
+    mappedProviderId = "different-provider";
+    await expect(completeAudienceCase("framekit", undefined, "mapped-provider-attack")).rejects.toMatchObject({ code: "PROVIDER_ID_MISMATCH" });
+    mappedProviderId = "oidc";
 
     const nonceAttack = await auth.beginProviderAuthorization("oidc", { tenantId: "t1" });
     const nonceAttackUrl = new URL(nonceAttack.authorizationUrl);
