@@ -22,6 +22,7 @@ Framekit follows the Dependency Rule: source dependencies point inward.
 
 Metadata invariants, business-document status, lifecycle ordering, and version guarantees are specified in [Metadata and Document Compatibility](./metadata-compatibility.md).
 Ownership, policy composition, and adapter enforcement are specified in [Ownership and Row Permissions](./row-permissions.md).
+Locale fallback, translation keys, typed setting scopes, and secret-storage boundaries are specified in [Localization and Typed Settings](./localization-settings.md).
 
 ## Hostability
 

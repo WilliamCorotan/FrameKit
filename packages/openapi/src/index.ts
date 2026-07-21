@@ -45,11 +45,33 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
     },
     FramekitMetadata: {
       type: "object",
-      required: ["name", "version", "modules"],
+      required: ["name", "version", "locale", "supportedLocales", "messages", "modules"],
       properties: {
         name: { type: "string" },
         version: { type: "string" },
+        locale: { type: "string" },
+        supportedLocales: { type: "array", items: { type: "string" } },
+        messages: { type: "object", additionalProperties: { type: "string" } },
         modules: { type: "array", items: { type: "object", additionalProperties: true } }
+      }
+    },
+    PublicSetting: {
+      type: "object",
+      additionalProperties: false,
+      required: ["key", "label", "type", "scope", "required", "configured", "redacted"],
+      properties: {
+        key: { type: "string" },
+        label: { type: "string" },
+        labelKey: { type: "string" },
+        description: { type: "string" },
+        descriptionKey: { type: "string" },
+        type: { type: "string", enum: ["text", "number", "boolean", "select", "secret"] },
+        scope: { type: "string", enum: ["tenant", "app"] },
+        required: { type: "boolean" },
+        options: { type: "array", items: { type: "string" } },
+        value: { type: ["string", "number", "boolean"] },
+        configured: { type: "boolean" },
+        redacted: { type: "boolean" }
       }
     },
     FramekitDiagnostics: {
@@ -174,6 +196,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: "getMetadata",
         summary: "Read Framekit app metadata",
         tags: ["System"],
+        parameters: [queryParam("locale", "string")],
         responses: okResponse(ref("FramekitMetadata"))
       }
     },
@@ -349,6 +372,27 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
           }
         }, true),
         responses: createdResponse({ type: "object", additionalProperties: true })
+      }
+    },
+    [`${basePath}/settings`]: {
+      get: {
+        operationId: "listSettings",
+        summary: "List localized typed application settings",
+        tags: ["Customization"],
+        parameters: [queryParam("locale", "string")],
+        "x-framekit-permission": "framekit.settings.read",
+        responses: okResponse({ type: "array", items: ref("PublicSetting") })
+      }
+    },
+    [`${basePath}/settings/{key}`]: {
+      put: {
+        operationId: "upsertSetting",
+        summary: "Validate and update an application setting",
+        tags: ["Customization"],
+        parameters: [pathParam("key")],
+        "x-framekit-permission": "framekit.settings.manage",
+        requestBody: jsonBody({ type: "object", additionalProperties: false, required: ["value"], properties: { value: {} } }, true),
+        responses: okResponse(ref("PublicSetting"))
       }
     },
     [`${basePath}/views`]: {
