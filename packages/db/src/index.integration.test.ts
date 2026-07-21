@@ -347,7 +347,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(rollbackRuntime.get(bob, "secured_record", rollbackRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
     const mutationRecord = await rollbackRuntime.create(alice, "secured_record", { title: "Mutation", code: "mutation-code" });
     const mutationTransfer = await rollbackRuntime.transferOwner(manager, "secured_record", mutationRecord.id, "bob", { expectedRevision: 1, idempotencyKey: "pg-transfer-mutation" });
-    expect(mutationTransfer).toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "Mutation", code: "mutation-code" } });
+    expect(mutationTransfer).toEqual({ id: mutationRecord.id, ownerId: "bob", revision: 2, updatedAt: expect.any(String) });
     const mutationRows = await sql<{ ownerId: string; revision: number; title: string }[]>`
       select owner_id as "ownerId", revision, data ->> 'title' as title from framekit_documents where tenant_id = ${tenant.tenantId} and id = ${mutationRecord.id}
     `;
@@ -355,7 +355,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     const transferOutbox = await sql<{ payload: Record<string, unknown> }[]>`
       select payload from framekit_outbox_events where tenant_id = ${tenant.tenantId} and type = 'secured_record.owner.transferred' and payload ->> 'id' = ${mutationRecord.id}
     `;
-    expect(transferOutbox[0]?.payload).toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "Mutation", code: "mutation-code" } });
+    expect(transferOutbox[0]?.payload).toEqual({ doctype: "secured_record", ...mutationTransfer });
+    expect(transferOutbox[0]?.payload).not.toHaveProperty("data");
     await expect(rollbackRuntime.transferOwner(manager, "secured_record", mutationRecord.id, "bob", { expectedRevision: 1, idempotencyKey: "pg-transfer-mutation" })).resolves.toEqual(mutationTransfer);
     const transferred = await runtime.transferOwner(manager, "secured_record", aliceRecord.id, "bob", { expectedRevision: aliceRecord.revision });
     expect(transferred).toMatchObject({ ownerId: "bob", revision: 2 });

@@ -162,6 +162,13 @@ export type DocumentRecord<TData extends DocumentData = DocumentData> = {
   updatedAt: string;
 };
 
+export type OwnerTransferReceipt = {
+  id: string;
+  ownerId: string;
+  revision: number;
+  updatedAt: string;
+};
+
 export type HookContext<TData extends DocumentData = DocumentData> = {
   app: AppDefinition;
   doctype: DocTypeDefinition;

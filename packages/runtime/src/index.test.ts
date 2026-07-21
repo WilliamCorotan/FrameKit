@@ -484,6 +484,7 @@ describe("runtime document service", () => {
     await expect(runtime.transferOwner(bob, "secured_record", aliceRecord.id, "bob")).rejects.toMatchObject({ code: "FORBIDDEN" });
     const transferred = await runtime.transferOwner(manager, "secured_record", aliceRecord.id, "bob", { expectedRevision: aliceRecord.revision });
     expect(transferred).toMatchObject({ ownerId: "bob", revision: 2 });
+    expect(transferred).not.toHaveProperty("data");
     await expect(runtime.get(alice, "secured_record", aliceRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
     await expect(runtime.get(bob, "secured_record", aliceRecord.id)).resolves.toMatchObject({ ownerId: "bob" });
     expect((await runtime.auditTrail(manager)).map((event) => event.action)).toContain("transfer_owner");
@@ -512,6 +513,8 @@ describe("runtime document service", () => {
   });
 
   it("isolates owner-transfer hook mutation and replays the persisted result exactly", async () => {
+    const realtime: unknown[] = [];
+    const listeners: Array<(event: never) => void> = [];
     const secured = defineDocType({
       name: "transfer_note", label: "Transfer Note", ownership: { transferPermissions: ["notes.transfer"] },
       fields: [{ name: "title", label: "Title", type: "text", required: true }],
@@ -525,15 +528,29 @@ describe("runtime document service", () => {
       id: "notes", name: "Notes", doctypes: [secured], hooks: {
         beforeOwnerTransfer: { transfer_note: [mutateSnapshot] }, afterOwnerTransfer: { transfer_note: [mutateSnapshot] }
       }
-    })] }), { idGenerator: (() => { let id = 0; return () => `transfer-${++id}`; })() });
+    })] }), {
+      idGenerator: (() => { let id = 0; return () => `transfer-${++id}`; })(),
+      realtime: {
+        publish(event) { realtime.push(event); for (const listener of listeners) listener(event as never); },
+        subscribe(_channel, listener) { listeners.push(listener as (event: never) => void); return () => undefined; }
+      }
+    });
     const alice = { tenantId: "tenant", userId: "alice", roles: [], permissions: [] };
     const bob = { ...alice, userId: "bob" };
     const manager = { ...alice, userId: "manager", permissions: ["notes.transfer"] };
+    const subscribed: unknown[] = [];
+    await runtime.subscribeRealtime(manager, (event) => subscribed.push(event));
     const created = await runtime.create(alice, "transfer_note", { title: "canonical" });
     const transferred = await runtime.transferOwner(manager, "transfer_note", created.id, "bob", { expectedRevision: 1, idempotencyKey: "transfer-once" });
-    expect(transferred).toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "canonical" } });
-    await expect(runtime.get(bob, "transfer_note", created.id)).resolves.toEqual(transferred);
-    expect((await runtime.outboxEvents(manager)).find((event) => event.type === "transfer_note.owner.transferred")?.payload).toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "canonical" } });
+    expect(transferred).toEqual({ id: created.id, ownerId: "bob", revision: 2, updatedAt: expect.any(String) });
+    await expect(runtime.get(bob, "transfer_note", created.id)).resolves.toMatchObject({ ownerId: "bob", revision: 2, documentStatus: "draft", data: { title: "canonical" } });
+    const payload = (await runtime.outboxEvents(manager)).find((event) => event.type === "transfer_note.owner.transferred")?.payload;
+    expect(payload).toEqual({ doctype: "transfer_note", ...transferred });
+    expect(payload).not.toHaveProperty("data");
+    expect(realtime.at(-1)).toMatchObject({ type: "transfer_note.owner.transferred", payload: { doctype: "transfer_note", ...transferred } });
+    expect((realtime.at(-1) as { payload: object }).payload).not.toHaveProperty("data");
+    expect(subscribed.at(-1)).toEqual(realtime.at(-1));
+    await expect(runtime.get(alice, "transfer_note", created.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
     await expect(runtime.transferOwner(manager, "transfer_note", created.id, "bob", { expectedRevision: 1, idempotencyKey: "transfer-once" })).resolves.toEqual(transferred);
   });
 

@@ -57,6 +57,8 @@ describe("createNitroHandler", () => {
       method: "POST", headers: { ...headers, "if-match": String(cancelled.revision) }, body: { ownerId: " reviewer " }
     });
     expect(transferred).toMatchObject({ revision: cancelled.revision + 1, ownerId: "reviewer" });
+    expect(transferred).not.toHaveProperty("data");
+    expect(transferred).not.toHaveProperty("documentStatus");
   });
 
   it("emits telemetry hooks and applies the optional rate limiter", async () => {

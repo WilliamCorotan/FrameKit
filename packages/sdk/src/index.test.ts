@@ -60,6 +60,13 @@ describe("generateSdkTypes", () => {
     ]);
   });
 
+  it("returns only the narrow ownership transfer receipt", async () => {
+    vi.mocked(ofetch).mockResolvedValue({ id: "note-1", ownerId: "user-2", revision: 6, updatedAt: "2026-07-21T00:00:00.000Z" } as never);
+    const receipt = await createClient({ baseUrl: "http://localhost:3000" }).transferOwner("note", "note-1", "user-2", { expectedRevision: 5 });
+    expect(receipt).toEqual({ id: "note-1", ownerId: "user-2", revision: 6, updatedAt: "2026-07-21T00:00:00.000Z" });
+    expect(receipt).not.toHaveProperty("data");
+  });
+
   it("covers identity linking, invitations, and recovery endpoint parity", async () => {
     vi.mocked(ofetch).mockResolvedValue({} as never);
     const client = createClient({ baseUrl: "https://app.example", token: "session" });

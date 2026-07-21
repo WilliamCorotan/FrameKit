@@ -60,6 +60,9 @@ describe("createOpenApiDocument", () => {
     expect(doc.paths["/api/doctypes/deal/{id}/transition"]).toBeDefined();
     expect(doc.paths["/api/doctypes/deal/{id}/submit"]?.post?.operationId).toBe("submitDeal");
     expect(doc.paths["/api/doctypes/deal/{id}/cancel"]?.post?.operationId).toBe("cancelDeal");
+    expect(JSON.stringify(doc.paths["/api/doctypes/deal/{id}/owner"]?.post?.responses)).toContain("OwnerTransferReceipt");
+    expect(doc.components.schemas.OwnerTransferReceipt).toMatchObject({ required: ["id", "ownerId", "revision", "updatedAt"], additionalProperties: false });
+    expect(doc.components.schemas.OwnerTransferReceipt?.properties).not.toHaveProperty("data");
     expect(doc.paths["/api/doctypes/deal/{id}/owner"]?.post?.operationId).toBe("transferDealOwner");
     const listDeal = doc.paths["/api/doctypes/deal"]?.get;
     expect(JSON.stringify(listDeal?.parameters)).toContain("cursor");

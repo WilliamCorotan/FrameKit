@@ -64,6 +64,10 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         warnings: { type: "array", items: { type: "string" } }
       }
     },
+    OwnerTransferReceipt: {
+      type: "object", required: ["id", "ownerId", "revision", "updatedAt"], additionalProperties: false,
+      properties: { id: { type: "string" }, ownerId: { type: "string" }, revision: { type: "integer" }, updatedAt: { type: "string", format: "date-time" } }
+    },
     AuthUser: {
       type: "object",
       required: ["id", "tenantId", "email", "name", "roles", "permissions"],
@@ -725,7 +729,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
           tags: [doctype.label],
           parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
           requestBody: jsonBody({ type: "object", required: ["ownerId"], properties: { ownerId: { type: "string", minLength: 1, pattern: ".*\\S.*" } } }, true),
-          responses: okResponse(ref(recordName))
+          responses: okResponse(ref("OwnerTransferReceipt"))
         }
       };
     }

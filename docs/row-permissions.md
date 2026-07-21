@@ -28,6 +28,8 @@ The authenticated creator is always assigned as `ownerId`. Create/update input c
 
 Ownership transfer has dedicated `beforeOwnerTransfer` and `afterOwnerTransfer` notification hooks. Each hook receives an isolated snapshot: mutations are ignored, while a thrown error aborts the transfer. The persisted repository result is the single source for the API response, audit/outbox payloads, and idempotency replay; generic update hooks cannot alter transfer data, status, state, or revision.
 
+A caller holding transfer permission does not implicitly gain read permission. `transferOwner` therefore returns only `{ id, ownerId, revision, updatedAt }`. Its outbox and realtime events add only the DocType name to that receipt and never include document data, status, state, or the previous owner. A Desk or service that also has read permission may fetch the document separately after transfer.
+
 Denied rows are indistinguishable from absent rows (`DOCUMENT_NOT_FOUND`). Lists filter before pagination. Link validation uses the caller's read policy, so hidden targets cannot be referenced. Uniqueness remains tenant-wide and is enforced by the durable reservation table without returning the conflicting document id.
 
 PostgreSQL compiles the effective rule set to `true`, `false`, or a parameterized `owner_id = userId` predicate. The predicate is included in list/get SQL and in update/delete unit-of-work statements; filtering is never performed after sensitive rows are fetched.

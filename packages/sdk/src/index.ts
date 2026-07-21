@@ -1,5 +1,5 @@
 import { ofetch } from "ofetch";
-import { listDocTypes, type AppDefinition, type DocumentData, type DocumentRecord, type FieldDefinition, type TenantContext } from "@framekit/core";
+import { listDocTypes, type AppDefinition, type DocumentData, type DocumentRecord, type FieldDefinition, type OwnerTransferReceipt, type TenantContext } from "@framekit/core";
 
 export type AuthUser = {
   id: string;
@@ -468,7 +468,7 @@ export class FramekitClient {
     return this.request(`/api/doctypes/${doctype}/${id}/cancel`, { method: "POST", headers: mutationHeaders(options) });
   }
 
-  transferOwner<TData extends DocumentData = DocumentData>(doctype: string, id: string, ownerId: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
+  transferOwner(doctype: string, id: string, ownerId: string, options: MutationRequestOptions = {}): Promise<OwnerTransferReceipt> {
     return this.request(`/api/doctypes/${doctype}/${id}/owner`, { method: "POST", body: { ownerId }, headers: mutationHeaders(options) });
   }
 

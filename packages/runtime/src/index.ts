@@ -15,6 +15,7 @@ import {
   type DocumentData,
   type DocumentRecord,
   type HookName,
+  type OwnerTransferReceipt,
   type TenantContext,
   type ViewDefinition
 } from "@framekit/core";
@@ -818,7 +819,7 @@ export class FramekitRuntime {
     return this.changeDocumentStatus(tenant, doctypeName, id, "cancel", "cancelled", "beforeCancel", "afterCancel", options);
   }
 
-  async transferOwner(tenant: TenantContext, doctypeName: string, id: string, ownerId: string, options: MutationOptions = {}): Promise<DocumentRecord> {
+  async transferOwner(tenant: TenantContext, doctypeName: string, id: string, ownerId: string, options: MutationOptions = {}): Promise<OwnerTransferReceipt> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     if (!doctype.ownership) throw new FramekitError("OWNERSHIP_NOT_ENABLED", `${doctype.name} does not enable ownership`, 400);
     assertPermission(tenant, doctype, "transfer_owner");
@@ -830,7 +831,7 @@ export class FramekitRuntime {
     requireExpectedRevisionForRetry(options);
     const fingerprint = mutationFingerprint("transfer_owner", doctype.name, { id, ownerId, expectedRevision: options.expectedRevision });
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
-    if (replay) return replay;
+    if (replay) return ownerTransferReceipt(replay);
     const existing = await this.repository.getForOwnerTransfer(tenant, doctype, id);
     if (!existing) throw new FramekitError("DOCUMENT_NOT_FOUND", `No ${doctype.name} document with id "${id}"`, 404);
     const expectedRevision = options.expectedRevision ?? existing.revision;
@@ -842,14 +843,14 @@ export class FramekitRuntime {
           idempotencyKey: options.idempotencyKey, idempotencyFingerprint: fingerprint,
           sideEffects: (persisted) => ({
             audit: this.createAuditEvent(tenant, "transfer_owner", persisted),
-            outbox: this.createOutboxEvent(tenant, "owner.transferred", persisted)
+            outbox: this.createOwnerTransferOutboxEvent(tenant, persisted)
           }),
           afterWrite: (persisted) => this.runImmutableHooks("afterOwnerTransfer", tenant, doctype, persisted!)
         })
       : { document: await this.transferOwnerWithoutUnitOfWork(tenant, doctype, updated, expectedRevision), replayed: false };
     const saved = execution.document!;
-    if (!execution.replayed) await this.publishDocumentEvent(tenant, "owner.transferred", saved);
-    return saved;
+    if (!execution.replayed) await this.publishOwnerTransferEvent(tenant, saved);
+    return ownerTransferReceipt(saved);
   }
 
   private async changeDocumentStatus(
@@ -1073,6 +1074,13 @@ export class FramekitRuntime {
     };
   }
 
+  private createOwnerTransferOutboxEvent(tenant: TenantContext, document: DocumentRecord): OutboxEvent {
+    return {
+      id: this.idGenerator(), tenantId: tenant.tenantId, type: `${document.doctype}.owner.transferred`, topic: document.doctype,
+      payload: { doctype: document.doctype, ...ownerTransferReceipt(document) }, status: "pending", attempts: 0, createdAt: this.now().toISOString()
+    };
+  }
+
   private async createWithoutUnitOfWork(
     tenant: TenantContext,
     doctype: DocTypeDefinition,
@@ -1109,7 +1117,7 @@ export class FramekitRuntime {
     const saved = await this.repository.transferOwner(tenant, doctype, document.id, document.ownerId!, { expectedRevision, updatedAt: document.updatedAt });
     await this.runImmutableHooks("afterOwnerTransfer", tenant, doctype, saved);
     await this.audit.record(this.createAuditEvent(tenant, "transfer_owner", saved));
-    await this.outbox.record(this.createOutboxEvent(tenant, "owner.transferred", saved));
+    await this.outbox.record(this.createOwnerTransferOutboxEvent(tenant, saved));
     return saved;
   }
 
@@ -1150,6 +1158,13 @@ export class FramekitRuntime {
         state: document.state,
         data: document.data
       }
+    });
+  }
+
+  private async publishOwnerTransferEvent(tenant: TenantContext, document: DocumentRecord): Promise<void> {
+    await this.realtime.publish({
+      channel: `tenant:${tenant.tenantId}:documents`, type: `${document.doctype}.owner.transferred`,
+      payload: { doctype: document.doctype, ...ownerTransferReceipt(document) }
     });
   }
 }
@@ -1637,6 +1652,10 @@ export class NoopRealtimePublisher implements RealtimePublisher {
 
 export function createRuntime(app: AppDefinition, options?: RuntimeOptions): FramekitRuntime {
   return new FramekitRuntime(app, options);
+}
+
+function ownerTransferReceipt(document: DocumentRecord): OwnerTransferReceipt {
+  return { id: document.id, ownerId: document.ownerId!, revision: document.revision, updatedAt: document.updatedAt };
 }
 
 function keyFor(tenantId: string, doctype: string, id: string): string {
