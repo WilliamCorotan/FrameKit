@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Activity, Boxes, Check, Database, FileClock, FilePlus, KeyRound, LogOut, Radio, RefreshCw, Save, Search, Settings, Shield, Users } from "lucide-react";
+import { Activity, Boxes, Check, ChevronLeft, ChevronRight, Database, FileClock, FilePlus, KeyRound, LogOut, Radio, RefreshCw, Save, Search, Settings, Shield, Trash2, Users } from "lucide-react";
 import "./styles.css";
 
 type FieldDefinition = {
@@ -112,6 +112,7 @@ type CustomField = {
 type DeskSection = "documents" | "users" | "roles" | "tokens" | "audit" | "outbox" | "diagnostics" | "customization";
 
 const apiUrl = import.meta.env.VITE_FRAMEKIT_API_URL ?? "http://localhost:3000";
+const pageSize = 5;
 
 function App() {
   const [token, setToken] = useState(() => window.localStorage.getItem("framekit.token") ?? "");
@@ -124,6 +125,7 @@ function App() {
   const [selected, setSelected] = useState<DocumentRecord | undefined>();
   const [draft, setDraft] = useState<Record<string, unknown>>({});
   const [query, setQuery] = useState("");
+  const [page, setPage] = useState(0);
   const [status, setStatus] = useState("Loading metadata");
 
   const doctypes = useMemo(() => metadata?.modules.flatMap((module) => module.doctypes) ?? [], [metadata]);
@@ -146,18 +148,27 @@ function App() {
     if (!active || section !== "documents") {
       return;
     }
-    void refresh(active.name, query);
-  }, [active?.name, query, section]);
+    void refresh(active.name, query, page);
+  }, [active?.name, query, page, section]);
 
   async function login() {
-    setStatus("Signing in");
-    const session = await fetchJson<{ token: string }>("/api/auth/login", { method: "POST", body: { email, password } });
-    window.localStorage.setItem("framekit.token", session.token);
-    setToken(session.token);
-    setStatus("Ready");
+    try {
+      setStatus("Signing in…");
+      const session = await fetchJson<{ token: string }>("/api/auth/login", { method: "POST", body: { email, password } });
+      window.localStorage.setItem("framekit.token", session.token);
+      setToken(session.token);
+      setStatus("Ready");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
   }
 
-  function logout() {
+  async function logout() {
+    try {
+      await fetchJson("/api/auth/logout", { method: "POST", token });
+    } catch {
+      // Local sign-out must still complete when the session is already invalid.
+    }
     window.localStorage.removeItem("framekit.token");
     setToken("");
     setMetadata(undefined);
@@ -165,40 +176,75 @@ function App() {
     setSelected(undefined);
   }
 
-  async function refresh(doctype = activeDocType, search = query) {
-    setStatus("Syncing");
-    const suffix = search ? `?search=${encodeURIComponent(search)}` : "";
-    const list = await fetchJson<DocumentRecord[]>(`/api/doctypes/${doctype}${suffix}`, { token });
-    setRecords(list);
-    setSelected(list[0]);
-    setDraft(list[0]?.data ?? {});
-    setStatus("Ready");
+  async function refresh(doctype = activeDocType, search = query, targetPage = page) {
+    try {
+      setStatus("Syncing…");
+      const params = new URLSearchParams({ limit: String(pageSize), offset: String(targetPage * pageSize) });
+      if (search) {
+        params.set("search", search);
+      }
+      const list = await fetchJson<DocumentRecord[]>(`/api/doctypes/${doctype}?${params}`, { token });
+      setRecords(list);
+      setSelected(list[0]);
+      setDraft(list[0]?.data ?? {});
+      setStatus("Ready");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
   }
 
   async function save() {
     if (!active) {
       return;
     }
-    setStatus("Saving");
-    const record = selected
-      ? await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { method: "PATCH", body: draft, token })
-      : await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}`, { method: "POST", body: draft, token });
-    setSelected(record);
-    setDraft(record.data);
-    await refresh(active.name, query);
-    setStatus("Saved");
+    try {
+      setStatus("Saving…");
+      const creating = !selected;
+      const record = selected
+        ? await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { method: "PATCH", body: draft, token })
+        : await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}`, { method: "POST", body: draft, token });
+      setSelected(record);
+      setDraft(record.data);
+      if (creating) {
+        setPage(0);
+      }
+      await refresh(active.name, query, creating ? 0 : page);
+      setStatus("Saved");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
   }
 
   async function transition(action: string) {
     if (!active || !selected) {
       return;
     }
-    setStatus("Transitioning");
-    const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/transition`, { method: "POST", body: { action }, token });
-    setSelected(record);
-    setDraft(record.data);
-    await refresh(active.name, query);
-    setStatus("Transitioned");
+    try {
+      setStatus("Transitioning…");
+      const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/transition`, { method: "POST", body: { action }, token });
+      setSelected(record);
+      setDraft(record.data);
+      await refresh(active.name, query, page);
+      setStatus("Transitioned");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
+  }
+
+  async function removeDocument() {
+    if (!active || !selected || !window.confirm(`Delete ${selected.id}? This cannot be undone.`)) {
+      return;
+    }
+    try {
+      setStatus("Deleting…");
+      await fetchJson(`/api/doctypes/${active.name}/${selected.id}`, { method: "DELETE", token });
+      const targetPage = records.length === 1 && page > 0 ? page - 1 : page;
+      setPage(targetPage);
+      await refresh(active.name, query, targetPage);
+      setStatus("Deleted");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
   }
 
   function startNew() {
@@ -217,27 +263,29 @@ function App() {
 
   if (!token) {
     return (
-      <main className="login-shell">
-        <section className="login-panel" aria-labelledby="login-title">
+      <main className="login-shell" id="main-content">
+        <form className="login-panel" aria-labelledby="login-title" onSubmit={(event) => { event.preventDefault(); void login(); }}>
           <div className="mark"><Boxes size={24} /> Framekit</div>
           <p className="eyebrow">Desk sign in</p>
           <h1 id="login-title">Metadata operations console</h1>
           <label className="field">
             <span>Email</span>
-            <input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} />
+            <input name="email" type="email" autoComplete="username" spellCheck={false} value={email} onChange={(event) => setEmail(event.target.value)} />
           </label>
           <label className="field">
             <span>Password</span>
-            <input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} />
+            <input name="password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} />
           </label>
-          <button className="primary wide" onClick={() => void login()}><KeyRound size={16} /> Sign in</button>
-          <p className="status" role="status">{status}</p>
-        </section>
+          <button type="submit" className="primary wide"><KeyRound size={16} /> Sign in</button>
+          <p className="status" role="status" aria-live="polite">{status}</p>
+        </form>
       </main>
     );
   }
 
   return (
+    <>
+    <a className="skip-link" href="#desk-main">Skip to main content</a>
     <main className="desk">
       <aside className="rail">
         <div className="mark"><Boxes size={22} /> Framekit</div>
@@ -256,11 +304,11 @@ function App() {
           <button className={section === "audit" ? "active" : ""} onClick={() => setSection("audit")}><FileClock size={17} /><span>Audit</span></button>
           <button className={section === "outbox" ? "active" : ""} onClick={() => setSection("outbox")}><Radio size={17} /><span>Outbox</span></button>
           <button className={section === "diagnostics" ? "active" : ""} onClick={() => setSection("diagnostics")}><Activity size={17} /><span>Diagnostics</span></button>
-          <button onClick={logout}><LogOut size={17} /><span>Sign out</span></button>
+          <button onClick={() => void logout()}><LogOut size={17} /><span>Sign out</span></button>
         </nav>
       </aside>
 
-      <section className="workbench" aria-label="Desk workbench">
+      <section className="workbench" aria-label="Desk workbench" id="desk-main" tabIndex={-1}>
         {section === "users" || section === "roles" || section === "tokens" ? <AdminPanel section={section} token={token} status={status} setStatus={setStatus} /> : null}
         {section === "audit" || section === "outbox" || section === "diagnostics" || section === "customization" ? <OperationsPanel section={section} token={token} doctypes={doctypes} status={status} setStatus={setStatus} /> : null}
         {section === "documents" ? (
@@ -273,10 +321,10 @@ function App() {
           <div className="toolbar">
             <label className="search">
               <Search size={16} />
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter records" />
+              <input name="record-search" aria-label="Filter records" autoComplete="off" value={query} onChange={(event) => { setQuery(event.target.value); setPage(0); }} placeholder="Filter records…" />
             </label>
-            <button onClick={() => void refresh()} title="Refresh"><RefreshCw size={16} /></button>
-            <button onClick={startNew} title="New document"><FilePlus size={16} /></button>
+            <button onClick={() => void refresh()} aria-label="Refresh records"><RefreshCw size={16} /></button>
+            <button onClick={startNew} aria-label="New document"><FilePlus size={16} /></button>
           </div>
         </header>
 
@@ -284,7 +332,7 @@ function App() {
           <section className="list">
             <div className="list-head">
               <span>{records.length} records</span>
-              <span>{status}</span>
+              <span role="status" aria-live="polite">{status}</span>
             </div>
             {records.map((record) => (
               <button key={record.id} className={selected?.id === record.id ? "row selected" : "row"} onClick={() => { setSelected(record); setDraft(record.data); }}>
@@ -292,6 +340,11 @@ function App() {
                 <span>{listFields.map((field) => String(record.data[field.name] ?? "")).filter(Boolean).join(" · ") || record.doctype}</span>
               </button>
             ))}
+            <div className="pagination" aria-label="Record pagination">
+              <button onClick={() => setPage((current) => Math.max(0, current - 1))} disabled={page === 0} aria-label="Previous page"><ChevronLeft size={16} /> Previous</button>
+              <span>Page {page + 1}</span>
+              <button onClick={() => setPage((current) => current + 1)} disabled={records.length < pageSize} aria-label="Next page">Next <ChevronRight size={16} /></button>
+            </div>
           </section>
 
           <section className="editor">
@@ -300,7 +353,10 @@ function App() {
                 <p className="eyebrow">{selected ? selected.id : "New document"}</p>
                 <h2>{active?.description ?? "Metadata-generated form"}</h2>
               </div>
-              <button className="primary" onClick={() => void save()}><Save size={16} /> Save</button>
+              <div className="editor-actions">
+                {selected ? <button className="danger" onClick={() => void removeDocument()}><Trash2 size={16} /> Delete</button> : null}
+                <button className="primary" onClick={() => void save()}><Save size={16} /> Save</button>
+              </div>
             </div>
 
             <div className="fields">
@@ -326,6 +382,7 @@ function App() {
         ) : null}
       </section>
     </main>
+    </>
   );
 }
 
@@ -341,59 +398,74 @@ function AdminPanel({ section, token, status, setStatus }: { section: "users" | 
   }, [section]);
 
   async function refresh() {
-    setStatus("Syncing");
-    if (section === "users") {
-      setUsers(await fetchJson<AuthUser[]>("/api/auth/users", { token }));
+    try {
+      setStatus("Syncing…");
+      if (section === "users") {
+        setUsers(await fetchJson<AuthUser[]>("/api/auth/users", { token }));
+      }
+      if (section === "roles") {
+        setRoles(await fetchJson<AuthRole[]>("/api/auth/roles", { token }));
+      }
+      if (section === "tokens") {
+        setTokens(await fetchJson<ApiToken[]>("/api/auth/tokens", { token }));
+      }
+      setStatus("Ready");
+    } catch (error) {
+      setStatus(errorMessage(error));
     }
-    if (section === "roles") {
-      setRoles(await fetchJson<AuthRole[]>("/api/auth/roles", { token }));
-    }
-    if (section === "tokens") {
-      setTokens(await fetchJson<ApiToken[]>("/api/auth/tokens", { token }));
-    }
-    setStatus("Ready");
   }
 
   async function submit() {
-    setStatus("Saving");
-    if (section === "users") {
-      await fetchJson<AuthUser>("/api/auth/users", {
-        method: "POST",
-        token,
-        body: {
-          id: form.id,
-          email: form.email,
-          name: form.name,
-          password: form.password,
-          roles: csv(form.roles),
-          permissions: csv(form.permissions)
-        }
-      });
+    try {
+      setStatus("Saving…");
+      if (section === "users") {
+        await fetchJson<AuthUser>("/api/auth/users", {
+          method: "POST",
+          token,
+          body: {
+            id: form.id,
+            email: form.email,
+            name: form.name,
+            password: form.password,
+            roles: csv(form.roles),
+            permissions: csv(form.permissions)
+          }
+        });
+      }
+      if (section === "roles") {
+        await fetchJson<AuthRole>("/api/auth/roles", {
+          method: "POST",
+          token,
+          body: { id: form.id, name: form.name, permissions: csv(form.permissions) }
+        });
+      }
+      if (section === "tokens") {
+        const created = await fetchJson<CreatedApiToken>("/api/auth/tokens", {
+          method: "POST",
+          token,
+          body: { id: form.id, name: form.name, roles: csv(form.roles), permissions: csv(form.permissions) }
+        });
+        setCreatedToken(created.token);
+      }
+      setForm({});
+      await refresh();
+    } catch (error) {
+      setStatus(errorMessage(error));
     }
-    if (section === "roles") {
-      await fetchJson<AuthRole>("/api/auth/roles", {
-        method: "POST",
-        token,
-        body: { id: form.id, name: form.name, permissions: csv(form.permissions) }
-      });
-    }
-    if (section === "tokens") {
-      const created = await fetchJson<CreatedApiToken>("/api/auth/tokens", {
-        method: "POST",
-        token,
-        body: { id: form.id, name: form.name, roles: csv(form.roles), permissions: csv(form.permissions) }
-      });
-      setCreatedToken(created.token);
-    }
-    setForm({});
-    await refresh();
   }
 
   async function remove(id: string) {
-    setStatus("Deleting");
-    const path = section === "users" ? `/api/auth/users/${id}` : section === "roles" ? `/api/auth/roles/${id}` : `/api/auth/tokens/${id}`;
-    await fetchJson(path, { method: "DELETE", token });
-    await refresh();
+    if (!window.confirm(`Delete ${id}? This cannot be undone.`)) {
+      return;
+    }
+    try {
+      setStatus("Deleting…");
+      const path = section === "users" ? `/api/auth/users/${id}` : section === "roles" ? `/api/auth/roles/${id}` : `/api/auth/tokens/${id}`;
+      await fetchJson(path, { method: "DELETE", token });
+      await refresh();
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
   }
 
   const items = section === "users" ? users : section === "roles" ? roles : tokens;
@@ -415,25 +487,26 @@ function AdminPanel({ section, token, status, setStatus }: { section: "users" | 
               <p className="eyebrow">Create</p>
               <h2>{title}</h2>
             </div>
-            <button className="primary" onClick={() => void submit()}><Save size={16} /> Save</button>
+            <button className="primary" onClick={() => void submit()} aria-label={`Save ${title}`}><Save size={16} /> Save</button>
           </div>
           <div className="fields">
-            <label className="field"><span>ID</span><input value={form.id ?? ""} onChange={(event) => setForm((next) => ({ ...next, id: event.target.value }))} /></label>
-            <label className="field"><span>Name</span><input value={form.name ?? ""} onChange={(event) => setForm((next) => ({ ...next, name: event.target.value }))} /></label>
-            {section === "users" ? <label className="field"><span>Email</span><input value={form.email ?? ""} onChange={(event) => setForm((next) => ({ ...next, email: event.target.value }))} /></label> : null}
-            {section === "users" ? <label className="field"><span>Password</span><input type="password" value={form.password ?? ""} onChange={(event) => setForm((next) => ({ ...next, password: event.target.value }))} /></label> : null}
-            {section !== "roles" ? <label className="field"><span>Roles</span><input value={form.roles ?? ""} onChange={(event) => setForm((next) => ({ ...next, roles: event.target.value }))} placeholder="administrator,sales" /></label> : null}
-            <label className="field"><span>Permissions</span><input value={form.permissions ?? ""} onChange={(event) => setForm((next) => ({ ...next, permissions: event.target.value }))} placeholder="*,crm.customer.read" /></label>
+            <label className="field"><span>ID</span><input name={`${section}-id`} autoComplete="off" value={form.id ?? ""} onChange={(event) => setForm((next) => ({ ...next, id: event.target.value }))} /></label>
+            <label className="field"><span>Name</span><input name={`${section}-name`} autoComplete="off" value={form.name ?? ""} onChange={(event) => setForm((next) => ({ ...next, name: event.target.value }))} /></label>
+            {section === "users" ? <label className="field"><span>Email</span><input name="user-email" type="email" autoComplete="off" spellCheck={false} value={form.email ?? ""} onChange={(event) => setForm((next) => ({ ...next, email: event.target.value }))} /></label> : null}
+            {section === "users" ? <label className="field"><span>Password</span><input name="user-password" type="password" autoComplete="new-password" value={form.password ?? ""} onChange={(event) => setForm((next) => ({ ...next, password: event.target.value }))} /></label> : null}
+            {section !== "roles" ? <label className="field"><span>Roles</span><input name={`${section}-roles`} autoComplete="off" value={form.roles ?? ""} onChange={(event) => setForm((next) => ({ ...next, roles: event.target.value }))} placeholder="administrator,sales…" /></label> : null}
+            <label className="field"><span>Permissions</span><input name={`${section}-permissions`} autoComplete="off" value={form.permissions ?? ""} onChange={(event) => setForm((next) => ({ ...next, permissions: event.target.value }))} placeholder="*,crm.customer.read…" /></label>
           </div>
           {createdToken ? <p className="token-copy">{createdToken}</p> : null}
         </section>
         <section className="list">
-          <div className="list-head"><span>{items.length} records</span><span>{status}</span></div>
+          <div className="list-head"><span>{items.length} records</span><span role="status" aria-live="polite">{status}</span></div>
           {items.map((item) => (
-            <button key={item.id} className="row" onClick={() => void remove(item.id)}>
+            <div key={item.id} className="row passive">
               <strong>{item.id}</strong>
               <span>{adminItemLabel(item)} · {item.permissions.join(", ") || "no permissions"}{"revokedAt" in item && item.revokedAt ? " · revoked" : ""}</span>
-            </button>
+              <div className="row-actions"><button className="danger" onClick={() => void remove(item.id)}>Delete {item.id}</button></div>
+            </div>
           ))}
         </section>
       </div>
@@ -453,47 +526,59 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
   }, [section]);
 
   async function refresh() {
-    setStatus("Syncing");
-    if (section === "audit") {
-      setAudit(await fetchJson<AuditEvent[]>("/api/audit?limit=50", { token }));
+    try {
+      setStatus("Syncing…");
+      if (section === "audit") {
+        setAudit(await fetchJson<AuditEvent[]>("/api/audit?limit=50", { token }));
+      }
+      if (section === "outbox") {
+        setOutbox(await fetchJson<OutboxEvent[]>("/api/outbox?limit=50", { token }));
+      }
+      if (section === "diagnostics") {
+        setDiagnostics(await fetchJson<Diagnostics>("/api/diagnostics", { token }));
+      }
+      if (section === "customization") {
+        setCustomFields(await fetchJson<CustomField[]>("/api/custom-fields", { token }));
+      }
+      setStatus("Ready");
+    } catch (error) {
+      setStatus(errorMessage(error));
     }
-    if (section === "outbox") {
-      setOutbox(await fetchJson<OutboxEvent[]>("/api/outbox?limit=50", { token }));
-    }
-    if (section === "diagnostics") {
-      setDiagnostics(await fetchJson<Diagnostics>("/api/diagnostics", { token }));
-    }
-    if (section === "customization") {
-      setCustomFields(await fetchJson<CustomField[]>("/api/custom-fields", { token }));
-    }
-    setStatus("Ready");
   }
 
   async function addCustomField() {
-    setStatus("Saving");
-    await fetchJson<CustomField>("/api/custom-fields", {
-      method: "POST",
-      token,
-      body: {
-        doctype: form.doctype ?? doctypes[0]?.name,
-        field: {
-          name: form.name,
-          label: form.label,
-          type: form.type || "text",
-          options: csv(form.options),
-          inList: form.inList === "true",
-          required: form.required === "true"
+    try {
+      setStatus("Saving…");
+      await fetchJson<CustomField>("/api/custom-fields", {
+        method: "POST",
+        token,
+        body: {
+          doctype: form.doctype ?? doctypes[0]?.name,
+          field: {
+            name: form.name,
+            label: form.label,
+            type: form.type || "text",
+            options: csv(form.options),
+            inList: form.inList === "true",
+            required: form.required === "true"
+          }
         }
-      }
-    });
-    setForm({});
-    await refresh();
+      });
+      setForm({});
+      await refresh();
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
   }
 
   async function markOutbox(id: string, action: "dispatch" | "fail") {
-    setStatus("Updating");
-    await fetchJson(`/api/outbox/${id}/${action}`, { method: "POST", token, body: action === "fail" ? { error: "Marked failed from Desk" } : undefined });
-    await refresh();
+    try {
+      setStatus("Updating…");
+      await fetchJson(`/api/outbox/${id}/${action}`, { method: "POST", token, body: action === "fail" ? { error: "Marked failed from Desk" } : undefined });
+      await refresh();
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
   }
 
   const title = section === "audit" ? "Audit Trail" : section === "outbox" ? "Outbox" : section === "diagnostics" ? "Diagnostics" : "Customization";
@@ -519,12 +604,12 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
               <button className="primary" onClick={() => void addCustomField()}><Save size={16} /> Save</button>
             </div>
             <div className="fields">
-              <label className="field"><span>DocType</span><select value={form.doctype ?? doctypes[0]?.name ?? ""} onChange={(event) => setForm((next) => ({ ...next, doctype: event.target.value }))}>{doctypes.map((doctype) => <option key={doctype.name} value={doctype.name}>{doctype.label}</option>)}</select></label>
-              <label className="field"><span>Name</span><input value={form.name ?? ""} onChange={(event) => setForm((next) => ({ ...next, name: event.target.value }))} /></label>
-              <label className="field"><span>Label</span><input value={form.label ?? ""} onChange={(event) => setForm((next) => ({ ...next, label: event.target.value }))} /></label>
-              <label className="field"><span>Type</span><select value={form.type ?? "text"} onChange={(event) => setForm((next) => ({ ...next, type: event.target.value }))}><option value="text">Text</option><option value="number">Number</option><option value="currency">Currency</option><option value="boolean">Boolean</option><option value="select">Select</option><option value="date">Date</option></select></label>
-              <label className="field"><span>Options</span><input value={form.options ?? ""} onChange={(event) => setForm((next) => ({ ...next, options: event.target.value }))} placeholder="open,won,lost" /></label>
-              <label className="field"><span>List Field</span><select value={form.inList ?? "false"} onChange={(event) => setForm((next) => ({ ...next, inList: event.target.value }))}><option value="false">No</option><option value="true">Yes</option></select></label>
+              <label className="field"><span>DocType</span><select name="custom-doctype" value={form.doctype ?? doctypes[0]?.name ?? ""} onChange={(event) => setForm((next) => ({ ...next, doctype: event.target.value }))}>{doctypes.map((doctype) => <option key={doctype.name} value={doctype.name}>{doctype.label}</option>)}</select></label>
+              <label className="field"><span>Name</span><input name="custom-name" autoComplete="off" value={form.name ?? ""} onChange={(event) => setForm((next) => ({ ...next, name: event.target.value }))} /></label>
+              <label className="field"><span>Label</span><input name="custom-label" autoComplete="off" value={form.label ?? ""} onChange={(event) => setForm((next) => ({ ...next, label: event.target.value }))} /></label>
+              <label className="field"><span>Type</span><select name="custom-type" value={form.type ?? "text"} onChange={(event) => setForm((next) => ({ ...next, type: event.target.value }))}><option value="text">Text</option><option value="number">Number</option><option value="currency">Currency</option><option value="boolean">Boolean</option><option value="select">Select</option><option value="date">Date</option></select></label>
+              <label className="field"><span>Options</span><input name="custom-options" autoComplete="off" value={form.options ?? ""} onChange={(event) => setForm((next) => ({ ...next, options: event.target.value }))} placeholder="open, won, lost…" /></label>
+              <label className="field"><span>List Field</span><select name="custom-in-list" value={form.inList ?? "false"} onChange={(event) => setForm((next) => ({ ...next, inList: event.target.value }))}><option value="false">No</option><option value="true">Yes</option></select></label>
             </div>
           </section>
           <RecordList items={customFields.map((field) => ({ id: field.id, label: `${field.doctype}.${field.field.name}`, detail: `${field.field.label} · ${field.field.type}` }))} status={status} />
@@ -535,7 +620,7 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
 
       {section === "outbox" ? (
         <section className="list operation-list">
-          <div className="list-head"><span>{outbox.length} events</span><span>{status}</span></div>
+          <div className="list-head"><span>{outbox.length} events</span><span role="status" aria-live="polite">{status}</span></div>
           {outbox.map((event) => (
             <div key={event.id} className="row passive">
               <strong>{event.type}</strong>
@@ -559,7 +644,7 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
             </section>
           ))}
           <section className="list operation-list">
-            <div className="list-head"><span>{diagnostics.warnings.length} warnings</span><span>{status}</span></div>
+            <div className="list-head"><span>{diagnostics.warnings.length} warnings</span><span role="status" aria-live="polite">{status}</span></div>
             {diagnostics.warnings.map((warning) => <div key={warning} className="row passive"><strong>{warning}</strong></div>)}
           </section>
         </div>
@@ -571,7 +656,7 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
 function RecordList({ items, status }: { items: Array<{ id: string; label: string; detail: string }>; status: string }) {
   return (
     <section className="list operation-list">
-      <div className="list-head"><span>{items.length} records</span><span>{status}</span></div>
+      <div className="list-head"><span>{items.length} records</span><span role="status" aria-live="polite">{status}</span></div>
       {items.map((item) => (
         <div key={item.id} className="row passive">
           <strong>{item.label}</strong>
@@ -625,12 +710,25 @@ async function fetchJson<T>(path: string, options: { method?: string; body?: unk
     headers
   });
   if (!response.ok) {
-    throw new Error(await response.text());
+    const text = await response.text();
+    try {
+      const payload = JSON.parse(text) as { message?: unknown };
+      throw new Error(typeof payload.message === "string" ? payload.message : `Request failed (${response.status}).`);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new Error(text || `Request failed (${response.status}).`);
+      }
+      throw error;
+    }
   }
   if (response.status === 204) {
     return undefined as T;
   }
   return response.json() as Promise<T>;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Request failed. Try again.";
 }
 
 function csv(value: string | undefined): string[] {

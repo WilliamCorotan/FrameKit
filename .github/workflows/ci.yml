@@ -93,3 +93,35 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @framekit/desk exec playwright install --with-deps chromium
       - run: pnpm test:desk:browser
+
+  desk-fullstack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: framekit
+          POSTGRES_PASSWORD: framekit
+          POSTGRES_DB: framekit_desk
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U framekit -d framekit_desk"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @framekit/desk exec playwright install --with-deps chromium firefox
+      - run: pnpm test:desk:fullstack
+        env:
+          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit_desk
