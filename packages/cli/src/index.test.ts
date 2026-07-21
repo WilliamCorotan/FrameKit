@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -24,7 +24,10 @@ describe("framekit CLI", () => {
       expect(JSON.parse(await readFile(join(directory, "standalone-notes/tsconfig.json"), "utf8"))).not.toHaveProperty("extends");
       expect(await readFile(join(directory, "standalone-notes/src/app.ts"), "utf8")).toContain("await hashPassword(bootstrapPassword)");
       expect(await readFile(join(directory, "standalone-notes/start.mjs"), "utf8")).toContain("server.listen(port, host");
-      expect(await readFile(join(directory, "standalone-notes/test/standalone-smoke.mjs"), "utf8")).toContain("Standalone CRUD proof failed");
+      const smoke = await readFile(join(directory, "standalone-notes/test/standalone-smoke.mjs"), "utf8");
+      expect(smoke).toContain("Standalone get-by-id proof failed");
+      expect(smoke).toContain("Standalone update proof failed");
+      expect(smoke).toContain("Standalone delete proof expected 404");
     });
   });
 
@@ -48,6 +51,32 @@ describe("framekit CLI", () => {
 
   it("rejects scaffold names that could resolve to the current directory", async () => {
     await expect(runCli(["create-app", "../"], { log: () => undefined })).rejects.toThrow("at least one letter or number");
+  });
+
+  it.each([{ options: [] as string[] }, { options: ["--dry-run"] }, { options: ["--force"] }])("rejects a symlinked target directory for options $options", async ({ options }) => {
+    await inTemporaryDirectory(async (directory) => {
+      const outside = await mkdtemp(join(tmpdir(), "framekit-cli-outside-"));
+      try {
+        await writeFile(join(outside, "sentinel"), "untouched\n");
+        await symlink(outside, join(directory, "linked-app"), "dir");
+        await expect(runCli(["create-app", "linked-app", ...options], { log: () => undefined })).rejects.toThrow("symbolic link");
+        expect(await readFile(join(outside, "sentinel"), "utf8")).toBe("untouched\n");
+        await expect(readFile(join(outside, "package.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it.each([{ options: [] as string[] }, { options: ["--dry-run"] }, { options: ["--force"] }])("rejects a symlinked scaffold file for options $options", async ({ options }) => {
+    await inTemporaryDirectory(async (directory) => {
+      const outside = join(directory, "outside-package.json");
+      await writeFile(outside, "user-owned-content\n");
+      await mkdir(join(directory, "linked-file-app"));
+      await symlink(outside, join(directory, "linked-file-app", "package.json"), "file");
+      await expect(runCli(["create-app", "linked-file-app", ...options], { log: () => undefined })).rejects.toThrow("symbolic link");
+      expect(await readFile(outside, "utf8")).toBe("user-owned-content\n");
+    });
   });
 
   it("generates SDK types from an app module path", async () => {

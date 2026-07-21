@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { realpathSync } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { constants, realpathSync } from "node:fs";
+import { access, lstat, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { AppDefinition } from "@framekit/core";
 import { PostgresMigrationStore, createPostgresMigrationSql } from "@framekit/db";
@@ -290,8 +290,10 @@ function scaffoldOptions(args: string[]): ScaffoldOptions {
 }
 
 async function writeScaffold(files: ScaffoldFile[], options: ScaffoldOptions, log: (message: string) => void): Promise<void> {
+  const root = realpathSync(process.cwd());
   const existing: string[] = [];
   for (const file of files) {
+    await assertSafeScaffoldPath(root, file.path);
     if (await pathExists(file.path)) {
       existing.push(file.path);
     }
@@ -306,7 +308,35 @@ async function writeScaffold(files: ScaffoldFile[], options: ScaffoldOptions, lo
       continue;
     }
     await mkdir(dirname(file.path), { recursive: true });
-    await writeFile(file.path, file.content);
+    await assertSafeScaffoldPath(root, file.path);
+    const handle = await open(file.path, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o666);
+    try {
+      await handle.writeFile(file.content);
+    } finally {
+      await handle.close();
+    }
+  }
+}
+
+async function assertSafeScaffoldPath(root: string, candidate: string): Promise<void> {
+  const absolute = resolve(candidate);
+  if (absolute !== root && !absolute.startsWith(root + sep)) {
+    throw new Error(`Refusing scaffold path outside the current directory: ${candidate}`);
+  }
+  const components = relative(root, absolute).split(sep).filter(Boolean);
+  let current = root;
+  for (const component of components) {
+    current = join(current, component);
+    try {
+      if ((await lstat(current)).isSymbolicLink()) {
+        throw new Error(`Refusing scaffold path containing a symbolic link: ${candidate}`);
+      }
+    } catch (error) {
+      if (isNodeError(error) && error.code === "ENOENT") {
+        return;
+      }
+      throw error;
+    }
   }
 }
 
@@ -423,8 +453,21 @@ try {
   const login = await json("/api/auth/login", { method: "POST", headers: { origin }, body: { email: "admin@example.com", password: "change-me-before-deploying" } });
   const headers = { authorization: \`Bearer \${login.token}\` };
   const created = await json("/api/doctypes/note", { method: "POST", headers, body: { title: "Standalone proof", body: "Packed packages work." } });
+  const fetched = await json(\`/api/doctypes/note/\${created.id}\`, { headers });
+  if (fetched.id !== created.id || fetched.data.title !== "Standalone proof") throw new Error("Standalone get-by-id proof failed.");
+  const updated = await json(\`/api/doctypes/note/\${created.id}\`, {
+    method: "PATCH",
+    headers: { ...headers, "if-match": String(created.revision) },
+    body: { title: "Updated standalone proof", body: "Packed packages still work." }
+  });
+  if (updated.data.title !== "Updated standalone proof" || updated.revision <= created.revision) throw new Error("Standalone update proof failed.");
   const listed = await json("/api/doctypes/note", { headers });
-  if (!created.id || !listed.some((record) => record.id === created.id)) throw new Error("Standalone CRUD proof failed.");
+  if (!created.id || !listed.some((record) => record.id === created.id && record.data.title === "Updated standalone proof")) throw new Error("Standalone list proof failed.");
+  await json(\`/api/doctypes/note/\${created.id}\`, { method: "DELETE", headers: { ...headers, "if-match": String(updated.revision) } });
+  const missing = await request(\`/api/doctypes/note/\${created.id}\`, { headers });
+  if (missing.response.status !== 404) throw new Error(\`Standalone delete proof expected 404, received \${missing.response.status}.\`);
+  const afterDelete = await json("/api/doctypes/note", { headers });
+  if (afterDelete.some((record) => record.id === created.id)) throw new Error("Standalone delete proof left the record in list results.");
   console.log(JSON.stringify({ ok: true, id: created.id }));
 } finally {
   if (child.exitCode === null) {
@@ -446,14 +489,19 @@ async function waitForHealth() {
 }
 
 async function json(path, options = {}) {
+  const { response, body } = await request(path, options);
+  if (!response.ok) throw new Error(\`\${options.method ?? "GET"} \${path} failed (\${response.status}): \${JSON.stringify(body)}\`);
+  return body;
+}
+
+async function request(path, options = {}) {
   const response = await fetch(origin + path, {
     method: options.method ?? "GET",
     headers: { "content-type": "application/json", "x-tenant-id": "default", ...(options.headers ?? {}) },
     body: options.body ? JSON.stringify(options.body) : undefined
   });
   const body = await response.json().catch(() => undefined);
-  if (!response.ok) throw new Error(\`\${options.method ?? "GET"} \${path} failed (\${response.status}): \${JSON.stringify(body)}\`);
-  return body;
+  return { response, body };
 }
 `;
 
