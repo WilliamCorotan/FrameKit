@@ -83,6 +83,24 @@ describe("generateSdkTypes", () => {
     expect(receipt).not.toHaveProperty("data");
   });
 
+  it("uploads, downloads, deletes, and cleans attachment objects", async () => {
+    vi.mocked(ofetch)
+      .mockResolvedValueOnce({ id: "attachment-1", name: "note.txt", contentType: "text/plain", size: 3, storageKey: "key", createdAt: "now", createdBy: "sdk" } as never)
+      .mockResolvedValueOnce({ metadata: { id: "attachment-1", name: "note.txt", contentType: "text/plain", size: 3, storageKey: "key", createdAt: "now", createdBy: "sdk" }, data: "AQID" } as never)
+      .mockResolvedValue({ deleted: ["orphan"] } as never);
+    const client = createClient({ baseUrl: "http://localhost:3000" });
+    await client.uploadAttachment("note", "note-1", "files", { name: "note.txt", contentType: "text/plain", bytes: new Uint8Array([1, 2, 3]) }, { expectedRevision: 1 });
+    await expect(client.downloadAttachment("note", "note-1", "files", "attachment-1")).resolves.toMatchObject({ bytes: new Uint8Array([1, 2, 3]) });
+    await client.deleteAttachment("note", "note-1", "files", "attachment-1", { expectedRevision: 2 });
+    await client.cleanupOrphanAttachments();
+    expect(vi.mocked(ofetch).mock.calls.map(([url, options]) => [url, options?.method, options?.body])).toEqual([
+      ["http://localhost:3000/api/doctypes/note/note-1/attachments/files", "POST", { name: "note.txt", contentType: "text/plain", data: "AQID" }],
+      ["http://localhost:3000/api/doctypes/note/note-1/attachments/files/attachment-1", "GET", undefined],
+      ["http://localhost:3000/api/doctypes/note/note-1/attachments/files/attachment-1", "DELETE", undefined],
+      ["http://localhost:3000/api/attachments/cleanup", "POST", undefined]
+    ]);
+  });
+
   it("covers identity linking, invitations, and recovery endpoint parity", async () => {
     vi.mocked(ofetch).mockResolvedValue({} as never);
     const client = createClient({ baseUrl: "https://app.example", token: "session" });

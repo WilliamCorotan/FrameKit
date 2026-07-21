@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type DocumentHook, type TenantContext } from "@framekit/core";
-import { applyFilters, assertDestructiveMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan } from "./index.js";
+import { applyFilters, assertDestructiveMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryAttachmentStorage, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -804,6 +804,62 @@ describe("runtime document service", () => {
     expect(() => assertDestructiveMigration(plan, {})).toThrow(/destructive/i);
   });
 
+  it("owns ordered child rows transactionally and manages authorized attachment bytes", async () => {
+    const product = defineDocType({
+      name: "product", label: "Product", fields: [{ name: "name", label: "Name", type: "text" }]
+    });
+    const order = defineDocType({
+      name: "order", label: "Order",
+      ownership: {},
+      rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] },
+      fields: [
+        { name: "title", label: "Title", type: "text", required: true },
+        { name: "lines", label: "Lines", type: "children", required: true, fields: [
+          { name: "sku", label: "SKU", type: "text", required: true },
+          { name: "quantity", label: "Quantity", type: "number", required: true },
+          { name: "product", label: "Product", type: "link", linkTo: "product" }
+        ] },
+        { name: "files", label: "Files", type: "attachments" }
+      ],
+      permissions: [
+        { action: "create", permissions: ["orders.write"] }, { action: "read", permissions: ["orders.read"] },
+        { action: "update", permissions: ["orders.write"] }, { action: "delete", permissions: ["orders.write"] }
+      ]
+    });
+    let id = 0;
+    const storage = new InMemoryAttachmentStorage();
+    const runtime = createRuntime(defineApp({ name: "Orders", modules: [defineModule({ id: "orders", name: "Orders", doctypes: [product, order] })] }), {
+      idGenerator: () => `id-${++id}`, attachmentStorage: storage
+    });
+    const writer = { tenantId: "tenant", userId: "writer", roles: [], permissions: ["orders.read", "orders.write", "framekit.attachments.cleanup"] };
+    const reader = { ...writer, permissions: ["orders.read"] };
+    await expect(runtime.create(writer, "order", { title: "Forged", lines: [], files: [{ id: "forged" }] }))
+      .rejects.toMatchObject({ code: "ATTACHMENTS_MANAGED" });
+    const created = await runtime.create(writer, "order", { title: "Order", lines: [{ sku: "A", quantity: "2" }, { sku: "B", quantity: 1 }] });
+    const initialLines = created.data.lines as Array<{ id: string; position: number; data: Record<string, unknown> }>;
+    expect(initialLines.map((line) => [line.position, line.data])).toEqual([[0, { sku: "A", quantity: 2 }], [1, { sku: "B", quantity: 1 }]]);
+    const reordered = await runtime.update(writer, "order", created.id, { lines: [initialLines[1], initialLines[0]] });
+    expect((reordered.data.lines as typeof initialLines).map((line) => [line.id, line.position])).toEqual([[initialLines[1]!.id, 0], [initialLines[0]!.id, 1]]);
+    await expect(runtime.update(writer, "order", created.id, { lines: [{ id: "foreign", data: { sku: "X", quantity: 1 } }] })).rejects.toMatchObject({ code: "INVALID_CHILD_ID" });
+    await expect(runtime.update(writer, "order", created.id, { lines: [{ ...initialLines[0], data: { ...initialLines[0]!.data, product: "missing" } }] }))
+      .rejects.toMatchObject({ code: "LINK_NOT_FOUND", details: { field: "lines.product" } });
+    await expect(runtime.get(writer, "order", created.id)).resolves.toMatchObject({ revision: 2, data: { lines: reordered.data.lines } });
+
+    await expect(runtime.uploadAttachment(reader, "order", created.id, "files", { name: "denied.txt", contentType: "text/plain", bytes: new Uint8Array([1]) }))
+      .rejects.toMatchObject({ code: "FORBIDDEN" });
+    const attachment = await runtime.uploadAttachment(writer, "order", created.id, "files", { name: "invoice.txt", contentType: "text/plain", bytes: new Uint8Array([1, 2, 3]) }, { expectedRevision: 2 });
+    expect(attachment).toMatchObject({ name: "invoice.txt", size: 3, createdBy: "writer" });
+    await expect(runtime.downloadAttachment(reader, "order", created.id, "files", attachment.id)).resolves.toMatchObject({ metadata: { id: attachment.id }, bytes: new Uint8Array([1, 2, 3]) });
+    await runtime.deleteAttachment(writer, "order", created.id, "files", attachment.id, { expectedRevision: 3 });
+    await expect(runtime.downloadAttachment(reader, "order", created.id, "files", attachment.id)).rejects.toMatchObject({ code: "ATTACHMENT_NOT_FOUND" });
+    const otherWriter = { ...writer, userId: "other-writer", permissions: ["orders.read", "orders.write"] };
+    const otherOrder = await runtime.create(otherWriter, "order", { title: "Other", lines: [{ sku: "PRIVATE", quantity: 1 }] });
+    const referencedHiddenAttachment = await runtime.uploadAttachment(otherWriter, "order", otherOrder.id, "files", { name: "private.txt", contentType: "text/plain", bytes: new Uint8Array([7]) });
+    await storage.put("tenant/orphan", new Uint8Array([9]), { contentType: "application/octet-stream" });
+    await expect(runtime.cleanupOrphanAttachments(writer)).resolves.toEqual(["tenant/orphan"]);
+    expect(await storage.list("tenant/")).toEqual([referencedHiddenAttachment.storageKey]);
+  });
+
   it("reports runtime diagnostics", async () => {
     const app = defineApp({
       name: "Diagnostics",
@@ -833,6 +889,25 @@ describe("runtime document service", () => {
       realtime: { kind: "none", durable: false },
       doctypes: [{ name: "customer", workflow: false }]
     });
+  });
+
+  it("plans child schema changes explicitly and guards incompatible collection migrations", async () => {
+    const currentDocType = defineDocType({ name: "order", label: "Order", fields: [
+      { name: "lines", label: "Lines", type: "children", fields: [{ name: "sku", label: "SKU", type: "text" }] }
+    ] });
+    const nextDocType = defineDocType({ name: "order", label: "Order", fields: [
+      { name: "lines", label: "Lines", type: "children", fields: [{ name: "sku", label: "SKU", type: "text", required: true }] },
+      { name: "files", label: "Files", type: "attachments" }
+    ] });
+    const current = defineApp({ name: "Collections", modules: [defineModule({ id: "orders", name: "Orders", doctypes: [currentDocType] })] });
+    const next = defineApp({ name: "Collections", modules: [defineModule({ id: "orders", name: "Orders", doctypes: [nextDocType] })] });
+    const plan = await createRuntime(current, { idGenerator: () => "collection-migration" }).planMigration(tenant, next);
+    expect(plan.changes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "change_collection_schema", field: "lines", destructive: true }),
+      expect.objectContaining({ kind: "add_field", field: "files", destructive: false })
+    ]));
+    await expect(validateMigrationPlan(plan)).resolves.toBeUndefined();
+    expect(() => assertDestructiveMigration(plan, {})).toThrow(/destructive/i);
   });
 
   it("records audit events for mutations", async () => {

@@ -1,7 +1,7 @@
 import postgres from "postgres";
 import { describe, expect, it, afterAll, beforeAll } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
-import { createRuntime, InMemoryDocumentRepository, migrationChecksum, type ListOptions } from "@framekit/runtime";
+import { createRuntime, InMemoryAttachmentStorage, InMemoryDocumentRepository, migrationChecksum, type ListOptions } from "@framekit/runtime";
 import {
   PostgresApiTokenStore,
   PostgresAuthAuditStore,
@@ -117,9 +117,19 @@ const securedReferenceDocType = defineDocType({
   fields: [{ name: "target", label: "Target", type: "link", linkTo: "secured_record" }]
 });
 
+const collectionDocType = defineDocType({
+  name: "collection_order", label: "Collection Order", fields: [
+    { name: "title", label: "Title", type: "text", required: true },
+    { name: "lines", label: "Lines", type: "children", required: true, fields: [
+      { name: "sku", label: "SKU", type: "text", required: true }, { name: "quantity", label: "Quantity", type: "number", required: true }
+    ] },
+    { name: "files", label: "Files", type: "attachments" }
+  ]
+});
+
 const app = defineApp({
   name: "Postgres Integration",
-  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType, securedDocType, securedReferenceDocType] })]
+  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType, securedDocType, securedReferenceDocType, collectionDocType] })]
 });
 
 describe.skipIf(!connectionString)("Postgres durable stores", () => {
@@ -229,7 +239,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
             dealDocType,
             approvalDocType,
             securedDocType,
-            securedReferenceDocType
+            securedReferenceDocType,
+            collectionDocType
           ]
         })
       ]
@@ -272,6 +283,33 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(true);
     await stores.sessionRevocations.revoke("pg-integration-session", new Date(Date.now() - 60_000).toISOString());
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(false);
+  });
+
+  it("persists ordered child ownership and attachment metadata through PostgreSQL", async () => {
+    const attachmentStorage = new InMemoryAttachmentStorage();
+    const runtime = createRuntime(app, {
+      repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
+      attachmentStorage, idGenerator: createIdGenerator("collection")
+    });
+    const created = await runtime.create(tenant, "collection_order", { title: "PG order", lines: [
+      { data: { sku: "A", quantity: "2" } }, { data: { sku: "B", quantity: 1 } }
+    ] });
+    const originalLines = created.data.lines as Array<{ id: string; position: number; data: { sku: string; quantity: number } }>;
+    expect(originalLines.map((line) => [line.position, line.data.sku, line.data.quantity])).toEqual([[0, "A", 2], [1, "B", 1]]);
+    const reordered = await runtime.update(tenant, "collection_order", created.id, { lines: [originalLines[1], originalLines[0]] }, { expectedRevision: 1 });
+    await expect(runtime.update(tenant, "collection_order", created.id, { lines: [{ id: "foreign", data: { sku: "X", quantity: 1 } }] }, { expectedRevision: 2 }))
+      .rejects.toMatchObject({ code: "INVALID_CHILD_ID" });
+    const attachment = await runtime.uploadAttachment(tenant, "collection_order", created.id, "files", {
+      name: "proof.txt", contentType: "text/plain", bytes: new Uint8Array([1, 2, 3])
+    }, { expectedRevision: reordered.revision });
+    const restarted = createRuntime(app, {
+      repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations, attachmentStorage
+    });
+    await expect(restarted.get(tenant, "collection_order", created.id)).resolves.toMatchObject({
+      revision: 3,
+      data: { lines: [{ id: originalLines[1]!.id, position: 0 }, { id: originalLines[0]!.id, position: 1 }], files: [{ id: attachment.id, storageKey: attachment.storageKey }] }
+    });
+    await expect(restarted.downloadAttachment(tenant, "collection_order", created.id, "files", attachment.id)).resolves.toMatchObject({ bytes: new Uint8Array([1, 2, 3]) });
   });
 
   it("atomically persists tenant identity links and consumes lifecycle/OIDC state once", async () => {

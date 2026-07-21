@@ -11,7 +11,9 @@ export const fieldTypes = [
   "datetime",
   "select",
   "link",
-  "json"
+  "json",
+  "children",
+  "attachments"
 ] as const;
 
 export type FieldType = (typeof fieldTypes)[number];
@@ -33,10 +35,9 @@ export const ComputedFieldSchema = z.discriminatedUnion("operation", [
   z.object({ operation: z.literal("concat"), dependencies: ComputedDependenciesSchema, separator: z.string().optional() }).strict()
 ]);
 
-export const FieldSchema = z.object({
+const FieldBaseSchema = z.object({
   name: z.string().min(1).regex(/^[a-z][a-z0-9_]*$/),
   label: z.string().min(1),
-  type: z.enum(fieldTypes),
   precision: z.number().int().min(1).max(100).optional(),
   scale: z.number().int().min(0).max(50).optional(),
   required: z.boolean().default(false),
@@ -47,11 +48,32 @@ export const FieldSchema = z.object({
   readOnly: z.boolean().default(false),
   inList: z.boolean().default(false),
   description: z.string().optional(),
-  validators: z.array(FieldValidatorSchema).default([]),
+  validators: z.array(FieldValidatorSchema).default([])
+});
+
+export const ChildFieldSchema = FieldBaseSchema.extend({
+  type: z.enum(["text", "long_text", "number", "decimal", "currency", "boolean", "date", "datetime", "select", "link", "json"])
+});
+
+export const FieldSchema = FieldBaseSchema.extend({
+  type: z.enum(fieldTypes),
+  fields: z.array(ChildFieldSchema).min(1).optional(),
   computed: ComputedFieldSchema.optional()
 });
 
 export type FieldDefinition = z.infer<typeof FieldSchema>;
+export type ChildFieldDefinition = z.infer<typeof ChildFieldSchema>;
+
+export type ChildRecord = { id: string; position: number; data: DocumentData };
+export type AttachmentMetadata = {
+  id: string;
+  name: string;
+  contentType: string;
+  size: number;
+  storageKey: string;
+  createdAt: string;
+  createdBy: string;
+};
 
 export function decimalPrecision(field: Pick<FieldDefinition, "type" | "precision">): number {
   return field.precision ?? 18;
@@ -468,25 +490,24 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
     throw new Error(`DocType "${doctype.name}" uses owner policies without ownership metadata`);
   }
   for (const field of doctype.fields) {
-    const exactDecimal = field.type === "decimal" || field.type === "currency";
-    if (exactDecimal) {
-      if (decimalScale(field) > decimalPrecision(field)) throw new Error(`Scale for "${doctype.name}.${field.name}" cannot exceed precision`);
-      if (field.default !== undefined) field.default = canonicalExactValue(field.default, field, `${doctype.name}.${field.name} default`);
-    } else if (field.precision !== undefined || field.scale !== undefined) {
-      throw new Error(`Only decimal and currency fields may declare precision or scale: "${doctype.name}.${field.name}"`);
-    }
-    if (field.type === "select") {
-      if (!field.options?.length) throw new Error(`Select field "${doctype.name}.${field.name}" requires options`);
-      if (new Set(field.options).size !== field.options.length) throw new Error(`Select field "${doctype.name}.${field.name}" has duplicate options`);
-      if (field.default !== undefined && !field.options.includes(String(field.default))) {
-        throw new Error(`Default for "${doctype.name}.${field.name}" is not a select option`);
+    if (field.type === "children") {
+      if (!field.fields?.length) throw new Error(`Children field "${doctype.name}.${field.name}" requires child fields`);
+      if (field.unique || field.default !== undefined || field.options || field.linkTo || field.precision !== undefined || field.scale !== undefined || field.validators.length > 0 || field.computed) throw new Error(`Children field "${doctype.name}.${field.name}" uses unsupported scalar metadata`);
+      const childNames = new Set<string>();
+      for (const childField of field.fields) {
+        if (childNames.has(childField.name)) throw new Error(`Children field "${doctype.name}.${field.name}" repeats child field "${childField.name}"`);
+        childNames.add(childField.name);
+        assertScalarFieldInvariants(doctype.name, `${field.name}.${childField.name}`, childField);
       }
-    } else if (field.options) {
-      throw new Error(`Only select fields may define options: "${doctype.name}.${field.name}"`);
+      continue;
     }
-    if (field.type === "link" && !field.linkTo) throw new Error(`Link field "${doctype.name}.${field.name}" requires linkTo`);
-    if (field.type !== "link" && field.linkTo) throw new Error(`Only link fields may define linkTo: "${doctype.name}.${field.name}"`);
-    if (field.unique && field.type === "json") throw new Error(`JSON field "${doctype.name}.${field.name}" cannot be unique`);
+    if (field.type === "attachments") {
+      if (field.unique || field.default !== undefined || field.options || field.linkTo || field.fields || field.precision !== undefined || field.scale !== undefined || field.validators.length > 0 || field.computed) throw new Error(`Attachments field "${doctype.name}.${field.name}" uses unsupported metadata`);
+      continue;
+    }
+    if (field.fields) throw new Error(`Only children fields may define child fields: "${doctype.name}.${field.name}"`);
+    assertScalarFieldInvariants(doctype.name, field.name, field);
+    const exactDecimal = field.type === "decimal" || field.type === "currency";
     if (field.computed) {
       if (field.computed.dependencies.includes(field.name)) throw new Error(`Computed field "${doctype.name}.${field.name}" cannot depend on itself`);
       for (const dependency of field.computed.dependencies) {
@@ -508,38 +529,6 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
         if (field.computed.operation === "concat" && dependencyType === "json") throw new Error(`Computed concat field "${doctype.name}.${field.name}" cannot depend on JSON`);
       }
     }
-    for (const validator of field.validators) {
-      if (validator.kind === "length") {
-        if (!["text", "long_text", "select", "link"].includes(field.type)) throw new Error(`Length validator on "${doctype.name}.${field.name}" requires a string field`);
-        if (validator.min === undefined && validator.max === undefined) throw new Error(`Length validator on "${doctype.name}.${field.name}" requires min or max`);
-        if (validator.min !== undefined && validator.max !== undefined && validator.min > validator.max) throw new Error(`Length validator on "${doctype.name}.${field.name}" has min greater than max`);
-      }
-      if (validator.kind === "range") {
-        if (!["number", "decimal", "currency"].includes(field.type)) throw new Error(`Range validator on "${doctype.name}.${field.name}" requires a numeric field`);
-        if (validator.min === undefined && validator.max === undefined) throw new Error(`Range validator on "${doctype.name}.${field.name}" requires min or max`);
-        if (exactDecimal) {
-          const min = validator.min === undefined ? undefined : exactDecimalCoefficient(validator.min, field, `${doctype.name}.${field.name} minimum`);
-          const max = validator.max === undefined ? undefined : exactDecimalCoefficient(validator.max, field, `${doctype.name}.${field.name} maximum`);
-          if (min !== undefined && max !== undefined && min > max) throw new Error(`Range validator on "${doctype.name}.${field.name}" has min greater than max`);
-          if (validator.min !== undefined) validator.min = canonicalExactValue(validator.min, field, `${doctype.name}.${field.name} minimum`);
-          if (validator.max !== undefined) validator.max = canonicalExactValue(validator.max, field, `${doctype.name}.${field.name} maximum`);
-        } else {
-          for (const [label, bound] of [["minimum", validator.min], ["maximum", validator.max]] as const) {
-            if (bound !== undefined && (typeof bound !== "number" || !Number.isFinite(bound) || Math.abs(bound) > Number.MAX_SAFE_INTEGER)) {
-              throw new Error(`${label} for "${doctype.name}.${field.name}" must be a finite safe number`);
-            }
-          }
-          if (validator.min !== undefined && validator.max !== undefined && validator.min > validator.max) throw new Error(`Range validator on "${doctype.name}.${field.name}" has min greater than max`);
-        }
-      }
-      if (validator.kind === "pattern" && !["text", "long_text", "link"].includes(field.type)) throw new Error(`Pattern validator on "${doctype.name}.${field.name}" requires a string field`);
-      if (validator.kind === "domain") {
-        if (field.type === "json") throw new Error(`Domain validator on "${doctype.name}.${field.name}" cannot target JSON`);
-        const canonical = validator.values.map((value) => canonicalDomainValue(field, value, `${doctype.name}.${field.name}`));
-        if (new Set(canonical).size !== canonical.length) throw new Error(`Domain validator on "${doctype.name}.${field.name}" has duplicate canonical values`);
-        validator.values.splice(0, validator.values.length, ...canonical.map((value) => JSON.parse(value.slice(value.indexOf(":") + 1)) as string | number | boolean));
-      }
-    }
   }
   const visitingComputed = new Set<string>();
   const visitedComputed = new Set<string>();
@@ -557,6 +546,7 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
   for (const field of doctype.fields.filter((candidate) => candidate.computed)) visitComputed(field.name, []);
   const indexes = new Set<string>();
   for (const index of doctype.indexes) {
+    if (index.some((name) => ["children", "attachments"].includes(fields.get(name)?.type ?? ""))) throw new Error(`Index on "${doctype.name}" cannot include managed collection fields`);
     if (new Set(index).size !== index.length) throw new Error(`Index on "${doctype.name}" repeats a field`);
     for (const field of index) if (!fields.has(field)) throw new Error(`Index on "${doctype.name}" references unknown field "${field}"`);
     const key = index.join("\u0000");
@@ -604,7 +594,9 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
   }
 }
 
-function exactDecimalCoefficient(value: unknown, field: FieldDefinition, label: string): bigint {
+type ScalarFieldDefinition = z.infer<typeof ChildFieldSchema> | FieldDefinition;
+
+function exactDecimalCoefficient(value: unknown, field: ScalarFieldDefinition, label: string): bigint {
   if (typeof value !== "string") throw new Error(`${label} must use an exact decimal string`);
   const match = /^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?$/.exec(value);
   if (!match) throw new Error(`${label} is not a base-10 decimal`);
@@ -617,7 +609,7 @@ function exactDecimalCoefficient(value: unknown, field: FieldDefinition, label: 
   return coefficient;
 }
 
-function canonicalDomainValue(field: FieldDefinition, value: string | number | boolean, label: string): string {
+function canonicalDomainValue(field: ScalarFieldDefinition, value: string | number | boolean, label: string): string {
   if (field.type === "decimal" || field.type === "currency") {
     return `string:${JSON.stringify(canonicalExactValue(value, field, `${label} domain value`))}`;
   }
@@ -634,13 +626,63 @@ function canonicalDomainValue(field: FieldDefinition, value: string | number | b
   return `string:${JSON.stringify(value)}`;
 }
 
-function canonicalExactValue(value: unknown, field: FieldDefinition, label: string): string {
+function canonicalExactValue(value: unknown, field: ScalarFieldDefinition, label: string): string {
   const coefficient = exactDecimalCoefficient(value, field, label);
   const scale = decimalScale(field);
   const negative = coefficient < 0n;
   const digits = (negative ? -coefficient : coefficient).toString().padStart(scale + 1, "0");
   const normalized = scale === 0 ? digits : `${digits.slice(0, -scale)}.${digits.slice(-scale)}`;
   return negative ? `-${normalized}` : normalized;
+}
+
+function assertScalarFieldInvariants(doctype: string, path: string, field: ScalarFieldDefinition): void {
+  const exactDecimal = field.type === "decimal" || field.type === "currency";
+  if (exactDecimal) {
+    if (decimalScale(field) > decimalPrecision(field)) throw new Error(`Scale for "${doctype}.${path}" cannot exceed precision`);
+    if (field.default !== undefined) field.default = canonicalExactValue(field.default, field, `${doctype}.${path} default`);
+  } else if (field.precision !== undefined || field.scale !== undefined) {
+    throw new Error(`Only decimal and currency fields may declare precision or scale: "${doctype}.${path}"`);
+  }
+  if (field.type === "select") {
+    if (!field.options?.length) throw new Error(`Select field "${doctype}.${path}" requires options`);
+    if (new Set(field.options).size !== field.options.length) throw new Error(`Select field "${doctype}.${path}" has duplicate options`);
+    if (field.default !== undefined && !field.options.includes(String(field.default))) throw new Error(`Default for "${doctype}.${path}" is not a select option`);
+  } else if (field.options) {
+    throw new Error(`Only select fields may define options: "${doctype}.${path}"`);
+  }
+  if (field.type === "link" && !field.linkTo) throw new Error(`Link field "${doctype}.${path}" requires linkTo`);
+  if (field.type !== "link" && field.linkTo) throw new Error(`Only link fields may define linkTo: "${doctype}.${path}"`);
+  if (field.unique && field.type === "json") throw new Error(`JSON field "${doctype}.${path}" cannot be unique`);
+  for (const validator of field.validators) {
+    if (validator.kind === "length") {
+      if (!["text", "long_text", "select", "link"].includes(field.type)) throw new Error(`Length validator on "${doctype}.${path}" requires a string field`);
+      if (validator.min === undefined && validator.max === undefined) throw new Error(`Length validator on "${doctype}.${path}" requires min or max`);
+      if (validator.min !== undefined && validator.max !== undefined && validator.min > validator.max) throw new Error(`Length validator on "${doctype}.${path}" has min greater than max`);
+    }
+    if (validator.kind === "range") {
+      if (!["number", "decimal", "currency"].includes(field.type)) throw new Error(`Range validator on "${doctype}.${path}" requires a numeric field`);
+      if (validator.min === undefined && validator.max === undefined) throw new Error(`Range validator on "${doctype}.${path}" requires min or max`);
+      if (exactDecimal) {
+        const min = validator.min === undefined ? undefined : exactDecimalCoefficient(validator.min, field, `${doctype}.${path} minimum`);
+        const max = validator.max === undefined ? undefined : exactDecimalCoefficient(validator.max, field, `${doctype}.${path} maximum`);
+        if (min !== undefined && max !== undefined && min > max) throw new Error(`Range validator on "${doctype}.${path}" has min greater than max`);
+        if (validator.min !== undefined) validator.min = canonicalExactValue(validator.min, field, `${doctype}.${path} minimum`);
+        if (validator.max !== undefined) validator.max = canonicalExactValue(validator.max, field, `${doctype}.${path} maximum`);
+      } else {
+        for (const [label, bound] of [["minimum", validator.min], ["maximum", validator.max]] as const) {
+          if (bound !== undefined && (typeof bound !== "number" || !Number.isFinite(bound) || Math.abs(bound) > Number.MAX_SAFE_INTEGER)) throw new Error(`${label} for "${doctype}.${path}" must be a finite safe number`);
+        }
+        if (validator.min !== undefined && validator.max !== undefined && validator.min > validator.max) throw new Error(`Range validator on "${doctype}.${path}" has min greater than max`);
+      }
+    }
+    if (validator.kind === "pattern" && !["text", "long_text", "link"].includes(field.type)) throw new Error(`Pattern validator on "${doctype}.${path}" requires a string field`);
+    if (validator.kind === "domain") {
+      if (field.type === "json") throw new Error(`Domain validator on "${doctype}.${path}" cannot target JSON`);
+      const canonical = validator.values.map((value) => canonicalDomainValue(field, value, `${doctype}.${path}`));
+      if (new Set(canonical).size !== canonical.length) throw new Error(`Domain validator on "${doctype}.${path}" has duplicate canonical values`);
+      validator.values.splice(0, validator.values.length, ...canonical.map((value) => JSON.parse(value.slice(value.indexOf(":") + 1)) as string | number | boolean));
+    }
+  }
 }
 
 function assertAppReferences(app: AppDefinition): void {
@@ -650,6 +692,11 @@ function assertAppReferences(app: AppDefinition): void {
     for (const field of doctype.fields) {
       if (field.type === "link" && !doctypes.has(field.linkTo!)) {
         throw new Error(`Link field "${doctype.name}.${field.name}" targets unknown DocType "${field.linkTo}"`);
+      }
+      for (const childField of field.fields ?? []) {
+        if (childField.type === "link" && !doctypes.has(childField.linkTo!)) {
+          throw new Error(`Link field "${doctype.name}.${field.name}.${childField.name}" targets unknown DocType "${childField.linkTo}"`);
+        }
       }
     }
   }

@@ -11,6 +11,8 @@ Framekit follows the Dependency Rule: source dependencies point inward.
 
 `@framekit/core` and `@framekit/runtime` do not import Nitro, React, Drizzle, BullMQ, or Redis. Those packages are replaceable details.
 
+Repeating child rows remain inside the parent document aggregate so ordering, validation, and persistence share the parent transaction. Attachment metadata follows the same aggregate boundary while byte storage is delegated to `AttachmentStorage`; see [Child Records and Attachments](./children-and-attachments.md).
+
 ## Frappe-Inspired Concepts
 
 - DocType: metadata definition for a business document.

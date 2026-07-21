@@ -20,7 +20,11 @@ type FieldDefinition = {
     | { kind: "domain"; values: Array<string | number | boolean> }
   >;
   computed?: { operation: "sum" | "subtract" | "multiply" | "concat"; dependencies: string[]; separator?: string };
+  fields?: FieldDefinition[];
 };
+
+type ChildRecord = { id?: string; position?: number; data: Record<string, unknown> };
+type AttachmentMetadata = { id: string; name: string; contentType: string; size: number; storageKey: string; createdAt: string; createdBy: string };
 
 type DocTypeDefinition = {
   name: string;
@@ -220,12 +224,12 @@ function App() {
     try {
       setStatus("Saving…");
       const creating = !selected;
-      const invalid = active.fields.find((field) => !field.computed && !validDeskFieldValue(field, draft[field.name]));
+      const invalid = active.fields.find((field) => !field.computed && field.type !== "attachments" && !validDeskFieldValue(field, draft[field.name]));
       if (invalid) { setStatus(`Invalid value for ${invalid.label}`); return; }
       const payload = { ...draft };
-      for (const field of active.fields) if (field.computed) delete payload[field.name];
+      for (const field of active.fields) if (field.computed || field.type === "attachments") delete payload[field.name];
       const record = selected
-        ? await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { method: "PATCH", body: payload, token })
+        ? await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { method: "PATCH", body: payload, token, expectedRevision: selected.revision })
         : await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}`, { method: "POST", body: payload, token });
       setSelected(record);
       setDraft(record.data);
@@ -237,6 +241,29 @@ function App() {
     } catch (error) {
       setStatus(errorMessage(error));
     }
+  }
+
+  async function uploadAttachment(field: FieldDefinition, file: File) {
+    if (!active || !selected) return;
+    try {
+      setStatus("Uploading…");
+      await fetchJson(`/api/doctypes/${active.name}/${selected.id}/attachments/${field.name}`, {
+        method: "POST", token, expectedRevision: selected.revision,
+        body: { name: file.name, contentType: file.type || "application/octet-stream", data: encodeBase64(new Uint8Array(await file.arrayBuffer())) }
+      });
+      const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { token });
+      setSelected(record); setDraft(record.data); setStatus("Uploaded");
+    } catch (error) { setStatus(errorMessage(error)); }
+  }
+
+  async function deleteAttachment(field: FieldDefinition, attachmentId: string) {
+    if (!active || !selected) return;
+    try {
+      setStatus("Deleting attachment…");
+      await fetchJson(`/api/doctypes/${active.name}/${selected.id}/attachments/${field.name}/${attachmentId}`, { method: "DELETE", token, expectedRevision: selected.revision });
+      const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { token });
+      setSelected(record); setDraft(record.data); setStatus("Attachment deleted");
+    } catch (error) { setStatus(errorMessage(error)); }
   }
 
   async function transition(action: string) {
@@ -439,7 +466,9 @@ function App() {
               {formFields.map((field) => (
                 <label key={field.name} className="field">
                   <span>{field.label}{field.required ? " *" : ""}</span>
-                  <FieldInput field={field} value={draft[field.name]} onChange={(value) => setDraft((current) => ({ ...current, [field.name]: value }))} />
+                  <FieldInput field={field} value={draft[field.name]} onChange={(value) => setDraft((current) => ({ ...current, [field.name]: value }))}
+                    canManageAttachments={Boolean(selected && selected.documentStatus === "draft")}
+                    onUpload={(file) => void uploadAttachment(field, file)} onDeleteAttachment={(id) => void deleteAttachment(field, id)} />
                 </label>
               ))}
             </div>
@@ -755,9 +784,37 @@ function orderedFields(doctype: DocTypeDefinition, preferred: string[] | undefin
   return fields.length > 0 ? fields : doctype.fields;
 }
 
-function FieldInput({ field, value, onChange }: { field: FieldDefinition; value: unknown; onChange: (value: unknown) => void }) {
+function FieldInput({ field, value, onChange, canManageAttachments, onUpload, onDeleteAttachment }: {
+  field: FieldDefinition; value: unknown; onChange: (value: unknown) => void; canManageAttachments?: boolean;
+  onUpload?: (file: File) => void; onDeleteAttachment?: (id: string) => void;
+}) {
   const domain = field.validators?.find((validator) => validator.kind === "domain");
   const disabled = field.readOnly || Boolean(field.computed);
+  if (field.type === "children") {
+    const rows = Array.isArray(value) ? value as ChildRecord[] : [];
+    const replace = (index: number, row: ChildRecord) => onChange(rows.map((candidate, candidateIndex) => candidateIndex === index ? row : candidate));
+    const move = (index: number, offset: number) => {
+      const next = [...rows]; const target = index + offset;
+      if (target < 0 || target >= next.length) return;
+      [next[index], next[target]] = [next[target]!, next[index]!]; onChange(next);
+    };
+    return <div className="child-records">
+      {rows.map((row, index) => <fieldset key={row.id ?? index}>
+        <legend>Row {index + 1}</legend>
+        {(field.fields ?? []).map((child) => <label key={child.name}><span>{child.label}</span><FieldInput field={child} value={row.data[child.name]} onChange={(next) => replace(index, { ...row, data: { ...row.data, [child.name]: next } })} /></label>)}
+        <div className="row-actions"><button type="button" aria-label={`Move row ${index + 1} up`} onClick={() => move(index, -1)}>↑</button><button type="button" aria-label={`Move row ${index + 1} down`} onClick={() => move(index, 1)}>↓</button><button type="button" onClick={() => onChange(rows.filter((_, candidateIndex) => candidateIndex !== index))}>Remove row</button></div>
+      </fieldset>)}
+      <button type="button" aria-label="Add child row" onClick={() => onChange([...rows, { data: {} }])}>Add row</button>
+    </div>;
+  }
+  if (field.type === "attachments") {
+    const attachments = Array.isArray(value) ? value as AttachmentMetadata[] : [];
+    return <div className="attachments">
+      {attachments.map((attachment) => <div key={attachment.id} className="attachment-row"><span>{attachment.name} · {attachment.size} bytes</span><button type="button" aria-label={`Delete ${attachment.name} attachment`} disabled={!canManageAttachments} onClick={() => onDeleteAttachment?.(attachment.id)}>Delete attachment</button></div>)}
+      <input aria-label={`Upload ${field.label}`} type="file" disabled={!canManageAttachments} onChange={(event) => { const file = event.target.files?.[0]; if (file) onUpload?.(file); event.target.value = ""; }} />
+      {!canManageAttachments ? <small>Save a draft before uploading files.</small> : null}
+    </div>;
+  }
   if (domain?.kind === "domain") {
     const selectedIndex = Math.max(0, domain.values.findIndex((option) => Object.is(option, value)));
     return <select value={String(selectedIndex)} onChange={(event) => onChange(domain.values[Number(event.target.value)])} disabled={disabled}>{domain.values.map((option, index) => <option key={`${typeof option}:${String(option)}`} value={String(index)}>{String(option)}</option>)}</select>;
@@ -846,6 +903,12 @@ async function fetchJson<T>(path: string, options: { method?: string; body?: unk
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Request failed. Try again.";
+}
+
+function encodeBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  return btoa(binary);
 }
 
 function csv(value: string | undefined): string[] {

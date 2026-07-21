@@ -105,6 +105,32 @@ describe("createNitroHandler", () => {
     })).resolves.toMatchObject({ revision: created.revision, data: { subtotal: "9007199254740993.1000" } });
   });
 
+  it("serves ordered children and the attachment lifecycle", async () => {
+    const order = defineDocType({ name: "order", label: "Order", fields: [
+      { name: "title", label: "Title", type: "text", required: true },
+      { name: "lines", label: "Lines", type: "children", fields: [{ name: "sku", label: "SKU", type: "text", required: true }] },
+      { name: "files", label: "Files", type: "attachments" }
+    ] });
+    let id = 0;
+    const runtime = createRuntime(defineApp({ name: "Collections", modules: [defineModule({ id: "sales", name: "Sales", doctypes: [order] })] }), { idGenerator: () => `resource-${++id}` });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { development: { allowHeaderIdentity: true } }));
+    const fetch = toWebHandler(h3);
+    const headers = { "x-user-id": "writer" };
+    const created = await json<{ id: string; revision: number; data: { lines: Array<{ id: string; position: number; data: { sku: string } }> } }>(fetch, "/api/doctypes/order", {
+      method: "POST", headers, body: { title: "A", lines: [{ data: { sku: "ONE" } }, { data: { sku: "TWO" } }] }
+    });
+    expect(created.data.lines.map((line) => [line.position, line.data.sku])).toEqual([[0, "ONE"], [1, "TWO"]]);
+    const uploaded = await json<{ id: string; size: number }>(fetch, `/api/doctypes/order/${created.id}/attachments/files`, {
+      method: "POST", headers: { ...headers, "if-match": "1" }, body: { name: "proof.txt", contentType: "text/plain", data: "AQID" }
+    });
+    expect(uploaded.size).toBe(3);
+    const downloaded = await json<{ data: string }>(fetch, `/api/doctypes/order/${created.id}/attachments/files/${uploaded.id}`, { headers });
+    expect(downloaded.data).toBe("AQID");
+    await json(fetch, `/api/doctypes/order/${created.id}/attachments/files/${uploaded.id}`, { method: "DELETE", headers: { ...headers, "if-match": "2" } });
+    await expect(json(fetch, `/api/doctypes/order/${created.id}/attachments/files/${uploaded.id}`, { headers })).rejects.toMatchObject({ code: "ATTACHMENT_NOT_FOUND" });
+  });
+
   it("exposes submit and cancel document lifecycle commands", async () => {
     const invoice = defineDocType({
       name: "invoice",
