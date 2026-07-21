@@ -27,6 +27,10 @@ import {
   type OutboxEvent,
   type OutboxStore,
   type RepositoryDiagnostics,
+  assertDestructiveMigration,
+  assertMigrationDrift,
+  assertMigrationIdentity,
+  assertSupportedMigration,
   createRollbackMigrationPlan,
   validateMigrationPlan
 } from "@framekit/runtime";
@@ -193,6 +197,10 @@ export const framekitMigrations = pgTable(
     tenantId: text("tenant_id").notNull(),
     id: text("id").notNull(),
     appName: text("app_name").notNull(),
+    fromSchemaChecksum: text("from_schema_checksum").notNull().default(""),
+    toSchemaChecksum: text("to_schema_checksum").notNull().default(""),
+    fromUniqueConstraints: jsonb("from_unique_constraints").notNull().$type<MigrationRecord["fromUniqueConstraints"]>().default([]),
+    toUniqueConstraints: jsonb("to_unique_constraints").notNull().$type<MigrationRecord["toUniqueConstraints"]>().default([]),
     changes: jsonb("changes").notNull().$type<MigrationRecord["changes"]>(),
     checksum: text("checksum").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
@@ -908,7 +916,7 @@ export class PostgresMigrationStore implements MigrationStore {
   }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createMigrationTableSql()));
+    await this.db.execute(drizzleSql.raw(`${createMigrationTableSql()}\n${createMutationTablesSql()}`));
   }
 
   describe(): RepositoryDiagnostics {
@@ -924,11 +932,17 @@ export class PostgresMigrationStore implements MigrationStore {
     return rows.map(rowToMigration).sort((a, b) => b.appliedAt.localeCompare(a.appliedAt));
   }
 
-  async record(_tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord> {
+  async record(tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord> {
+    assertMigrationIdentity(tenant, migration.appName, migration);
+    await validateMigrationPlan(migration);
     await this.db.insert(framekitMigrations).values({
       tenantId: migration.tenantId,
       id: migration.id,
       appName: migration.appName,
+      fromSchemaChecksum: migration.fromSchemaChecksum,
+      toSchemaChecksum: migration.toSchemaChecksum,
+      fromUniqueConstraints: migration.fromUniqueConstraints,
+      toUniqueConstraints: migration.toUniqueConstraints,
       changes: migration.changes,
       checksum: migration.checksum,
       createdAt: new Date(migration.createdAt),
@@ -939,19 +953,48 @@ export class PostgresMigrationStore implements MigrationStore {
 
   async applyPlan(tenant: TenantContext, plan: MigrationPlan, options: { allowDestructive?: boolean; appliedAt?: string } = {}): Promise<MigrationRecord> {
     await validateExecutableMigration(plan, options);
+    assertMigrationIdentity(tenant, plan.appName, plan);
     const statements = executableStatements(createPostgresMigrationStatements(plan));
     const appliedAt = options.appliedAt ?? new Date().toISOString();
-    const record: MigrationRecord = { ...plan, tenantId: tenant.tenantId, appliedAt };
-    await this.sql.begin(async (sql) => {
+    const record: MigrationRecord = { ...plan, appliedAt };
+    return this.sql.begin(async (sql) => {
+      await sql`select pg_advisory_xact_lock(hashtextextended(${`framekit:migration:${tenant.tenantId}:${plan.appName}`}, 0))`;
+      const existing = await sql<MigrationSqlRow[]>`
+        select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
+               to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
+               to_unique_constraints as "toUniqueConstraints", changes, checksum, created_at as "createdAt", applied_at as "appliedAt"
+        from framekit_migrations where tenant_id = ${tenant.tenantId} and id = ${plan.id} limit 1
+      `;
+      if (existing[0]) {
+        const applied = migrationSqlRowToRecord(existing[0]);
+        if (applied.checksum === plan.checksum) return applied;
+        throw new FramekitError("MIGRATION_ID_CONFLICT", `Migration ID "${plan.id}" was already applied with a different checksum.`, 409);
+      }
+      const latestRows = await sql<MigrationSqlRow[]>`
+        select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
+               to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
+               to_unique_constraints as "toUniqueConstraints", changes, checksum, created_at as "createdAt", applied_at as "appliedAt"
+        from framekit_migrations where tenant_id = ${tenant.tenantId} order by applied_at desc, id desc limit 1
+      `;
+      assertMigrationDrift(latestRows[0] ? migrationSqlRowToRecord(latestRows[0]) : undefined, plan);
+      await assertLegacyUniqueValues(sql, tenant.tenantId, plan.toUniqueConstraints);
       for (const statement of statements) {
         await sql.unsafe(statement);
       }
+      await resynchronizeUniqueValues(sql, tenant.tenantId, plan.fromUniqueConstraints, plan.toUniqueConstraints);
       await sql`
-        insert into framekit_migrations (tenant_id, id, app_name, changes, checksum, created_at, applied_at)
-        values (${record.tenantId}, ${record.id}, ${record.appName}, ${JSON.stringify(record.changes)}::jsonb, ${record.checksum}, ${new Date(record.createdAt)}, ${new Date(record.appliedAt)})
+        insert into framekit_migrations (
+          tenant_id, id, app_name, from_schema_checksum, to_schema_checksum, from_unique_constraints,
+          to_unique_constraints, changes, checksum, created_at, applied_at
+        ) values (
+          ${record.tenantId}, ${record.id}, ${record.appName}, ${record.fromSchemaChecksum}, ${record.toSchemaChecksum},
+          ${JSON.stringify(record.fromUniqueConstraints)}::jsonb, ${JSON.stringify(record.toUniqueConstraints)}::jsonb,
+          ${JSON.stringify(record.changes)}::jsonb,
+          ${record.checksum}, ${record.createdAt}::timestamptz, ${record.appliedAt}::timestamptz
+        )
       `;
+      return record;
     });
-    return record;
   }
 
   async rollback(tenant: TenantContext, migration: MigrationRecord, options: { allowDestructive?: boolean; id?: string; appliedAt?: string } = {}): Promise<MigrationRecord> {
@@ -959,19 +1002,7 @@ export class PostgresMigrationStore implements MigrationStore {
       id: options.id,
       createdAt: options.appliedAt ?? new Date().toISOString()
     });
-    await validateExecutableMigration(plan, options);
-    const statements = executableStatements(createPostgresMigrationStatements(migration, { direction: "down" }));
-    const record: MigrationRecord = { ...plan, tenantId: tenant.tenantId, appliedAt: options.appliedAt ?? new Date().toISOString() };
-    await this.sql.begin(async (sql) => {
-      for (const statement of statements) {
-        await sql.unsafe(statement);
-      }
-      await sql`
-        insert into framekit_migrations (tenant_id, id, app_name, changes, checksum, created_at, applied_at)
-        values (${record.tenantId}, ${record.id}, ${record.appName}, ${JSON.stringify(record.changes)}::jsonb, ${record.checksum}, ${new Date(record.createdAt)}, ${new Date(record.appliedAt)})
-      `;
-    });
-    return record;
+    return this.applyPlan(tenant, plan, options);
   }
 }
 
@@ -1172,6 +1203,10 @@ create table if not exists framekit_migrations (
   tenant_id text not null,
   id text not null,
   app_name text not null,
+  from_schema_checksum text not null default '',
+  to_schema_checksum text not null default '',
+  from_unique_constraints jsonb not null default '[]'::jsonb,
+  to_unique_constraints jsonb not null default '[]'::jsonb,
   changes jsonb not null,
   checksum text not null default '',
   created_at timestamptz not null,
@@ -1179,6 +1214,10 @@ create table if not exists framekit_migrations (
   constraint framekit_migrations_identity unique (tenant_id, id)
 );
 alter table framekit_migrations add column if not exists checksum text not null default '';
+alter table framekit_migrations add column if not exists from_schema_checksum text not null default '';
+alter table framekit_migrations add column if not exists to_schema_checksum text not null default '';
+alter table framekit_migrations add column if not exists from_unique_constraints jsonb not null default '[]'::jsonb;
+alter table framekit_migrations add column if not exists to_unique_constraints jsonb not null default '[]'::jsonb;
 create index if not exists framekit_migrations_lookup on framekit_migrations (tenant_id, applied_at desc);
 `;
 }
@@ -1200,14 +1239,16 @@ export function createPostgresMigrationStatements(plan: MigrationPlan, options: 
 
 async function validateExecutableMigration(plan: MigrationPlan, options: { allowDestructive?: boolean }): Promise<void> {
   await validateMigrationPlan(plan);
-  const destructive = plan.changes.filter((change) => change.destructive);
-  if (destructive.length > 0 && !options.allowDestructive) {
-    throw new FramekitError("DESTRUCTIVE_MIGRATION", "Migration contains destructive changes.", 409, destructive);
-  }
+  assertDestructiveMigration(plan, options);
+  assertSupportedMigration(plan);
 }
 
 function statementsForChange(tenantId: string, change: MigrationChange | MigrationRollback): string[] {
   switch (change.kind) {
+    case "add_doctype":
+      return [`-- add_doctype ${change.doctype}: documents use the shared JSONB table`];
+    case "remove_doctype":
+      return [`delete from framekit_documents where tenant_id = ${sqlLiteral(tenantId)} and doctype = ${sqlLiteral(change.doctype)};`];
     case "add_field": {
       const field = change.to && typeof change.to === "object" ? change.to as { default?: unknown } : undefined;
       if (field && "default" in field) {
@@ -1238,11 +1279,99 @@ function executableStatements(statements: string[]): string[] {
   return statements.filter((statement) => !statement.trimStart().startsWith("--"));
 }
 
+type MigrationSqlRow = {
+  tenantId: string;
+  id: string;
+  appName: string;
+  fromSchemaChecksum: string;
+  toSchemaChecksum: string;
+  fromUniqueConstraints: MigrationRecord["fromUniqueConstraints"];
+  toUniqueConstraints: MigrationRecord["toUniqueConstraints"];
+  changes: MigrationRecord["changes"];
+  checksum: string;
+  createdAt: Date;
+  appliedAt: Date;
+};
+
+function migrationSqlRowToRecord(row: MigrationSqlRow): MigrationRecord {
+  return {
+    ...row,
+    createdAt: row.createdAt.toISOString(),
+    appliedAt: row.appliedAt.toISOString()
+  };
+}
+
+async function assertLegacyUniqueValues(
+  sql: postgres.TransactionSql,
+  tenantId: string,
+  constraints: Array<{ doctype: string; field: string }>
+): Promise<void> {
+  for (const constraint of constraints) {
+    const duplicates = await sql<{ value: string; documentIds: string[] }[]>`
+      select value, array_agg(id order by id) as "documentIds"
+      from (
+        select id, data ->> ${constraint.field} as value
+        from framekit_documents
+        where tenant_id = ${tenantId} and doctype = ${constraint.doctype}
+          and data ? ${constraint.field} and data -> ${constraint.field} <> 'null'::jsonb
+      ) legacy_values
+      group by value
+      having count(*) > 1
+      limit 1
+    `;
+    if (duplicates[0]) {
+      throw new FramekitError("LEGACY_UNIQUE_CONFLICT", `Legacy rows conflict on ${constraint.doctype}.${constraint.field}.`, 409, {
+        ...constraint,
+        value: duplicates[0].value,
+        documentIds: duplicates[0].documentIds
+      });
+    }
+  }
+}
+
+async function resynchronizeUniqueValues(
+  sql: postgres.TransactionSql,
+  tenantId: string,
+  fromConstraints: Array<{ doctype: string; field: string }>,
+  toConstraints: Array<{ doctype: string; field: string }>
+): Promise<void> {
+  const affected = new Map([...fromConstraints, ...toConstraints].map((constraint) => [`${constraint.doctype}.${constraint.field}`, constraint]));
+  for (const constraint of affected.values()) {
+    await sql`
+      delete from framekit_document_unique_values
+      where tenant_id = ${tenantId} and doctype = ${constraint.doctype} and field = ${constraint.field}
+    `;
+  }
+  for (const constraint of toConstraints) {
+    const indexName = indexIdentifier({ doctype: constraint.doctype, field: constraint.field }, "uniq");
+    await sql.unsafe(
+      `create unique index if not exists ${indexName} on framekit_documents (tenant_id, doctype, (data ->> ${sqlLiteral(constraint.field)})) ` +
+      `where doctype = ${sqlLiteral(constraint.doctype)} and data ? ${sqlLiteral(constraint.field)};`
+    );
+    const indexRows = await sql<{ indexName: string | null }[]>`select to_regclass(${indexName})::text as "indexName"`;
+    if (!indexRows[0]?.indexName) {
+      throw new FramekitError("MIGRATION_SCHEMA_DRIFT", `Expected unique index "${indexName}" is missing.`, 409, constraint);
+    }
+    await sql`
+      insert into framekit_document_unique_values (tenant_id, doctype, field, value, document_id)
+      select tenant_id, doctype, ${constraint.field}, data ->> ${constraint.field}, id
+      from framekit_documents
+      where tenant_id = ${tenantId} and doctype = ${constraint.doctype}
+        and data ? ${constraint.field} and data -> ${constraint.field} <> 'null'::jsonb
+        and data ->> ${constraint.field} <> ''
+    `;
+  }
+}
+
 function rollbackFromChange(change: MigrationChange): MigrationRollback {
   if (change.rollback) {
     return change.rollback;
   }
   switch (change.kind) {
+    case "add_doctype":
+      return { kind: "remove_doctype", doctype: change.doctype, field: "*", destructive: true, from: change.to };
+    case "remove_doctype":
+      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing DocType "${change.doctype}" cannot be rolled back automatically.`, 409);
     case "add_field":
       return { kind: "remove_field", doctype: change.doctype, field: change.field, destructive: true, from: change.to };
     case "remove_field":
@@ -1334,7 +1463,7 @@ function mapMutationError(error: unknown, command: MutationCommand): unknown {
   if (error instanceof FramekitError) return error;
   const postgresError = error as { code?: string; constraint_name?: string };
   if (postgresError.code === "23505") {
-    if (postgresError.constraint_name === "framekit_document_unique_value") {
+    if (postgresError.constraint_name === "framekit_document_unique_value" || postgresError.constraint_name?.endsWith("_uniq")) {
       return new FramekitError("UNIQUE_CONSTRAINT_FAILED", `${command.doctype.name} contains a duplicate unique value`, 409, {
         doctype: command.doctype.name
       });
@@ -1527,6 +1656,10 @@ function rowToMigration(row: typeof framekitMigrations.$inferSelect): MigrationR
     tenantId: row.tenantId,
     id: row.id,
     appName: row.appName,
+    fromSchemaChecksum: row.fromSchemaChecksum,
+    toSchemaChecksum: row.toSchemaChecksum,
+    fromUniqueConstraints: row.fromUniqueConstraints,
+    toUniqueConstraints: row.toUniqueConstraints,
     changes: row.changes,
     checksum: row.checksum,
     createdAt: row.createdAt.toISOString(),

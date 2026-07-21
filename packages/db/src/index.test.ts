@@ -64,6 +64,10 @@ async function migrationPlanFixture(): Promise<MigrationPlan> {
     id: "migration-1",
     tenantId: "tenant_1",
     appName: "CRM",
+    fromSchemaChecksum: "schema-before",
+    toSchemaChecksum: "schema-after",
+    fromUniqueConstraints: [],
+    toUniqueConstraints: [{ doctype: "customer", field: "region" }],
     createdAt: "2026-07-06T00:00:00.000Z",
     changes: [
       {

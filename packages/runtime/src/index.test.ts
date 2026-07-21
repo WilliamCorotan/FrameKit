@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
-import { applyFilters, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime } from "./index.js";
+import { applyFilters, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, migrationChecksum } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -525,6 +525,61 @@ describe("runtime document service", () => {
       changes: expect.arrayContaining([expect.objectContaining({ kind: "remove_field", field: "region" })])
     });
     await expect(runtime.rollbackMigration(tenant, applied, { id: "migration-1-down", allowDestructive: true })).resolves.toMatchObject({ id: "migration-1-down" });
+  });
+
+  it("validates migration identity, replay, drift, unsupported conversions, and DocType removal", async () => {
+    const customer = defineDocType({ name: "customer", label: "Customer", fields: [{ name: "name", label: "Name", type: "text" }] });
+    const current = defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customer] })] });
+    const next = defineApp({
+      name: "Migration State",
+      modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+        ...customer,
+        fields: [...customer.fields, { name: "code", label: "Code", type: "text", unique: true }]
+      })] })]
+    });
+    let id = 0;
+    const runtime = createRuntime(current, { idGenerator: () => `migration-${++id}` });
+    const plan = await runtime.planMigration(tenant, next);
+    const applied = await runtime.applyMigration(tenant, plan);
+    await expect(runtime.applyMigration(tenant, plan)).resolves.toEqual(applied);
+    await expect(runtime.applyMigration({ ...tenant, tenantId: "other" }, plan)).rejects.toMatchObject({ code: "MIGRATION_TENANT_MISMATCH" });
+
+    const conflicting = { ...plan, toSchemaChecksum: "different-target" };
+    const validConflict = { ...conflicting, checksum: await migrationChecksum(conflicting) };
+    await expect(runtime.applyMigration(tenant, validConflict)).rejects.toMatchObject({ code: "MIGRATION_ID_CONFLICT" });
+
+    const drifted = await runtime.planMigration(tenant, next);
+    await expect(runtime.applyMigration(tenant, drifted)).rejects.toMatchObject({ code: "MIGRATION_SCHEMA_DRIFT" });
+
+    const converted = defineApp({
+      name: "Migration State",
+      modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+        ...customer,
+        fields: [{ name: "name", label: "Name", type: "number" }]
+      })] })]
+    });
+    const conversionPlan = await runtime.planMigration(tenant, converted);
+    await expect(runtime.applyMigration(tenant, conversionPlan, { allowDestructive: true })).rejects.toMatchObject({ code: "UNSUPPORTED_MIGRATION_CONVERSION" });
+    await expect(runtime.migrationHistory(tenant)).resolves.toHaveLength(1);
+
+    const supplier = defineDocType({ name: "supplier", label: "Supplier", fields: [{ name: "name", label: "Name", type: "text" }] });
+    const replacement = defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [supplier] })] });
+    const replacementRuntime = createRuntime(current, { idGenerator: () => "replace-doctype" });
+    const replacementPlan = await replacementRuntime.planMigration(tenant, replacement);
+    expect(replacementPlan.changes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "add_doctype", doctype: "supplier" }),
+      expect.objectContaining({ kind: "remove_doctype", doctype: "customer", destructive: true })
+    ]));
+    expect(createExecutableMigrationArtifact(replacementPlan).down).toEqual([]);
+    const replacementRecord = await replacementRuntime.applyMigration(tenant, replacementPlan, { allowDestructive: true });
+    await expect(replacementRuntime.rollbackMigration(tenant, replacementRecord, { allowDestructive: true })).rejects.toMatchObject({ code: "IRREVERSIBLE_MIGRATION" });
+
+    const invalidLinks = defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+      name: "order",
+      label: "Order",
+      fields: [{ name: "customer", label: "Customer", type: "link", linkTo: "missing" }]
+    })] })] });
+    await expect(createRuntime(current).planMigration(tenant, invalidLinks)).rejects.toMatchObject({ code: "INVALID_MIGRATION_METADATA" });
   });
 
   it("generates predictable naming series", async () => {
