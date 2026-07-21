@@ -69,6 +69,11 @@ export type ListDocumentsOptions = {
   };
 };
 
+export type ListDocumentsPage<TData extends DocumentData = DocumentData> = {
+  items: DocumentRecord<TData>[];
+  nextCursor?: string;
+};
+
 export type MutationRequestOptions = {
   expectedRevision?: number;
   idempotencyKey?: string;
@@ -283,6 +288,17 @@ export class FramekitClient {
 
   list<TData extends DocumentData = DocumentData>(doctype: string, options: ListDocumentsOptions = {}): Promise<DocumentRecord<TData>[]> {
     return this.request(`/api/doctypes/${doctype}${listQuery(options)}`);
+  }
+
+  async listPage<TData extends DocumentData = DocumentData>(doctype: string, options: ListDocumentsOptions = {}): Promise<ListDocumentsPage<TData>> {
+    const response = await ofetch.raw<DocumentRecord<TData>[]>(this.baseUrl + `/api/doctypes/${doctype}${listQuery(options)}`, {
+      headers: this.headers(),
+      credentials: this.credentials
+    });
+    return {
+      items: response._data ?? [],
+      nextCursor: response.headers.get("x-next-cursor") ?? undefined
+    };
   }
 
   get<TData extends DocumentData = DocumentData>(doctype: string, id: string): Promise<DocumentRecord<TData>> {

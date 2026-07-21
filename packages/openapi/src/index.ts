@@ -602,12 +602,12 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
           queryParam("search", "string"),
           queryParam("limit", "integer"),
           queryParam("offset", "integer"),
-          queryParam("cursor", "string"),
+          queryParam("cursor", "string", "Opaque x-next-cursor value from the previous page; must use the same sort."),
           queryParam("fields", "string"),
           queryParam("filters", "string"),
           queryParam("sort", "string")
         ],
-        responses: okResponse({ type: "array", items: ref(recordName) })
+        responses: listResponse({ type: "array", items: ref(recordName) })
       },
       post: {
         operationId: `create${pascal(doctype.name)}`,
@@ -793,6 +793,22 @@ function okResponse(schema: JsonSchema): Record<string, unknown> {
   };
 }
 
+function listResponse(schema: JsonSchema): Record<string, unknown> {
+  return {
+    "200": {
+      description: "OK",
+      headers: {
+        "x-next-cursor": {
+          description: "Opaque cursor for the next stable keyset page. Omitted on the final page.",
+          schema: { type: "string" }
+        }
+      },
+      content: { "application/json": { schema } }
+    },
+    ...errorResponses()
+  };
+}
+
 function createdResponse(schema: JsonSchema): Record<string, unknown> {
   return {
     "201": { description: "Created", content: { "application/json": { schema } } },
@@ -822,8 +838,8 @@ function pathParam(name: string) {
   return { name, in: "path", required: true, schema: { type: "string" } };
 }
 
-function queryParam(name: string, type: string) {
-  return { name, in: "query", required: false, schema: { type } };
+function queryParam(name: string, type: string, description?: string) {
+  return { name, in: "query", required: false, schema: { type }, description };
 }
 
 function headerParam(name: string) {

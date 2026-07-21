@@ -357,6 +357,8 @@ See [docs/architecture.md](docs/architecture.md).
 
 Revision checks, atomic Postgres mutations, durable uniqueness, and retry semantics are documented in [docs/consistency.md](docs/consistency.md).
 
+Postgres query pushdown and stable opaque cursor semantics are documented in [docs/querying.md](docs/querying.md).
+
 ## Roadmap Status
 
 Framekit is currently assessed as an advanced alpha: 55% implemented toward a production-ready 1.0, with broad MVP functionality but open production-default, consistency, scale, and release-depth work. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).

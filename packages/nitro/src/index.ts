@@ -489,7 +489,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
       if (method === "GET" && !match.id) {
         const query = getQuery(event);
-        return await runtime.list(tenant, match.doctype, {
+        const page = await runtime.listPage(tenant, match.doctype, {
           search: typeof query.search === "string" ? query.search : undefined,
           limit: typeof query.limit === "string" ? Number(query.limit) : undefined,
           offset: typeof query.offset === "string" ? Number(query.offset) : undefined,
@@ -498,6 +498,8 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
           filters: parseFilters(query.filters),
           sort: parseSort(query.sort)
         });
+        if (page.nextCursor) event.res.headers.set("x-next-cursor", page.nextCursor);
+        return page.items;
       }
       if (method === "GET" && match.id) {
         return await runtime.get(tenant, match.doctype, match.id);
@@ -754,6 +756,7 @@ function applyCors(event: H3Event, cors: NormalizedCorsOptions | undefined, allo
     throw new FramekitError("CORS_ORIGIN_DENIED", "Request origin is not allowed.", 403);
   }
   event.res.headers.set("access-control-allow-origin", wildcard ? "*" : normalizedOrigin);
+  event.res.headers.set("access-control-expose-headers", "x-next-cursor,x-request-id");
   event.res.headers.append("vary", "Origin");
   event.res.headers.set("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
   event.res.headers.set("access-control-allow-headers", allowHeaderIdentity

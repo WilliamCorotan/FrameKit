@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
-import { createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime } from "./index.js";
+import { applyFilters, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -104,9 +104,18 @@ describe("runtime document service", () => {
     const beta = await runtime.create(tenant, "customer", { name: "Beta", status: "paused", notes: "second" });
     await runtime.create(tenant, "customer", { name: "Gamma", status: "active", notes: "third" });
 
+    const firstPage = await runtime.listPage(tenant, "customer", {
+      sort: { field: "name", direction: "asc" },
+      fields: ["name"],
+      limit: 2
+    });
+    expect(firstPage.items.at(-1)?.id).toBe(beta.id);
+    expect(firstPage.nextCursor).toBeDefined();
+    expect(firstPage.nextCursor).not.toContain(beta.id);
+
     const page = await runtime.list(tenant, "customer", {
       sort: { field: "name", direction: "asc" },
-      cursor: beta.id,
+      cursor: firstPage.nextCursor,
       fields: ["name"],
       limit: 1
     });
@@ -114,6 +123,7 @@ describe("runtime document service", () => {
     expect(page).toHaveLength(1);
     expect(page[0]?.data).toEqual({ name: "Gamma" });
     expect(page[0]?.id).toBe("customer-id7abcde");
+    await expect(runtime.list(tenant, "customer", { sort: { field: "name", direction: "desc" }, cursor: firstPage.nextCursor })).rejects.toMatchObject({ code: "INVALID_CURSOR" });
     await expect(runtime.list(tenant, "customer", { fields: ["unknown"] })).rejects.toMatchObject({ code: "UNKNOWN_PROJECTION_FIELD" });
   });
 
@@ -151,7 +161,21 @@ describe("runtime document service", () => {
       { data: { title: "North expansion" } }
     ]);
     await expect(runtime.list(tenant, "deal", { filters: { title: { contains: "renew" } } })).resolves.toMatchObject([{ data: { title: "South renewal" } }]);
-    await expect(runtime.list(tenant, "deal", { filters: { amount: { between: [1, 2] } } as never })).rejects.toMatchObject({ code: "UNKNOWN_FILTER_OPERATOR" });
+    await expect(runtime.list(tenant, "deal", { filters: { amount: { between: [1, 2] } } as never })).rejects.toMatchObject({ code: "INVALID_QUERY", statusCode: 422 });
+    await expect(runtime.list(tenant, "deal", { filters: { title: { contains: 42 } } as never })).rejects.toMatchObject({ code: "INVALID_QUERY", statusCode: 422 });
+    await expect(runtime.list(tenant, "deal", { filters: { stage: { in: [["open"]] } } as never })).rejects.toMatchObject({ code: "INVALID_QUERY", statusCode: 422 });
+
+    const doctype = app.modules[0]!.doctypes[0]!;
+    const missingAndNull = [
+      { id: "missing", doctype: "deal", tenantId: tenant.tenantId, revision: 1, data: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
+      { id: "null", doctype: "deal", tenantId: tenant.tenantId, revision: 1, data: { amount: null }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
+      { id: "zero", doctype: "deal", tenantId: tenant.tenantId, revision: 1, data: { amount: 0 }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }
+    ];
+    expect(applyFilters(missingAndNull, { amount: { lte: 0 } }, doctype).map((record) => record.id)).toEqual(["zero"]);
+
+    const forgedCursor = btoa(JSON.stringify({ v: 1, field: "amount", direction: "asc", value: "50", id: "deal1abcdef" }))
+      .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    await expect(runtime.list(tenant, "deal", { sort: { field: "amount", direction: "asc" }, cursor: forgedCursor })).rejects.toMatchObject({ code: "INVALID_CURSOR", statusCode: 422 });
   });
 
   it("validates link fields before writes", async () => {

@@ -134,6 +134,7 @@ describe("createNitroHandler", () => {
     expect(allowed.status).toBe(204);
     expect(allowed.headers.get("access-control-allow-origin")).toBe("https://desk.example.test");
     expect(allowed.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(allowed.headers.get("access-control-expose-headers")).toBe("x-next-cursor,x-request-id");
     expect(allowed.headers.get("vary")).toContain("Origin");
 
     const denied = await fetch(new Request("http://internal/health", {
@@ -149,6 +150,7 @@ describe("createNitroHandler", () => {
       headers: { origin: "https://attacker.example" }
     }));
     expect(deniedActual.status).toBe(403);
+    expect(deniedActual.headers.get("access-control-expose-headers")).toBeNull();
     await expect(deniedActual.json()).resolves.toMatchObject({ code: "CORS_ORIGIN_DENIED" });
 
     const noCorsH3 = new H3();
@@ -157,6 +159,7 @@ describe("createNitroHandler", () => {
       headers: { origin: "https://desk.example.test" }
     }));
     expect(noCors.headers.get("access-control-allow-origin")).toBeNull();
+    expect(noCors.headers.get("access-control-expose-headers")).toBeNull();
     expect(() => createNitroHandler(runtime, { cors: { origins: ["*"], credentials: true } })).toThrow(
       "Credentialed CORS cannot use the wildcard origin"
     );
@@ -656,14 +659,25 @@ describe("createNitroHandler", () => {
       body: { name: "Acme" }
     });
     expect(created).toMatchObject({ data: { name: "Acme" } });
+    await json(fetch, "/api/doctypes/customer", { method: "POST", headers, body: { name: "Beta" } });
 
     const filtered = await json<Array<{ id: string }>>(fetch, `/api/doctypes/customer?filters=${encodeURIComponent(JSON.stringify({ name: { contains: "cm" } }))}`, { headers });
     expect(filtered).toHaveLength(1);
+    await expect(json(fetch, `/api/doctypes/customer?filters=${encodeURIComponent(JSON.stringify({ name: { contains: 42 } }))}`, { headers }))
+      .rejects.toMatchObject({ code: "INVALID_QUERY" });
 
-    const projected = await json<Array<{ id: string; data: Record<string, unknown> }>>(fetch, "/api/doctypes/customer?sort=name:asc&fields=name&limit=1", { headers });
+    const forgedCursor = btoa(JSON.stringify({ v: 1, field: "name", direction: "asc", value: 42, id: created.id }))
+      .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    await expect(json(fetch, `/api/doctypes/customer?sort=name:asc&cursor=${encodeURIComponent(forgedCursor)}`, { headers }))
+      .rejects.toMatchObject({ code: "INVALID_CURSOR" });
+
+    const projectedResponse = await fetch(new Request("http://localhost/api/doctypes/customer?sort=name:asc&fields=name&limit=1", { headers }));
+    const projected = await projectedResponse.json() as Array<{ id: string; data: Record<string, unknown> }>;
     expect(projected[0]?.data).toEqual({ name: "Acme" });
-    const afterCursor = await json<Array<{ id: string }>>(fetch, `/api/doctypes/customer?sort=name:asc&cursor=${encodeURIComponent(projected[0]!.id)}`, { headers });
-    expect(afterCursor).toHaveLength(0);
+    const cursor = projectedResponse.headers.get("x-next-cursor");
+    expect(cursor).toBeTruthy();
+    const afterCursor = await json<Array<{ id: string }>>(fetch, `/api/doctypes/customer?sort=name:asc&cursor=${encodeURIComponent(cursor!)}`, { headers });
+    expect(afterCursor).toHaveLength(1);
 
     await expect(
       json(fetch, "/api/doctypes/customer", {
