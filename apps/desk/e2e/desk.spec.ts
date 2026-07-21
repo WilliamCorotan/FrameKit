@@ -8,6 +8,7 @@ type RecordItem = {
   revision: number;
   state?: string;
   documentStatus: "draft" | "submitted" | "cancelled";
+  ownerId?: string;
   data: Record<string, unknown>;
   updatedAt: string;
 };
@@ -104,6 +105,11 @@ test("covers document list, create, edit, delete, pagination, search, and workfl
   await page.getByRole("button", { name: "Cancel" }).click();
   expect((await cancelRequest).headers()["if-match"]).toBe("4");
   await expect(page.getByText("Cancelled")).toBeVisible();
+  await page.getByLabel("Owner").fill("new-owner");
+  const ownerRequest = page.waitForRequest((request) => request.url().endsWith("/owner"));
+  await page.getByRole("button", { name: "Transfer owner" }).click();
+  expect((await ownerRequest).headers()["if-match"]).toBe("5");
+  await expect(page.getByText("Owner transferred")).toBeVisible();
 
   await page.getByLabel("Filter records").fill("");
   for (let index = 0; index < 5; index += 1) {
@@ -224,6 +230,7 @@ async function mockDeskApi(page: Page) {
       revision: 1,
       state: "Lead",
       documentStatus: "draft",
+      ownerId: "admin",
       data: {
         name: "Northwind Traders",
         status: "active",
@@ -284,13 +291,14 @@ async function mockDeskApi(page: Page) {
         revision: 1,
         state: "Lead",
         documentStatus: "draft" as const,
+        ownerId: "admin",
         data: body,
         updatedAt: now
       };
       customers.unshift(record);
       return json(route, record);
     }
-    const customerMatch = path.match(/^\/api\/doctypes\/customer\/([^/]+)(?:\/(transition|submit|cancel))?$/);
+    const customerMatch = path.match(/^\/api\/doctypes\/customer\/([^/]+)(?:\/(transition|submit|cancel|owner))?$/);
     if (customerMatch && method === "PATCH" && body) {
       const record = customers.find((item) => item.id === customerMatch[1]);
       Object.assign(record!.data, body);
@@ -310,6 +318,12 @@ async function mockDeskApi(page: Page) {
     if (customerMatch?.[2] && ["submit", "cancel"].includes(customerMatch[2]) && method === "POST") {
       const record = customers.find((item) => item.id === customerMatch[1]);
       record!.documentStatus = customerMatch[2] === "submit" ? "submitted" : "cancelled";
+      record!.revision += 1;
+      return json(route, record);
+    }
+    if (customerMatch?.[2] === "owner" && method === "POST" && body) {
+      const record = customers.find((item) => item.id === customerMatch[1]);
+      record!.ownerId = String(body.ownerId);
       record!.revision += 1;
       return json(route, record);
     }
@@ -415,6 +429,7 @@ const metadata = {
           name: "customer",
           label: "Customer",
           description: "Customer profile",
+          ownership: { transferRoles: [], transferPermissions: ["customer.transfer"] },
           fields: [
             { name: "name", label: "Name", type: "text", required: true, inList: true },
             { name: "status", label: "Status", type: "select", options: ["lead", "active", "closed"], inList: true },

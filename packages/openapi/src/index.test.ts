@@ -14,6 +14,7 @@ describe("createOpenApiDocument", () => {
             defineDocType({
               name: "deal",
               label: "Deal",
+              ownership: { transferPermissions: ["deal.transfer"] },
               fields: [
                 { name: "title", label: "Title", type: "text", required: true },
                 { name: "amount", label: "Amount", type: "currency" },
@@ -59,6 +60,7 @@ describe("createOpenApiDocument", () => {
     expect(doc.paths["/api/doctypes/deal/{id}/transition"]).toBeDefined();
     expect(doc.paths["/api/doctypes/deal/{id}/submit"]?.post?.operationId).toBe("submitDeal");
     expect(doc.paths["/api/doctypes/deal/{id}/cancel"]?.post?.operationId).toBe("cancelDeal");
+    expect(doc.paths["/api/doctypes/deal/{id}/owner"]?.post?.operationId).toBe("transferDealOwner");
     const listDeal = doc.paths["/api/doctypes/deal"]?.get;
     expect(JSON.stringify(listDeal?.parameters)).toContain("cursor");
     expect(JSON.stringify(listDeal?.parameters)).toContain("fields");
@@ -84,5 +86,7 @@ describe("createOpenApiDocument", () => {
     expect(dealInput?.required).toContain("title");
     expect(doc.components.schemas.DealRecord?.required).toContain("documentStatus");
     expect(doc.components.schemas.DealRecord?.properties?.documentStatus).toEqual({ type: "string", enum: ["draft", "submitted", "cancelled"] });
+    expect(doc.components.schemas.DealRecord?.properties?.ownerId).toEqual({ type: "string" });
+    expect(doc.components.schemas.DealRecord?.required).toContain("ownerId");
   });
 });

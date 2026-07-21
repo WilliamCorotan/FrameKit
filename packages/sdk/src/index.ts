@@ -93,7 +93,7 @@ export type DependencyHealthResponse = {
 };
 
 export type MigrationChange = {
-  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint";
+  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy";
   doctype: string;
   field: string;
   destructive: boolean;
@@ -174,7 +174,8 @@ export const FRAMEKIT_HTTP_ENDPOINTS = [
   ["delete", "DELETE", "/api/doctypes/:doctype/:id"],
   ["transition", "POST", "/api/doctypes/:doctype/:id/transition"],
   ["submit", "POST", "/api/doctypes/:doctype/:id/submit"],
-  ["cancel", "POST", "/api/doctypes/:doctype/:id/cancel"]
+  ["cancel", "POST", "/api/doctypes/:doctype/:id/cancel"],
+  ["transferOwner", "POST", "/api/doctypes/:doctype/:id/owner"]
 ] as const;
 
 export class FramekitClient {
@@ -465,6 +466,10 @@ export class FramekitClient {
 
   cancel<TData extends DocumentData = DocumentData>(doctype: string, id: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
     return this.request(`/api/doctypes/${doctype}/${id}/cancel`, { method: "POST", headers: mutationHeaders(options) });
+  }
+
+  transferOwner<TData extends DocumentData = DocumentData>(doctype: string, id: string, ownerId: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
+    return this.request(`/api/doctypes/${doctype}/${id}/owner`, { method: "POST", body: { ownerId }, headers: mutationHeaders(options) });
   }
 
   private request<T>(path: string, options: { method?: string; body?: unknown; skipAuth?: boolean; headers?: Record<string, string> } = {}): Promise<T> {

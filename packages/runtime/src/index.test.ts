@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
-import { applyFilters, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, migrationChecksum } from "./index.js";
+import { applyFilters, assertDestructiveMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, migrationChecksum, validateMigrationPlan } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -439,6 +439,65 @@ describe("runtime document service", () => {
 
     expect(transitioned.state).toBe("won");
     expect(transitioned.data.stage).toBe("won");
+  });
+
+  it("enforces immutable ownership and composable row policies on every command", async () => {
+    const secured = defineDocType({
+      name: "secured_record", label: "Secured Record", ownership: { transferPermissions: ["records.transfer"] },
+      fields: [
+        { name: "title", label: "Title", type: "text", required: true },
+        { name: "email", label: "Email", type: "text", unique: true },
+        { name: "stage", label: "Stage", type: "select", options: ["open", "done"] }
+      ],
+      rowPolicy: {
+        read: [{ owner: "self" }, { owner: "any", roles: ["manager"] }],
+        write: [{ owner: "self" }, { owner: "any", permissions: ["records.manage"] }]
+      },
+      workflow: { field: "stage", initialState: "open", states: ["open", "done"], transitions: [{ action: "finish", from: ["open"], to: "done" }] }
+    });
+    const reference = defineDocType({
+      name: "secured_reference", label: "Secured Reference", fields: [{ name: "target", label: "Target", type: "link", linkTo: "secured_record" }]
+    });
+    const runtime = createRuntime(defineApp({ name: "Rows", modules: [defineModule({ id: "rows", name: "Rows", doctypes: [secured, reference] })] }), {
+      idGenerator: (() => { let id = 0; return () => `row-${++id}`; })()
+    });
+    const alice = { tenantId: "tenant", userId: "alice", roles: [], permissions: [] };
+    const bob = { ...alice, userId: "bob" };
+    const manager = { ...alice, userId: "manager", roles: ["manager"], permissions: ["records.transfer"] };
+    const aliceRecord = await runtime.create(alice, "secured_record", { title: "Alice", email: "shared@example.com" });
+    const bobRecord = await runtime.create(bob, "secured_record", { title: "Bob", email: "bob@example.com" });
+    expect(aliceRecord.ownerId).toBe("alice");
+    expect((await runtime.list(alice, "secured_record")).map((record) => record.id)).toEqual([aliceRecord.id]);
+    expect(await runtime.list(manager, "secured_record")).toHaveLength(2);
+    await expect(runtime.get(alice, "secured_record", bobRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.update(alice, "secured_record", bobRecord.id, { title: "stolen" })).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.delete(alice, "secured_record", bobRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.transition(alice, "secured_record", bobRecord.id, "finish")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.submit(alice, "secured_record", bobRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.create(bob, "secured_reference", { target: aliceRecord.id })).rejects.toMatchObject({ code: "LINK_NOT_FOUND" });
+    await expect(runtime.create(bob, "secured_record", { title: "Hidden unique", email: "shared@example.com" })).rejects.toMatchObject({ code: "UNIQUE_CONSTRAINT_FAILED" });
+    await expect(runtime.create(alice, "secured_record", { title: "Forged", ownerId: "bob" })).rejects.toMatchObject({ code: "OWNER_IMMUTABLE" });
+    await expect(runtime.transferOwner(bob, "secured_record", aliceRecord.id, "bob")).rejects.toMatchObject({ code: "FORBIDDEN" });
+    const transferred = await runtime.transferOwner(manager, "secured_record", aliceRecord.id, "bob", { expectedRevision: aliceRecord.revision });
+    expect(transferred).toMatchObject({ ownerId: "bob", revision: 2 });
+    await expect(runtime.get(alice, "secured_record", aliceRecord.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.get(bob, "secured_record", aliceRecord.id)).resolves.toMatchObject({ ownerId: "bob" });
+    expect((await runtime.auditTrail(manager)).map((event) => event.action)).toContain("transfer_owner");
+  });
+
+  it("plans row policy changes as explicit destructive migrations", async () => {
+    const base = defineDocType({ name: "note", label: "Note", fields: [{ name: "title", label: "Title", type: "text" }] });
+    const current = defineApp({ name: "Policy Migration", modules: [defineModule({ id: "notes", name: "Notes", doctypes: [base] })] });
+    const next = defineApp({ name: current.name, version: "1.0.0", modules: [defineModule({
+      id: "notes", name: "Notes", version: "1.0.0", doctypes: [defineDocType({
+        ...base, ownership: { transferPermissions: ["notes.transfer"] },
+        rowPolicy: { read: [{ owner: "self" }], write: [{ owner: "self" }] }
+      })]
+    })] });
+    const plan = await createRuntime(current, { idGenerator: () => "policy-migration" }).planMigration(tenant, next);
+    expect(plan.changes).toContainEqual(expect.objectContaining({ kind: "change_row_policy", doctype: "note", destructive: true }));
+    await expect(validateMigrationPlan(plan)).resolves.toBeUndefined();
+    expect(() => assertDestructiveMigration(plan, {})).toThrow(/destructive/i);
   });
 
   it("reports runtime diagnostics", async () => {

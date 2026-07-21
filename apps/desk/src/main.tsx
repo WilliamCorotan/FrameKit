@@ -18,6 +18,7 @@ type DocTypeDefinition = {
   label: string;
   description?: string;
   fields: FieldDefinition[];
+  ownership?: { transferRoles: string[]; transferPermissions: string[] };
   views?: Array<{ id: string; doctype: string; type: "list" | "form"; fields: string[] }>;
   workflow?: {
     field: string;
@@ -44,6 +45,7 @@ type DocumentRecord = {
   id: string;
   doctype: string;
   revision: number;
+  ownerId?: string;
   state?: string;
   documentStatus: "draft" | "submitted" | "cancelled";
   data: Record<string, unknown>;
@@ -127,6 +129,7 @@ function App() {
   const [hasNextPage, setHasNextPage] = useState(false);
   const [selected, setSelected] = useState<DocumentRecord | undefined>();
   const [draft, setDraft] = useState<Record<string, unknown>>({});
+  const [ownerDraft, setOwnerDraft] = useState("");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(0);
   const [status, setStatus] = useState("Loading metadata");
@@ -192,6 +195,7 @@ function App() {
       setRecords(list);
       setSelected(list[0]);
       setDraft(list[0]?.data ?? {});
+      setOwnerDraft(list[0]?.ownerId ?? "");
       setStatus("Ready");
     } catch (error) {
       setStatus(errorMessage(error));
@@ -247,6 +251,22 @@ function App() {
       setDraft(record.data);
       await refresh(active.name, query, page);
       setStatus(action === "submit" ? "Submitted" : "Cancelled");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
+  }
+
+  async function transferOwner() {
+    if (!active?.ownership || !selected) return;
+    try {
+      setStatus("Transferring owner…");
+      const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/owner`, {
+        method: "POST", body: { ownerId: ownerDraft }, token, expectedRevision: selected.revision
+      });
+      setSelected(record);
+      setOwnerDraft(record.ownerId ?? "");
+      await refresh(active.name, query, page);
+      setStatus("Owner transferred");
     } catch (error) {
       setStatus(errorMessage(error));
     }
@@ -356,7 +376,7 @@ function App() {
               <span role="status" aria-live="polite">{status}</span>
             </div>
             {records.map((record) => (
-              <button key={record.id} className={selected?.id === record.id ? "row selected" : "row"} onClick={() => { setSelected(record); setDraft(record.data); }}>
+              <button key={record.id} className={selected?.id === record.id ? "row selected" : "row"} onClick={() => { setSelected(record); setDraft(record.data); setOwnerDraft(record.ownerId ?? ""); }}>
                 <strong>{record.id}</strong>
                 <span>{listFields.map((field) => String(record.data[field.name] ?? "")).filter(Boolean).join(" · ") || record.doctype}</span>
               </button>
@@ -383,6 +403,13 @@ function App() {
             </div>
 
             <div className="fields">
+              {active?.ownership && selected ? (
+                <label className="field">
+                  <span>Owner</span>
+                  <input aria-label="Owner" value={ownerDraft} onChange={(event) => setOwnerDraft(event.target.value)} />
+                  <button onClick={() => void transferOwner()} disabled={!ownerDraft.trim() || ownerDraft === selected.ownerId}>Transfer owner</button>
+                </label>
+              ) : null}
               {formFields.map((field) => (
                 <label key={field.name} className="field">
                   <span>{field.label}{field.required ? " *" : ""}</span>

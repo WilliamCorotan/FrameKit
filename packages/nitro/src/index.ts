@@ -640,6 +640,10 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       if (method === "POST" && match.id && match.operation === "cancel") {
         return await runtime.cancel(tenant, match.doctype, match.id, mutationOptions(event.req));
       }
+      if (method === "POST" && match.id && match.operation === "owner") {
+        const body = (await readBody(event)) as { ownerId?: string };
+        return await runtime.transferOwner(tenant, match.doctype, match.id, body.ownerId ?? "", mutationOptions(event.req));
+      }
 
       throw new FramekitError("METHOD_NOT_ALLOWED", "Method not allowed", 405);
     } catch (error) {
@@ -685,7 +689,7 @@ function matchDocumentPath(path: string, basePath: string): { doctype: string; i
   if (parts.length === 2) {
     return { doctype: parts[0] ?? "", id: parts[1] };
   }
-  if (parts.length === 3 && ["transition", "submit", "cancel"].includes(parts[2]!)) {
+  if (parts.length === 3 && ["transition", "submit", "cancel", "owner"].includes(parts[2]!)) {
     return { doctype: parts[0] ?? "", id: parts[1], operation: parts[2] };
   }
   return undefined;

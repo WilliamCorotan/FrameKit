@@ -28,7 +28,7 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 
 | Component | Implementation | In place | Missing or incomplete |
 | --- | ---: | --- | --- |
-| Core metadata and domain model | 76% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics, ownership/row permissions, localization, typed settings |
+| Core metadata and domain model | 82% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, immutable ownership, composable row policies, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics, localization, typed settings |
 | Runtime and command lifecycle | 92% | CRUD, ordered validation/hooks, draft-submit-cancel lifecycle, post-submit immutability, atomic durable commands, revisions, idempotency, audit/outbox/realtime, diagnostics, and ordered start/close/dispose | Bulk/cross-document commands and deeper cancellation propagation |
 | Data, query, and persistence | 84% | In-memory and Postgres adapters, pushed-down filters/sorts/projections, opaque cursors, durable uniqueness, revisions, locking, and atomic document/outbox persistence | Load/performance evidence, sharding/partition guidance, broader physical schema modeling |
 | HTTP API and OpenAPI | 82% | Secure routing defaults, broad Nitro/OpenAPI surface, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
@@ -74,7 +74,7 @@ Exit criteria:
 
 ## Priority 2 - Production Maturity
 
-1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26) — bounded 1.0 contract implemented; deferred primitives are tracked by [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), [#41](https://github.com/WilliamCorotan/FrameKit/issues/41), and [#42](https://github.com/WilliamCorotan/FrameKit/issues/42).
+1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26) — bounded 1.0 contract and [#41 ownership/row policies](https://github.com/WilliamCorotan/FrameKit/issues/41) implemented; deferred primitives are tracked by [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), and [#42](https://github.com/WilliamCorotan/FrameKit/issues/42).
 2. [#27 Add production lifecycle, observability, compatibility, and supply-chain gates](https://github.com/WilliamCorotan/FrameKit/issues/27) — implemented by this change; closes when merged.
 
 Exit criteria:

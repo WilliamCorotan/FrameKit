@@ -1,10 +1,12 @@
 import {
   assertPermission,
+  canTransferOwnership,
   CustomFieldSchema,
   defineApp,
   defineDocType,
   FramekitError,
   getDocType,
+  hasRowAccess,
   hasAccess,
   ViewSchema,
   type AppDefinition,
@@ -60,9 +62,9 @@ export type LifecycleResource = {
 export type DocumentRepository = LifecycleResource & {
   list(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentRecord[]>;
   listPage?(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentPage>;
-  get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined>;
+  get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options?: { access?: "read" | "write" | "transfer" }): Promise<DocumentRecord | undefined>;
   create(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord>;
-  update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options?: { expectedRevision?: number }): Promise<DocumentRecord>;
+  update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options?: { expectedRevision?: number; ownerTransfer?: boolean }): Promise<DocumentRecord>;
   delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options?: { expectedRevision?: number }): Promise<void>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
@@ -82,6 +84,7 @@ export type MutationCommand = {
   idempotencyFingerprint: string;
   audit: AuditEvent;
   outbox: OutboxEvent;
+  ownerTransfer?: boolean;
   afterWrite(): Promise<void>;
 };
 
@@ -165,7 +168,7 @@ export type NamingSeriesStore = LifecycleResource & {
 };
 
 export type MigrationChange = {
-  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint";
+  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy";
   doctype: string;
   field: string;
   destructive: boolean;
@@ -477,6 +480,11 @@ export class FramekitRuntime {
           changes.push(migrationChange({ kind: "remove_index", doctype: nextDocType.name, field: indexKey(index), destructive: false, from: index }));
         }
       }
+      const currentPolicy = { ownership: currentDocType.ownership, rowPolicy: currentDocType.rowPolicy };
+      const nextPolicy = { ownership: nextDocType.ownership, rowPolicy: nextDocType.rowPolicy };
+      if (stableJson(currentPolicy) !== stableJson(nextPolicy)) {
+        changes.push(migrationChange({ kind: "change_row_policy", doctype: nextDocType.name, field: "row_policy", destructive: true, from: currentPolicy, to: nextPolicy }));
+      }
     }
     for (const currentDocType of currentDocTypes) {
       if (nextDocTypes.some((doctype) => doctype.name === currentDocType.name)) continue;
@@ -628,6 +636,7 @@ export class FramekitRuntime {
   async create(tenant: TenantContext, doctypeName: string, input: DocumentData, options: Omit<MutationOptions, "expectedRevision"> = {}): Promise<DocumentRecord> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "create");
+    if (doctype.ownership && Object.hasOwn(input, "ownerId")) throw new FramekitError("OWNER_IMMUTABLE", "Owner is assigned from the authenticated creator", 403);
     const fingerprint = mutationFingerprint("create", doctype.name, input);
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
     if (replay) return replay;
@@ -651,6 +660,7 @@ export class FramekitRuntime {
       tenantId: tenant.tenantId,
       revision: 1,
       documentStatus: "draft",
+      ownerId: doctype.ownership ? tenant.userId : undefined,
       data,
       state,
       createdAt: timestamp,
@@ -680,11 +690,12 @@ export class FramekitRuntime {
   async update(tenant: TenantContext, doctypeName: string, id: string, input: DocumentData, options: MutationOptions = {}): Promise<DocumentRecord> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "update");
+    if (doctype.ownership && Object.hasOwn(input, "ownerId")) throw new FramekitError("OWNER_IMMUTABLE", "Owner changes require transferOwner", 403);
     requireExpectedRevisionForRetry(options);
     const fingerprint = mutationFingerprint("update", doctype.name, { id, input, expectedRevision: options.expectedRevision });
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
     if (replay) return replay;
-    const existing = await this.get(tenant, doctypeName, id);
+    const existing = await this.getForWrite(tenant, doctype, id);
     assertDraftDocument(existing, "update");
     const candidate = { ...existing.data, ...input };
     await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
@@ -721,7 +732,7 @@ export class FramekitRuntime {
     requireExpectedRevisionForRetry(options);
     const fingerprint = mutationFingerprint("delete", doctype.name, { id, expectedRevision: options.expectedRevision });
     if ((await this.replayMutation(tenant, options.idempotencyKey, fingerprint)) !== undefined) return;
-    const existing = await this.get(tenant, doctypeName, id);
+    const existing = await this.getForWrite(tenant, doctype, id);
     assertDraftDocument(existing, "delete");
     const expectedRevision = options.expectedRevision ?? existing.revision;
     await this.runHooks("beforeDelete", tenant, doctype, existing, existing.data);
@@ -758,7 +769,7 @@ export class FramekitRuntime {
     if (!workflow) {
       throw new FramekitError("WORKFLOW_NOT_DEFINED", `${doctype.name} does not define a workflow`, 400);
     }
-    const existing = await this.get(tenant, doctypeName, id);
+    const existing = await this.getForWrite(tenant, doctype, id);
     assertDraftDocument(existing, "transition");
     const currentState = existing.state ?? workflow.initialState;
     const transition = workflow.transitions.find((candidate) => candidate.action === action && candidate.from.includes(currentState));
@@ -811,6 +822,38 @@ export class FramekitRuntime {
     return this.changeDocumentStatus(tenant, doctypeName, id, "cancel", "cancelled", "beforeCancel", "afterCancel", options);
   }
 
+  async transferOwner(tenant: TenantContext, doctypeName: string, id: string, ownerId: string, options: MutationOptions = {}): Promise<DocumentRecord> {
+    const doctype = await this.getEffectiveDocType(tenant, doctypeName);
+    if (!doctype.ownership) throw new FramekitError("OWNERSHIP_NOT_ENABLED", `${doctype.name} does not enable ownership`, 400);
+    assertPermission(tenant, doctype, "transfer_owner");
+    if (!canTransferOwnership(tenant, doctype)) {
+      throw new FramekitError("FORBIDDEN", `Missing permission to transfer ownership of ${doctype.name}`, 403);
+    }
+    if (!ownerId.trim()) throw new FramekitError("INVALID_OWNER", "Owner id is required", 422);
+    requireExpectedRevisionForRetry(options);
+    const fingerprint = mutationFingerprint("transfer_owner", doctype.name, { id, ownerId, expectedRevision: options.expectedRevision });
+    const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
+    if (replay) return replay;
+    const existing = await this.repository.get(tenant, doctype, id, { access: "transfer" });
+    if (!existing) throw new FramekitError("DOCUMENT_NOT_FOUND", `No ${doctype.name} document with id "${id}"`, 404);
+    const expectedRevision = options.expectedRevision ?? existing.revision;
+    const updated: DocumentRecord = { ...existing, ownerId, revision: existing.revision + 1, updatedAt: this.now().toISOString() };
+    await this.runHooks("beforeUpdate", tenant, doctype, updated, updated.data);
+    const audit = this.createAuditEvent(tenant, "transfer_owner", updated);
+    const outbox = this.createOutboxEvent(tenant, "owner.transferred", updated);
+    const execution = this.mutations
+      ? await this.mutations.execute({
+          operation: "update", tenant, doctype, document: updated, expectedRevision,
+          idempotencyKey: options.idempotencyKey, idempotencyFingerprint: fingerprint, audit, outbox,
+          ownerTransfer: true,
+          afterWrite: () => this.runHooks("afterUpdate", tenant, doctype, updated, updated.data)
+        })
+      : { document: await this.updateWithoutUnitOfWork(tenant, doctype, updated, updated.data, expectedRevision, audit, outbox, "afterUpdate", true), replayed: false };
+    const saved = execution.document!;
+    if (!execution.replayed) await this.publishDocumentEvent(tenant, "owner.transferred", saved);
+    return saved;
+  }
+
   private async changeDocumentStatus(
     tenant: TenantContext,
     doctypeName: string,
@@ -827,7 +870,7 @@ export class FramekitRuntime {
     const fingerprint = mutationFingerprint(action, doctype.name, { id, expectedRevision: options.expectedRevision });
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
     if (replay) return replay;
-    const existing = await this.get(tenant, doctypeName, id);
+    const existing = await this.getForWrite(tenant, doctype, id);
     const expectedStatus = action === "submit" ? "draft" : "submitted";
     if (existing.documentStatus !== expectedStatus) {
       throw new FramekitError("INVALID_DOCUMENT_STATUS", `Cannot ${action} ${doctype.name} "${id}" from ${existing.documentStatus}`, 409);
@@ -890,6 +933,12 @@ export class FramekitRuntime {
     return output;
   }
 
+  private async getForWrite(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord> {
+    const document = await this.repository.get(tenant, doctype, id, { access: "write" });
+    if (!document) throw new FramekitError("DOCUMENT_NOT_FOUND", `No ${doctype.name} document with id "${id}"`, 404);
+    return document;
+  }
+
   private assertListOptions(doctype: DocTypeDefinition, options: ListOptions = {}): void {
     validateListOptions(doctype, options);
   }
@@ -928,8 +977,7 @@ export class FramekitRuntime {
         throw new FramekitError("UNIQUE_CONSTRAINT_FAILED", `${doctype.name}.${field.name} must be unique`, 409, {
           doctype: doctype.name,
           field: field.name,
-          value,
-          conflictId: conflict.id
+          value
         });
       }
     }
@@ -1009,6 +1057,7 @@ export class FramekitRuntime {
         doctype: document.doctype,
         revision: document.revision,
         documentStatus: document.documentStatus,
+        ownerId: document.ownerId,
         state: document.state,
         data: document.data
       },
@@ -1041,9 +1090,10 @@ export class FramekitRuntime {
     expectedRevision: number,
     audit: AuditEvent,
     outbox: OutboxEvent,
-    hook: "afterUpdate" | "afterTransition" | "afterSubmit" | "afterCancel" = "afterUpdate"
+    hook: "afterUpdate" | "afterTransition" | "afterSubmit" | "afterCancel" = "afterUpdate",
+    ownerTransfer = false
   ): Promise<DocumentRecord> {
-    const saved = await this.repository.update(tenant, doctype, document, { expectedRevision });
+    const saved = await this.repository.update(tenant, doctype, document, { expectedRevision, ownerTransfer });
     await this.runHooks(hook, tenant, doctype, saved, data);
     await this.audit.record(audit);
     await this.outbox.record(outbox);
@@ -1108,16 +1158,23 @@ export class InMemoryDocumentRepository implements DocumentRepository {
 
   async listPage(tenant: TenantContext, doctype: DocTypeDefinition, options: ListOptions = {}): Promise<DocumentPage> {
     validateListOptions(doctype, options);
-    const records = [...this.records.values()].filter((record) => record.tenantId === tenant.tenantId && record.doctype === doctype.name);
+    const records = [...this.records.values()].filter((record) =>
+      record.tenantId === tenant.tenantId && record.doctype === doctype.name && hasRowAccess(tenant, doctype, "read", record.ownerId)
+    );
     return applyListOptionsPage(records, options, doctype);
   }
 
-  async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined> {
+  async get(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { access?: "read" | "write" | "transfer" } = {}): Promise<DocumentRecord | undefined> {
     const record = this.records.get(keyFor(tenant.tenantId, doctype.name, id));
+    if (record && options.access === "transfer" && !canTransferOwnership(tenant, doctype)) return undefined;
+    if (record && options.access !== "transfer" && !hasRowAccess(tenant, doctype, options.access ?? "read", record.ownerId)) return undefined;
     return record ? { ...record, data: { ...record.data } } : undefined;
   }
 
   async create(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord> {
+    if ((doctype.ownership && record.ownerId !== tenant.userId) || (!doctype.ownership && record.ownerId !== undefined)) {
+      throw new FramekitError("INVALID_OWNER", "Document owner must be assigned by enabled ownership metadata", 403);
+    }
     const key = keyFor(tenant.tenantId, doctype.name, record.id);
     if (this.records.has(key)) {
       throw new FramekitError("DOCUMENT_EXISTS", `${doctype.name} "${record.id}" already exists`, 409);
@@ -1127,12 +1184,14 @@ export class InMemoryDocumentRepository implements DocumentRepository {
     return record;
   }
 
-  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number } = {}): Promise<DocumentRecord> {
+  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number; ownerTransfer?: boolean } = {}): Promise<DocumentRecord> {
     const key = keyFor(tenant.tenantId, doctype.name, record.id);
     const existing = this.records.get(key);
     if (!existing) {
       throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${record.id}" does not exist`, 404);
     }
+    if (options.ownerTransfer ? !canTransferOwnership(tenant, doctype) : !hasRowAccess(tenant, doctype, "write", existing.ownerId)) throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${record.id}" does not exist`, 404);
+    if (!options.ownerTransfer && record.ownerId !== existing.ownerId) throw new FramekitError("OWNER_IMMUTABLE", "Owner changes require transferOwner", 403);
     if (options.expectedRevision !== undefined && existing.revision !== options.expectedRevision) {
       throw revisionConflict(doctype.name, record.id, options.expectedRevision, existing.revision);
     }
@@ -1147,6 +1206,7 @@ export class InMemoryDocumentRepository implements DocumentRepository {
     if (!existing) {
       throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
     }
+    if (!hasRowAccess(tenant, doctype, "write", existing.ownerId)) throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
     if (options.expectedRevision !== undefined && existing.revision !== options.expectedRevision) {
       throw revisionConflict(doctype.name, id, options.expectedRevision, existing.revision);
     }
@@ -1167,8 +1227,7 @@ export class InMemoryDocumentRepository implements DocumentRepository {
         throw new FramekitError("UNIQUE_CONSTRAINT_FAILED", `${doctype.name}.${field.name} must be unique`, 409, {
           doctype: doctype.name,
           field: field.name,
-          value,
-          conflictId: conflict.id
+          value
         });
       }
     }
@@ -1384,7 +1443,7 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
       if (command.operation === "create") {
         result = await this.repository.create(command.tenant, command.doctype, command.document);
       } else if (command.operation === "update") {
-        result = await this.repository.update(command.tenant, command.doctype, command.document, { expectedRevision: command.expectedRevision });
+        result = await this.repository.update(command.tenant, command.doctype, command.document, { expectedRevision: command.expectedRevision, ownerTransfer: command.ownerTransfer });
       } else {
         await this.repository.delete(command.tenant, command.doctype, command.document.id, { expectedRevision: command.expectedRevision });
       }
@@ -1617,6 +1676,8 @@ function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollba
       return { kind: "remove_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
     case "remove_unique_constraint":
       return { kind: "add_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+    case "change_row_policy":
+      return { kind: "change_row_policy", doctype: change.doctype, field: "row_policy", destructive: true, from: change.to, to: change.from };
   }
 }
 
@@ -1639,7 +1700,7 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration plan identity, schema checksums, uniqueness metadata, and changes are required.", 422);
   }
   const identifier = /^[a-z][a-z0-9_]*$/;
-  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint"]);
+  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint", "change_row_policy"]);
   const constraints = [...plan.fromUniqueConstraints, ...plan.toUniqueConstraints];
   if (constraints.some((constraint) => !constraint || !identifier.test(constraint.doctype) || !identifier.test(constraint.field))) {
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration uniqueness metadata contains an invalid DocType or field identifier.", 422);
@@ -1789,7 +1850,7 @@ export function assertDestructiveMigration(plan: MigrationPlan, options: { allow
 }
 
 export function migrationChangeIsDestructive(change: Pick<MigrationChange, "kind"> | MigrationRollback): boolean {
-  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type";
+  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type" || change.kind === "change_row_policy";
 }
 
 export function assertSupportedMigration(plan: MigrationPlan): void {
