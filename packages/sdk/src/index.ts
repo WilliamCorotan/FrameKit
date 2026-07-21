@@ -96,6 +96,7 @@ export class FramekitRateLimitError extends FramekitSdkError {}
 export class FramekitServerError extends FramekitSdkError {}
 export class FramekitResponseError extends FramekitSdkError {}
 export class FramekitTransportError extends FramekitSdkError {}
+export class FramekitProtocolError extends FramekitSdkError {}
 export class FramekitCancelledError extends FramekitSdkError {}
 
 export type FramekitRequestOptions = { signal?: AbortSignal };
@@ -272,19 +273,30 @@ export class FramekitClient {
     onEvent: (event: { id?: string; type: string; data: unknown }) => void,
     options: { signal?: AbortSignal; lastEventId?: string } = {}
   ): Promise<void> {
-    const response = await fetch(this.baseUrl + "/api/realtime/stream", {
-      headers: { ...this.headers(), ...(options.lastEventId ? { "last-event-id": options.lastEventId } : {}) },
-      credentials: this.credentials,
-      signal: options.signal
-    });
-    if (!response.ok || !response.body) {
-      throw new Error(await response.text());
+    if (options.signal?.aborted) throw cancelledError(options.signal.reason);
+    let response: Response;
+    try {
+      response = await fetch(this.baseUrl + "/api/realtime/stream", {
+        headers: { ...this.headers(), ...(options.lastEventId ? { "last-event-id": options.lastEventId } : {}) },
+        credentials: this.credentials,
+        signal: options.signal
+      });
+    } catch (cause) {
+      throw toFramekitSdkError(cause, options.signal);
     }
+    if (!response.ok) throw await responseToSdkError(response, options.signal);
+    if (!response.body) throw new FramekitProtocolError("Realtime response did not include a stream body.", "SSE_BODY_MISSING", response.status, undefined, response.headers.get("x-request-id") ?? undefined, undefined);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     while (true) {
-      const { done, value } = await reader.read();
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await reader.read();
+      } catch (cause) {
+        throw toFramekitSdkError(cause, options.signal);
+      }
+      const { done, value } = result;
       if (done) {
         return;
       }
@@ -580,7 +592,7 @@ export function upgradeFramekitClientConfig(input: FramekitClientOptions): Frame
 export function generateSdkTypes(app: AppDefinition): string {
   const lines: string[] = [
     "import type { DocumentRecord } from \"@framekit/core\";",
-    "export { FramekitSdkError, FramekitValidationError, FramekitAuthenticationError, FramekitAuthorizationError, FramekitNotFoundError, FramekitConflictError, FramekitRateLimitError, FramekitServerError, FramekitResponseError, FramekitTransportError, FramekitCancelledError } from \"@framekit/sdk\";",
+    "export { FramekitSdkError, FramekitValidationError, FramekitAuthenticationError, FramekitAuthorizationError, FramekitNotFoundError, FramekitConflictError, FramekitRateLimitError, FramekitServerError, FramekitResponseError, FramekitTransportError, FramekitProtocolError, FramekitCancelledError } from \"@framekit/sdk\";",
     "export type { FramekitClientConfigV1, FramekitClientConfigV2, FramekitRetryPolicy } from \"@framekit/sdk\";",
     ""
   ];
@@ -679,6 +691,25 @@ function toFramekitSdkError(cause: unknown, signal?: AbortSignal): FramekitSdkEr
   return new FramekitTransportError(...args);
 }
 
+async function responseToSdkError(response: Response, signal?: AbortSignal): Promise<FramekitSdkError> {
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (cause) {
+    return toFramekitSdkError(cause, signal);
+  }
+  let data: unknown;
+  try {
+    data = text ? JSON.parse(text) : undefined;
+  } catch {
+    data = text ? { message: text } : undefined;
+  }
+  return toFramekitSdkError({
+    message: text || `Framekit request failed with HTTP ${response.status}.`,
+    response: { status: response.status, headers: response.headers, _data: data }
+  }, signal);
+}
+
 function cancelledError(reason: unknown): FramekitCancelledError {
   return new FramekitCancelledError("Framekit request was cancelled.", "REQUEST_CANCELLED", undefined, reason, undefined, undefined, { cause: reason });
 }
@@ -733,5 +764,9 @@ function parseSseChunk(chunk: string): { id?: string; type: string; data: unknow
   if (!data) {
     return undefined;
   }
-  return { ...(id ? { id } : {}), type, data: JSON.parse(data) as unknown };
+  try {
+    return { ...(id ? { id } : {}), type, data: JSON.parse(data) as unknown };
+  } catch (cause) {
+    throw new FramekitProtocolError("Realtime event data is not valid JSON.", "SSE_INVALID_JSON", undefined, { eventId: id, eventType: type }, undefined, undefined, { cause });
+  }
 }

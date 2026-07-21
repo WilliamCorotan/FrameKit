@@ -55,9 +55,9 @@ try {
   run("pnpm", ["install", "--no-frozen-lockfile"], appRoot);
   run("pnpm", ["typecheck"], appRoot);
   run("pnpm", ["build"], appRoot);
-  await writeFile(join(appRoot, "test", "sdk-contract.mjs"), `import { FRAMEKIT_SDK_CONFIG_VERSION, FramekitResponseError, FramekitValidationError, upgradeFramekitClientConfig } from "@framekit/sdk";
+  await writeFile(join(appRoot, "test", "sdk-contract.mjs"), `import { FRAMEKIT_SDK_CONFIG_VERSION, FramekitProtocolError, FramekitResponseError, FramekitValidationError, upgradeFramekitClientConfig } from "@framekit/sdk";
 const upgraded = upgradeFramekitClientConfig({ version: 1, baseUrl: "http://localhost" });
-if (FRAMEKIT_SDK_CONFIG_VERSION !== 2 || upgraded.config.version !== 2 || upgraded.config.retry !== undefined || typeof FramekitValidationError !== "function" || typeof FramekitResponseError !== "function") {
+if (FRAMEKIT_SDK_CONFIG_VERSION !== 2 || upgraded.config.version !== 2 || upgraded.config.retry !== undefined || typeof FramekitValidationError !== "function" || typeof FramekitResponseError !== "function" || typeof FramekitProtocolError !== "function") {
   throw new Error("Packed SDK error/config exports are incomplete.");
 }
 `);

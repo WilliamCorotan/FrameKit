@@ -3,8 +3,8 @@ import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, validateMigrationPlan, type MigrationPlan as RuntimeMigrationPlan } from "../../runtime/src/index.js";
 import { ofetch } from "ofetch";
 import {
-  createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitCancelledError, FramekitClient, FramekitConflictError,
-  FramekitResponseError, FramekitServerError, FramekitValidationError, generateSdkTypes, upgradeFramekitClientConfig, type MigrationPlan
+  createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitAuthorizationError, FramekitCancelledError, FramekitClient, FramekitConflictError,
+  FramekitProtocolError, FramekitResponseError, FramekitServerError, FramekitValidationError, generateSdkTypes, upgradeFramekitClientConfig, type MigrationPlan
 } from "./index.js";
 
 vi.mock("ofetch", () => ({ ofetch: vi.fn() }));
@@ -251,6 +251,42 @@ describe("generateSdkTypes", () => {
 
     expect(events).toEqual([{ id: "42", type: "customer.created", data: { id: "customer-1" } }]);
     expect(vi.mocked(fetch).mock.calls[0]?.[1]?.headers).toMatchObject({ "last-event-id": "41" });
+  });
+
+  it("maps realtime HTTP envelopes with status, details, and request identity", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ code: "FORBIDDEN", message: "stream denied", details: { permission: "framekit.realtime.read" } }), {
+      status: 403,
+      headers: { "content-type": "application/json", "x-request-id": "stream-request-42" }
+    }));
+    const client = createClient({ baseUrl: "https://app.example" });
+
+    const error = await client.streamRealtimeEvents(() => undefined).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(FramekitAuthorizationError);
+    expect(error).toMatchObject({ status: 403, code: "FORBIDDEN", details: { permission: "framekit.realtime.read" }, requestId: "stream-request-42" });
+  });
+
+  it("maps realtime fetch and body-read aborts to cancellation", async () => {
+    const fetchController = new AbortController();
+    fetchController.abort("before fetch");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const client = createClient({ baseUrl: "https://app.example" });
+    await expect(client.streamRealtimeEvents(() => undefined, { signal: fetchController.signal })).rejects.toBeInstanceOf(FramekitCancelledError);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    fetchMock.mockResolvedValue(new Response(new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } }), { status: 200 }));
+    const readController = new AbortController();
+    const reading = client.streamRealtimeEvents(() => undefined, { signal: readController.signal });
+    await Promise.resolve();
+    await Promise.resolve();
+    readController.abort("during read");
+    streamController.error(new DOMException("aborted", "AbortError"));
+    await expect(reading).rejects.toBeInstanceOf(FramekitCancelledError);
+  });
+
+  it("classifies malformed realtime event data as a protocol error", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("event: broken\ndata: {not-json}\n\n", { status: 200 }));
+    await expect(createClient({ baseUrl: "https://app.example" }).streamRealtimeEvents(() => undefined)).rejects.toBeInstanceOf(FramekitProtocolError);
   });
 
   it("includes credentials for cookie-backed auth helpers", async () => {
