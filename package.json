@@ -14,6 +14,8 @@
     "release:candidate:check": "node scripts/release-candidate.mjs --check",
     "release:prepare": "node scripts/prepare-release.mjs",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "audit:dependencies": "pnpm audit --audit-level high",
     "test:desk:browser": "pnpm --filter @framekit/desk test:browser",
     "test:desk:fullstack": "pnpm --filter @framekit/desk test:browser:fullstack",
     "test:services": "pnpm --filter @framekit/db test:integration && pnpm --filter @framekit/jobs test:integration",
@@ -22,11 +24,12 @@
     "smoke:crm:built": "pnpm --filter @framekit/example-crm smoke:built",
     "test:smoke:crm:built": "pnpm --filter @framekit/example-crm test:smoke-built",
     "typecheck": "pnpm -r --if-present typecheck",
-    "audit:all": "pnpm lint && pnpm typecheck && pnpm test && pnpm build"
+    "audit:all": "pnpm lint && pnpm typecheck && pnpm test:coverage && pnpm build"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",
     "@vitejs/plugin-react": "^5.1.2",
+    "@vitest/coverage-v8": "^4.1.9",
     "typescript": "^6.0.3",
     "vite": "^8.1.3",
     "vitest": "^4.1.9"

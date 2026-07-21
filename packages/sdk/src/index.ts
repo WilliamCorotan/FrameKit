@@ -122,8 +122,8 @@ export type MigrationRecord = MigrationPlan & {
 };
 
 export const FRAMEKIT_HTTP_ENDPOINTS = [
-  ["health", "GET", "/health"],
-  ["dependencyHealth", "GET", "/health/dependencies"],
+  ["health", "GET", "/health/live"],
+  ["dependencyHealth", "GET", "/health/ready"],
   ["meta", "GET", "/api/meta"],
   ["diagnostics", "GET", "/api/diagnostics"],
   ["migrations", "GET", "/api/migrations"],
@@ -193,11 +193,11 @@ export class FramekitClient {
   }
 
   health(): Promise<HealthResponse> {
-    return this.request("/health", { skipAuth: true });
+    return this.request("/health/live", { skipAuth: true });
   }
 
   dependencyHealth(): Promise<DependencyHealthResponse> {
-    return this.request("/health/dependencies", { skipAuth: true });
+    return this.request("/health/ready", { skipAuth: true });
   }
 
   meta<T = unknown>(): Promise<T> {

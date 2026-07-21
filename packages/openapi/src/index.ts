@@ -145,19 +145,19 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
     }
   };
   const paths: Record<string, Record<string, Operation>> = {
-    "/health": {
+    "/health/live": {
       get: {
         operationId: "getHealth",
-        summary: "Check app health",
+        summary: "Check process liveness",
         tags: ["System"],
         responses: okResponse({ type: "object", additionalProperties: true }),
         security: []
       }
     },
-    "/health/dependencies": {
+    "/health/ready": {
       get: {
         operationId: "getDependencyHealth",
-        summary: "Check app dependency health",
+        summary: "Check dependency readiness",
         tags: ["System"],
         responses: okResponse({ type: "object", additionalProperties: true }),
         security: []

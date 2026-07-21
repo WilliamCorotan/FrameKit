@@ -51,7 +51,13 @@ export type FilterOperator = {
 
 export type FilterValue = FilterPrimitive | FilterPrimitive[] | FilterOperator;
 
-export type DocumentRepository = {
+export type LifecycleResource = {
+  start?(signal?: AbortSignal): void | Promise<void>;
+  close?(): void | Promise<void>;
+  dispose?(): void | Promise<void>;
+};
+
+export type DocumentRepository = LifecycleResource & {
   list(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentRecord[]>;
   listPage?(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentPage>;
   get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined>;
@@ -79,7 +85,7 @@ export type MutationCommand = {
   afterWrite(): Promise<void>;
 };
 
-export type MutationUnitOfWork = {
+export type MutationUnitOfWork = LifecycleResource & {
   execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }>;
   replay?(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<{ found: boolean; result?: DocumentRecord }>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
@@ -95,7 +101,7 @@ export type AuditSink = {
   record(event: AuditEvent): Promise<void> | void;
 };
 
-export type AuditStore = AuditSink & {
+export type AuditStore = LifecycleResource & AuditSink & {
   list(tenant: TenantContext, options?: { limit?: number }): Promise<AuditEvent[]>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
@@ -134,7 +140,7 @@ export type OutboxClaimOptions = {
   now?: string;
 };
 
-export type OutboxStore = {
+export type OutboxStore = LifecycleResource & {
   record(event: OutboxEvent): Promise<void> | void;
   list(tenant: TenantContext, options?: { limit?: number; status?: OutboxEvent["status"] }): Promise<OutboxEvent[]>;
   markDispatched(tenant: TenantContext, id: string): Promise<OutboxEvent>;
@@ -145,7 +151,7 @@ export type OutboxStore = {
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
-export type CustomizationStore = {
+export type CustomizationStore = LifecycleResource & {
   listCustomFields(tenant: TenantContext): Promise<CustomFieldDefinition[]>;
   addCustomField(tenant: TenantContext, field: CustomFieldDefinition): Promise<CustomFieldDefinition>;
   listViews(tenant: TenantContext): Promise<ViewDefinition[]>;
@@ -153,7 +159,7 @@ export type CustomizationStore = {
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
-export type NamingSeriesStore = {
+export type NamingSeriesStore = LifecycleResource & {
   next(tenant: TenantContext, doctype: DocTypeDefinition, prefix: string, digits: number): Promise<string>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
@@ -192,7 +198,7 @@ export type ExecutableMigrationArtifact = MigrationPlan & {
   down: MigrationRollback[];
 };
 
-export type MigrationStore = {
+export type MigrationStore = LifecycleResource & {
   list(tenant: TenantContext, options?: { appName?: string }): Promise<MigrationRecord[]>;
   record(tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord>;
   applyPlan?(tenant: TenantContext, plan: MigrationPlan, options?: { allowDestructive?: boolean; appliedAt?: string }): Promise<MigrationRecord>;
@@ -208,10 +214,10 @@ export type RuntimeRealtimeEvent = {
   createdAt?: string;
 };
 
-export type RealtimePublisher = {
+export type RealtimePublisher = LifecycleResource & {
   publish(event: RuntimeRealtimeEvent): Promise<void> | void;
   list?(channel: string, options?: { limit?: number; after?: string; order?: "asc" | "desc" }): Promise<RuntimeRealtimeEvent[]> | RuntimeRealtimeEvent[];
-  subscribe?(channel: string, listener: (event: RuntimeRealtimeEvent) => void): Promise<() => void> | (() => void);
+  subscribe?(channel: string, listener: (event: RuntimeRealtimeEvent) => void, options?: { signal?: AbortSignal }): Promise<() => void> | (() => void);
   health?(): Promise<{ ok: boolean; details?: Record<string, unknown> }>;
   close?(): Promise<void>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
@@ -226,6 +232,7 @@ export type RuntimeOptions = {
   migrations?: MigrationStore;
   realtime?: RealtimePublisher;
   mutations?: MutationUnitOfWork;
+  resources?: LifecycleResource[];
   idGenerator?: () => string;
   now?: () => Date;
 };
@@ -242,6 +249,10 @@ export class FramekitRuntime {
   private readonly mutations?: MutationUnitOfWork;
   private readonly idGenerator: () => string;
   private readonly now: () => Date;
+  private readonly resources: LifecycleResource[];
+  private lifecycleState: "created" | "started" | "closing" | "closed" = "created";
+  private startPromise?: Promise<void>;
+  private closePromise?: Promise<void>;
 
   constructor(app: AppDefinition, options: RuntimeOptions = {}) {
     this.app = defineApp(app);
@@ -262,6 +273,77 @@ export class FramekitRuntime {
     );
     this.idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
     this.now = options.now ?? (() => new Date());
+    this.resources = uniqueLifecycleResources([
+      repository, audit, outbox, this.customization, this.namingSeries, this.migrations, this.realtime,
+      ...(this.mutations ? [this.mutations] : []), ...(options.resources ?? [])
+    ]);
+  }
+
+  async start(signal?: AbortSignal): Promise<void> {
+    if (this.lifecycleState === "started") return;
+    if (this.startPromise) return this.startPromise;
+    if (this.lifecycleState !== "created") throw new FramekitError("RUNTIME_CLOSED", "Runtime cannot be started after shutdown.", 503);
+    const operation = this.startResources(signal);
+    this.startPromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.startPromise === operation) this.startPromise = undefined;
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.lifecycleState === "closed") return;
+    if (this.closePromise) return this.closePromise;
+    const operation = this.closeResources();
+    this.closePromise = operation;
+    try {
+      await operation;
+    } finally {
+      if (this.closePromise === operation) this.closePromise = undefined;
+    }
+  }
+
+  async dispose(): Promise<void> { await this.close(); }
+
+  lifecycleStatus(): { state: "created" | "started" | "closing" | "closed"; ready: boolean } {
+    return { state: this.lifecycleState, ready: this.lifecycleState === "started" };
+  }
+
+  private async startResources(signal?: AbortSignal): Promise<void> {
+    const started: LifecycleResource[] = [];
+    try {
+      for (const resource of this.resources) {
+        signal?.throwIfAborted();
+        await resource.start?.(signal);
+        started.push(resource);
+      }
+      this.lifecycleState = "started";
+    } catch (error) {
+      try {
+        await closeLifecycleResources(started.reverse());
+      } catch (closeError) {
+        throw new AggregateError([error, closeError], "Runtime startup and rollback both failed.");
+      } finally {
+        this.lifecycleState = "closed";
+      }
+      throw error;
+    }
+  }
+
+  private async closeResources(): Promise<void> {
+    try {
+      await this.startPromise;
+    } catch {
+      return;
+    }
+    if (this.lifecycleState === "closed") return;
+    this.lifecycleState = "closing";
+    try {
+      await closeLifecycleResources([...this.resources].reverse());
+    } finally {
+      this.lifecycleState = "closed";
+    }
   }
 
   async metadata(tenant?: TenantContext) {
@@ -325,11 +407,11 @@ export class FramekitRuntime {
     return this.realtime.list(`tenant:${tenant.tenantId}:documents`, options);
   }
 
-  async subscribeRealtime(tenant: TenantContext, listener: (event: RuntimeRealtimeEvent) => void): Promise<() => void> {
+  async subscribeRealtime(tenant: TenantContext, listener: (event: RuntimeRealtimeEvent) => void, options: { signal?: AbortSignal } = {}): Promise<() => void> {
     if (!this.realtime.subscribe) {
       throw new FramekitError("REALTIME_STREAM_UNAVAILABLE", "Realtime streaming is not available for this app.", 501);
     }
-    return await this.realtime.subscribe(`tenant:${tenant.tenantId}:documents`, listener);
+    return await this.realtime.subscribe(`tenant:${tenant.tenantId}:documents`, listener, options);
   }
 
   async planMigration(tenant: TenantContext, nextApp: AppDefinition): Promise<MigrationPlan> {
@@ -2135,4 +2217,25 @@ function createRuntimeWarnings(
     }
   }
   return warnings;
+}
+
+function uniqueLifecycleResources(resources: unknown[]): LifecycleResource[] {
+  return [...new Set(resources.flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object") return [];
+    const resource = candidate as LifecycleResource;
+    return resource.start || resource.close || resource.dispose ? [resource] : [];
+  }))];
+}
+
+async function closeLifecycleResources(resources: LifecycleResource[]): Promise<void> {
+  const failures: unknown[] = [];
+  for (const resource of resources) {
+    try {
+      if (resource.close) await resource.close();
+      else await resource.dispose?.();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) throw new AggregateError(failures, "One or more runtime resources failed to close.");
 }

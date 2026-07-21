@@ -10,6 +10,21 @@ const tenant: TenantContext = {
 };
 
 describe("runtime document service", () => {
+  it("starts resources in order and closes them once in reverse order", async () => {
+    const events: string[] = [];
+    const first = { start: () => { events.push("first:start"); }, close: () => { events.push("first:close"); } };
+    const second = { start: () => { events.push("second:start"); }, dispose: () => { events.push("second:dispose"); } };
+    const runtime = createRuntime(defineApp({ name: "Lifecycle", modules: [] }), { resources: [first, second] });
+
+    await runtime.start();
+    await runtime.start();
+    expect(runtime.lifecycleStatus()).toEqual({ state: "started", ready: true });
+    await runtime.close();
+    await runtime.dispose();
+
+    expect(events).toEqual(["first:start", "second:start", "second:dispose", "first:close"]);
+    expect(runtime.lifecycleStatus()).toEqual({ state: "closed", ready: false });
+  });
   it("creates and lists documents", async () => {
     const app = defineApp({
       name: "CRM",

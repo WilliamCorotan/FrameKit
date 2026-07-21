@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, migrationChecksum, type RealtimePublisher, type RuntimeRealtimeEvent } from "@framekit/runtime";
-import { assertSecureProductionCredentials, createNitroHandler } from "./index.js";
+import { assertSecureProductionCredentials, createNitroHandler, createOpenTelemetryAdapters } from "./index.js";
 
 describe("createNitroHandler", () => {
   it("exposes submit and cancel document lifecycle commands", async () => {
@@ -107,6 +107,64 @@ describe("createNitroHandler", () => {
       database: { ok: true },
       queue: { ok: false }
     });
+  });
+
+  it("separates liveness from bounded dependency readiness", async () => {
+    const runtime = createRuntime(defineApp({ name: "Health", modules: [] }));
+    let checks = 0;
+    let observedAbort = false;
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, {
+      healthCheckTimeoutMs: 20,
+      healthChecks: {
+        database: (signal) => new Promise((resolve) => {
+          checks += 1;
+          signal.addEventListener("abort", () => {
+            observedAbort = true;
+            resolve({ ok: false });
+          }, { once: true });
+        })
+      }
+    }));
+    const fetch = toWebHandler(h3);
+
+    expect((await fetch(new Request("http://localhost/health/live"))).status).toBe(200);
+    expect(checks).toBe(0);
+    const readiness = await fetch(new Request("http://localhost/health/ready"));
+    const body = await readiness.json() as { dependencies: { database: { details: { code: string; timeoutMs: number } } } };
+    expect(readiness.status).toBe(503);
+    expect(observedAbort).toBe(true);
+    expect(body.dependencies.database.details).toEqual({ code: "HEALTH_CHECK_TIMEOUT", timeoutMs: 20 });
+  });
+
+  it("adapts OpenTelemetry-compatible sinks and redacts secrets", async () => {
+    const records: Array<{ attributes: Record<string, unknown> }> = [];
+    const exceptions: unknown[] = [];
+    const durations: number[] = [];
+    const counts: number[] = [];
+    const adapters = createOpenTelemetryAdapters({
+      logger: { emit: (record) => records.push(record) },
+      tracer: { startSpan: () => ({ recordException: (error) => exceptions.push(error), end: vi.fn() }) },
+      meter: {
+        createHistogram: () => ({ record: (value) => durations.push(value) }),
+        createCounter: () => ({ add: (value) => counts.push(value) })
+      }
+    });
+    const runtime = createRuntime(defineApp({ name: "Telemetry", modules: [] }));
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, {
+      ...adapters,
+      rateLimit: { allow: () => { throw new Error("Bearer top.secret.value eyJabc.def.ghi"); } }
+    }));
+
+    const response = await toWebHandler(h3)(new Request("http://localhost/health/live"));
+    expect(response.status).toBe(500);
+    expect(records).toHaveLength(1);
+    expect(exceptions).toHaveLength(1);
+    expect(JSON.stringify(records)).not.toContain("top.secret.value");
+    expect(JSON.stringify(exceptions)).not.toContain("top.secret.value");
+    expect(durations).toHaveLength(1);
+    expect(counts).toEqual([1]);
   });
 
   it("executes browser-facing provider redirects and establishes the callback session cookie", async () => {

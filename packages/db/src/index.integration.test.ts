@@ -834,6 +834,7 @@ type StoreSet = {
 };
 
 async function migrateAll(stores: StoreSet) {
+  await Promise.all(Object.values(stores).map((store) => store.start()));
   await stores.repository.migrate();
   await stores.audit.migrate();
   await stores.outbox.migrate();
@@ -852,14 +853,7 @@ async function migrateAll(stores: StoreSet) {
 }
 
 async function closeStores(stores: StoreSet) {
-  for (const store of Object.values(stores)) {
-    const candidate = store as unknown as {
-      db?: { $client?: { end(options?: { timeout?: number }): Promise<void> } };
-      sql?: { end(options?: { timeout?: number }): Promise<void> };
-    };
-    await candidate.db?.$client?.end({ timeout: 1 });
-    await candidate.sql?.end({ timeout: 1 });
-  }
+  await Promise.all(Object.values(stores).map((store) => store.close()));
 }
 
 async function cleanup(sql: postgres.Sql) {
