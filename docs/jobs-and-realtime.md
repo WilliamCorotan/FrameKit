@@ -6,7 +6,7 @@ FrameKit's production delivery contract is **at least once**. `PostgresOutboxSto
 
 Failures use exponential backoff from `baseBackoffMs`. Events become `dead_letter` after `maxAttempts`; operators should alert on and inspect that state before explicitly redriving or resolving the underlying failure. `OutboxDispatcher`, `ScheduledJobRunner`, `BullMqQueue`, and `BullMqWorker` expose `health()` and `close()` so deployments can stop timers and connections during graceful shutdown.
 
-`PostgresRealtimePublisher` persists events before notification. PostgreSQL `LISTEN/NOTIFY` provides low-latency cross-instance fanout, while the table's monotonic cursor provides recovery. List history with `after=<cursor>` or reconnect SSE with `Last-Event-ID`; the server replays durable events and suppresses cursor duplicates across the replay/live handoff.
+`PostgresRealtimePublisher` persists events before notification. PostgreSQL `LISTEN/NOTIFY` provides low-latency cross-instance fanout, while the table's monotonic cursor provides recovery. Subscription readiness is awaited before replay, notifications trigger an ascending durable-history pump, and only the latest delivered cursor is retained, so fresh and reconnecting streams remain ordered without an unbounded deduplication set. List history with `after=<cursor>` or reconnect SSE with `Last-Event-ID`.
 
 Production wiring should:
 

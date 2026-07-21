@@ -672,6 +672,23 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       await expect(other.list(claimTenant, { status: "dead_letter" })).resolves.toEqual(expect.arrayContaining([
         expect.objectContaining({ id: expired.id, attempts: 2, error: "terminal" })
       ]));
+      await stores.outbox.record({
+        tenantId: claimTenant.tenantId,
+        id: "already-exhausted",
+        type: "customer.created",
+        topic: "customer",
+        payload: {},
+        status: "failed",
+        attempts: 2,
+        error: "legacy failure",
+        createdAt: "2026-07-21T00:00:00.000Z"
+      });
+      await expect(other.claim(claimTenant, { ownerId: "sweeper", maxAttempts: 2, now: "2026-07-21T00:01:00.000Z" })).resolves.not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: "already-exhausted" })])
+      );
+      await expect(other.list(claimTenant, { status: "dead_letter" })).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: "already-exhausted", attempts: 2, error: "legacy failure" })
+      ]));
     } finally {
       await sql`delete from framekit_outbox_events where tenant_id = ${claimTenant.tenantId}`;
       await other.close();
@@ -685,7 +702,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await publisher.migrate();
     await sql`delete from framekit_realtime_events where channel = ${channel}`;
     const received: Array<{ cursor?: string; payload: Record<string, unknown> }> = [];
-    const unsubscribe = subscriber.subscribe(channel, (event) => received.push(event));
+    const unsubscribe = await subscriber.subscribe(channel, (event) => received.push(event));
     try {
       await expect(subscriber.health()).resolves.toMatchObject({ ok: true });
       await publisher.publish({ channel, type: "customer.created", payload: { id: "first" } });
@@ -696,12 +713,24 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       await expect(subscriber.list(channel, { after: cursor })).resolves.toEqual([
         expect.objectContaining({ type: "customer.updated", payload: { id: "second" } })
       ]);
+      await Promise.all(Array.from({ length: 50 }, (_, index) => publisher.publish({
+        channel,
+        type: "customer.updated",
+        payload: { id: `burst-${index}` }
+      })));
+      await waitFor(() => received.length === 52);
+      const cursors = received.map((event) => BigInt(event.cursor!));
+      expect(cursors).toHaveLength(52);
+      expect(new Set(cursors.map(String)).size).toBe(52);
+      expect(cursors.every((value, index) => index === 0 || value > cursors[index - 1]!)).toBe(true);
+      const replayed = await subscriber.list(channel, { after: cursor, order: "asc", limit: 100 });
+      expect(replayed.map((event) => event.cursor)).toEqual(received.slice(1).map((event) => event.cursor));
     } finally {
       unsubscribe();
       await sql`delete from framekit_realtime_events where channel = ${channel}`;
       await Promise.all([publisher.close(), subscriber.close()]);
     }
-  });
+  }, 10_000);
 });
 
 type StoreSet = {

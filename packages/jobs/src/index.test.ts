@@ -163,6 +163,21 @@ describe("dispatchOutboxEvents", () => {
     runner.start();
     await runner.close();
   });
+
+  it("sweeps already-exhausted failed events into dead-letter state", async () => {
+    const runtime = createJobsRuntime("Exhausted Failures");
+    await runtime.create(tenant, "customer", { name: "Stranded Co" });
+    const [event] = await runtime.outboxEvents(tenant);
+    await runtime.markOutboxFailed(tenant, event!.id, "first failure");
+    await runtime.markOutboxFailed(tenant, event!.id, "second failure");
+
+    await expect(dispatchOutboxEvents(runtime, tenant, async () => undefined, {
+      ownerId: "sweeper", maxAttempts: 2, now: "2026-07-21T00:00:00.000Z"
+    })).resolves.toMatchObject({ inspected: 0, dispatched: 0 });
+    await expect(runtime.outboxEvents(tenant)).resolves.toEqual([
+      expect.objectContaining({ id: event!.id, status: "dead_letter", attempts: 2, error: "second failure" })
+    ]);
+  });
 });
 
 function createJobsRuntime(name: string) {

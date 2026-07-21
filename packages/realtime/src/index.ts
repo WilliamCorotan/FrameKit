@@ -29,9 +29,11 @@ export class InMemoryEventBus implements EventBus {
     }
   }
 
-  list(channel: string, options: { limit?: number; after?: string } = {}): RealtimeEvent[] {
+  list(channel: string, options: { limit?: number; after?: string; order?: "asc" | "desc" } = {}): RealtimeEvent[] {
     const events = this.events.filter((event) => event.channel === channel && (!options.after || Number(event.cursor) > Number(options.after)));
-    return options.after ? events.slice(0, options.limit ?? 100) : events.slice(-(options.limit ?? 100)).reverse();
+    return (options.order ?? (options.after ? "asc" : "desc")) === "asc"
+      ? events.slice(0, options.limit ?? 100)
+      : events.slice(-(options.limit ?? 100)).reverse();
   }
 
   subscribe(channel: string, listener: (event: RealtimeEvent) => void): () => void {

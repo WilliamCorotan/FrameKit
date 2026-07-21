@@ -2,7 +2,7 @@ import { H3, toWebHandler } from "h3";
 import { describe, expect, it, vi } from "vitest";
 import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
-import { createRuntime, migrationChecksum, type RuntimeRealtimeEvent } from "@framekit/runtime";
+import { createRuntime, migrationChecksum, type RealtimePublisher, type RuntimeRealtimeEvent } from "@framekit/runtime";
 import { assertSecureProductionCredentials, createNitroHandler } from "./index.js";
 
 describe("createNitroHandler", () => {
@@ -817,6 +817,76 @@ describe("createNitroHandler", () => {
     await json(fetch, "/api/auth/logout", { method: "POST", headers });
     await expect(json(fetch, "/api/auth/me", { headers })).rejects.toMatchObject({ code: "SESSION_REVOKED" });
   });
+
+  it("replays fresh and reconnecting SSE streams monotonically across the LISTEN handoff with bounded cursor state", async () => {
+    const channel = "tenant:default:documents";
+    const history = Array.from({ length: 1_500 }, (_, index): RuntimeRealtimeEvent => ({
+      cursor: String(index + 1), channel, type: "record.updated", payload: { index: index + 1 }
+    }));
+    const listeners = new Set<(event: RuntimeRealtimeEvent) => void>();
+    const readiness = deferred<void>();
+    let cleanups = 0;
+    const realtime: RealtimePublisher = {
+      publish: () => undefined,
+      list: (_channel, options = {}) => history
+        .filter((event) => !options.after || BigInt(event.cursor!) > BigInt(options.after))
+        .sort((left, right) => Number(BigInt(left.cursor!) - BigInt(right.cursor!)))
+        .slice(0, options.limit ?? 100),
+      async subscribe(_channel, listener) {
+        listeners.add(listener);
+        await readiness.promise;
+        return () => {
+          cleanups += 1;
+          listeners.delete(listener);
+        };
+      }
+    };
+    const fetch = realtimeFetch(realtime);
+    const fresh = await fetch(new Request("http://localhost/api/realtime/stream", { headers: realtimeHeaders }));
+    const duringHandshake: RuntimeRealtimeEvent = { cursor: "1501", channel, type: "record.updated", payload: { index: 1501 } };
+    history.push(duringHandshake);
+    for (const listener of listeners) listener(duringHandshake);
+    readiness.resolve();
+
+    expect(await readSseIds(fresh, 1_501)).toEqual(Array.from({ length: 1_501 }, (_, index) => String(index + 1)));
+    expect(cleanups).toBe(1);
+
+    const reconnect = await fetch(new Request("http://localhost/api/realtime/stream", {
+      headers: { ...realtimeHeaders, "last-event-id": "1499" }
+    }));
+    expect(await readSseIds(reconnect, 2)).toEqual(["1500", "1501"]);
+    expect(cleanups).toBe(2);
+  });
+
+  it("cleans realtime subscriptions when replay fails or the stream is cancelled during readiness", async () => {
+    let replayCleanup = 0;
+    const failingFetch = realtimeFetch({
+      publish: () => undefined,
+      list: () => { throw new Error("replay unavailable"); },
+      subscribe: () => () => { replayCleanup += 1; }
+    });
+    const failed = await failingFetch(new Request("http://localhost/api/realtime/stream", { headers: realtimeHeaders }));
+    const failedReader = failed.body!.getReader();
+    await failedReader.read();
+    await expect(failedReader.read()).rejects.toThrow("replay unavailable");
+    expect(replayCleanup).toBe(1);
+
+    const readiness = deferred<void>();
+    let earlyCleanup = 0;
+    const waitingFetch = realtimeFetch({
+      publish: () => undefined,
+      list: () => [],
+      async subscribe() {
+        await readiness.promise;
+        return () => { earlyCleanup += 1; };
+      }
+    });
+    const waiting = await waitingFetch(new Request("http://localhost/api/realtime/stream", { headers: realtimeHeaders }));
+    const cancellation = waiting.body!.cancel();
+    readiness.resolve();
+    await cancellation;
+    await vi.waitFor(() => expect(earlyCleanup).toBe(1));
+  });
 });
 
 async function json<T = unknown>(
@@ -841,4 +911,47 @@ async function json<T = unknown>(
     throw body;
   }
   return body as T;
+}
+
+const realtimeHeaders = {
+  "x-tenant-id": "default",
+  "x-user-id": "realtime-test",
+  "x-permissions": "framekit.realtime.read"
+};
+
+function realtimeFetch(realtime: RealtimePublisher) {
+  const runtime = createRuntime(defineApp({ name: "Realtime Test", modules: [] }), { realtime });
+  const h3 = new H3();
+  h3.all("/**", createNitroHandler(runtime, { development: { allowHeaderIdentity: true } }));
+  return toWebHandler(h3);
+}
+
+async function readSseIds(response: Response, count: number): Promise<string[]> {
+  const reader = response.body!.getReader();
+  const decoder = new TextDecoder();
+  const ids: string[] = [];
+  let buffer = "";
+  while (ids.length < count) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() ?? "";
+    for (const chunk of chunks) {
+      const id = chunk.split("\n").find((line) => line.startsWith("id: "))?.slice(4);
+      if (id) ids.push(id);
+    }
+  }
+  await reader.cancel();
+  return ids;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }

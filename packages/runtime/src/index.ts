@@ -209,8 +209,8 @@ export type RuntimeRealtimeEvent = {
 
 export type RealtimePublisher = {
   publish(event: RuntimeRealtimeEvent): Promise<void> | void;
-  list?(channel: string, options?: { limit?: number; after?: string }): Promise<RuntimeRealtimeEvent[]> | RuntimeRealtimeEvent[];
-  subscribe?(channel: string, listener: (event: RuntimeRealtimeEvent) => void): () => void;
+  list?(channel: string, options?: { limit?: number; after?: string; order?: "asc" | "desc" }): Promise<RuntimeRealtimeEvent[]> | RuntimeRealtimeEvent[];
+  subscribe?(channel: string, listener: (event: RuntimeRealtimeEvent) => void): Promise<() => void> | (() => void);
   health?(): Promise<{ ok: boolean; details?: Record<string, unknown> }>;
   close?(): Promise<void>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
@@ -317,18 +317,18 @@ export class FramekitRuntime {
     return this.migrations.list(tenant, { appName: this.app.name });
   }
 
-  async realtimeEvents(tenant: TenantContext, options: { limit?: number; after?: string } = {}): Promise<RuntimeRealtimeEvent[]> {
+  async realtimeEvents(tenant: TenantContext, options: { limit?: number; after?: string; order?: "asc" | "desc" } = {}): Promise<RuntimeRealtimeEvent[]> {
     if (!this.realtime.list) {
       return [];
     }
     return this.realtime.list(`tenant:${tenant.tenantId}:documents`, options);
   }
 
-  subscribeRealtime(tenant: TenantContext, listener: (event: RuntimeRealtimeEvent) => void): () => void {
+  async subscribeRealtime(tenant: TenantContext, listener: (event: RuntimeRealtimeEvent) => void): Promise<() => void> {
     if (!this.realtime.subscribe) {
       throw new FramekitError("REALTIME_STREAM_UNAVAILABLE", "Realtime streaming is not available for this app.", 501);
     }
-    return this.realtime.subscribe(`tenant:${tenant.tenantId}:documents`, listener);
+    return await this.realtime.subscribe(`tenant:${tenant.tenantId}:documents`, listener);
   }
 
   async planMigration(tenant: TenantContext, nextApp: AppDefinition): Promise<MigrationPlan> {
@@ -1069,10 +1069,12 @@ export class InMemoryOutboxStore implements OutboxStore {
     const now = new Date(options.now ?? new Date().toISOString());
     const maxAttempts = options.maxAttempts ?? 5;
     for (const event of this.events) {
-      if (event.tenantId === tenant.tenantId && event.status === "leased" && event.leaseExpiresAt && new Date(event.leaseExpiresAt) <= now && event.attempts >= maxAttempts) {
+      const exhaustedFailure = event.status === "failed" && event.attempts >= maxAttempts;
+      const exhaustedLease = event.status === "leased" && event.leaseExpiresAt && new Date(event.leaseExpiresAt) <= now && event.attempts >= maxAttempts;
+      if (event.tenantId === tenant.tenantId && (exhaustedFailure || exhaustedLease)) {
         event.status = "dead_letter";
         event.processedAt = now.toISOString();
-        event.error ??= "Lease expired after maximum delivery attempts";
+        event.error ??= exhaustedLease ? "Lease expired after maximum delivery attempts" : "Maximum delivery attempts exhausted";
         event.leaseOwner = undefined;
         event.leaseExpiresAt = undefined;
       }

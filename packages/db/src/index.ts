@@ -818,9 +818,12 @@ export class PostgresOutboxStore implements OutboxStore {
     return this.sql.begin(async (sql) => {
       await sql`
         update framekit_outbox_events
-        set status = 'dead_letter', processed_at = ${nowIso}::timestamptz, error = coalesce(error, 'Lease expired after maximum delivery attempts'),
+        set status = 'dead_letter', processed_at = ${nowIso}::timestamptz,
+            error = coalesce(error, case when status = 'leased' then 'Lease expired after maximum delivery attempts' else 'Maximum delivery attempts exhausted' end),
             lease_owner = null, lease_expires_at = null
-        where tenant_id = ${tenant.tenantId} and status = 'leased' and lease_expires_at <= ${nowIso}::timestamptz and attempts >= ${maxAttempts}
+        where tenant_id = ${tenant.tenantId} and attempts >= ${maxAttempts} and (
+          status = 'failed' or (status = 'leased' and lease_expires_at <= ${nowIso}::timestamptz)
+        )
       `;
       const rows = await sql<OutboxSqlRow[]>`
         with candidates as (
@@ -909,7 +912,10 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
   private readonly sql: Sql;
   private readonly listenerSql: Sql;
   private readonly listeners = new Map<string, Set<(event: RuntimeRealtimeEvent) => void>>();
-  private readonly instanceId = crypto.randomUUID();
+  private readonly deliveredCursors = new Map<string, string>();
+  private readonly channelReady = new Map<string, Promise<void>>();
+  private readonly deliveryPumps = new Map<string, Promise<void>>();
+  private readonly dirtyChannels = new Set<string>();
   private listener?: Awaited<ReturnType<Sql["listen"]>>;
   private listenerReady?: Promise<void>;
   private closed = false;
@@ -935,11 +941,10 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
       returning cursor::text, channel, type, payload, created_at
     `;
     const persisted = realtimeSqlRowToEvent(rows[0]!);
-    this.emit(persisted);
-    await this.sql`select pg_notify('framekit_realtime_events', ${JSON.stringify({ cursor: persisted.cursor, origin: this.instanceId })})`;
+    await this.sql`select pg_notify('framekit_realtime_events', ${JSON.stringify({ cursor: persisted.cursor, channel: persisted.channel })})`;
   }
 
-  async list(channel: string, options: { limit?: number; after?: string } = {}): Promise<RuntimeRealtimeEvent[]> {
+  async list(channel: string, options: { limit?: number; after?: string; order?: "asc" | "desc" } = {}): Promise<RuntimeRealtimeEvent[]> {
     const limit = options.limit ?? 100;
     if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
       throw new FramekitError("INVALID_REALTIME_CURSOR", "Realtime history limit must be an integer between 1 and 1000", 422);
@@ -950,25 +955,45 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
     const rows = options.after
       ? await this.sql<RealtimeSqlRow[]>`
           select cursor::text, channel, type, payload, created_at from framekit_realtime_events
-          where channel = ${channel} and cursor > ${options.after}::bigint order by cursor asc limit ${limit}
+          where channel = ${channel} and cursor > ${options.after}::bigint
+          order by case when ${options.order ?? "asc"} = 'asc' then cursor end asc,
+                   case when ${options.order ?? "asc"} = 'desc' then cursor end desc limit ${limit}
         `
       : await this.sql<RealtimeSqlRow[]>`
           select cursor::text, channel, type, payload, created_at from framekit_realtime_events
-          where channel = ${channel} order by cursor desc limit ${limit}
+          where channel = ${channel}
+          order by case when ${options.order ?? "desc"} = 'asc' then cursor end asc,
+                   case when ${options.order ?? "desc"} = 'desc' then cursor end desc limit ${limit}
         `;
     return rows.map(realtimeSqlRowToEvent);
   }
 
-  subscribe(channel: string, listener: (event: RuntimeRealtimeEvent) => void): () => void {
+  async subscribe(channel: string, listener: (event: RuntimeRealtimeEvent) => void): Promise<() => void> {
     if (this.closed) throw new FramekitError("REALTIME_CLOSED", "Realtime publisher is closed", 503);
     const listeners = this.listeners.get(channel) ?? new Set<(event: RuntimeRealtimeEvent) => void>();
     listeners.add(listener);
     this.listeners.set(channel, listeners);
-    void this.ensureListener().catch(() => undefined);
-    return () => {
+    const unsubscribe = () => {
       listeners.delete(listener);
-      if (listeners.size === 0) this.listeners.delete(channel);
+      if (listeners.size === 0) {
+        this.listeners.delete(channel);
+        this.deliveredCursors.delete(channel);
+        this.channelReady.delete(channel);
+      }
     };
+    try {
+      await this.ensureListener();
+      let ready = this.channelReady.get(channel);
+      if (!ready) {
+        ready = this.initializeChannel(channel);
+        this.channelReady.set(channel, ready);
+      }
+      await ready;
+      return unsubscribe;
+    } catch (error) {
+      unsubscribe();
+      throw error;
+    }
   }
 
   async health(): Promise<{ ok: boolean; details?: Record<string, unknown> }> {
@@ -986,8 +1011,11 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
     this.closed = true;
     await this.listenerReady;
     await this.listener?.unlisten();
-    await Promise.all([this.listenerSql.end({ timeout: 1 }), this.sql.end({ timeout: 1 })]);
     this.listeners.clear();
+    await Promise.allSettled([...this.deliveryPumps.values()]);
+    await Promise.all([this.listenerSql.end({ timeout: 1 }), this.sql.end({ timeout: 1 })]);
+    this.deliveredCursors.clear();
+    this.channelReady.clear();
   }
 
   private async ensureListener(): Promise<void> {
@@ -1001,16 +1029,57 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
   }
 
   private async receive(payload: string): Promise<void> {
-    const notification = JSON.parse(payload) as { cursor?: string; origin?: string };
-    if (!notification.cursor || notification.origin === this.instanceId) return;
-    const rows = await this.sql<RealtimeSqlRow[]>`
-      select cursor::text, channel, type, payload, created_at from framekit_realtime_events where cursor = ${notification.cursor}::bigint
+    const notification = JSON.parse(payload) as { cursor?: string; channel?: string };
+    if (!notification.cursor || !notification.channel || !this.listeners.has(notification.channel)) return;
+    const ready = this.channelReady.get(notification.channel);
+    if (ready) await ready;
+    await this.deliverChannel(notification.channel);
+  }
+
+  private async initializeChannel(channel: string): Promise<void> {
+    const rows = await this.sql<{ cursor: string }[]>`
+      select coalesce(max(cursor), 0)::text as cursor from framekit_realtime_events where channel = ${channel}
     `;
-    if (rows[0]) this.emit(realtimeSqlRowToEvent(rows[0]));
+    this.deliveredCursors.set(channel, rows[0]?.cursor ?? "0");
+  }
+
+  private async deliverChannel(channel: string): Promise<void> {
+    this.dirtyChannels.add(channel);
+    const existing = this.deliveryPumps.get(channel);
+    if (existing) return existing;
+    const pump = (async () => {
+      while (this.dirtyChannels.delete(channel) && this.listeners.has(channel)) {
+        while (this.listeners.has(channel)) {
+          const after = this.deliveredCursors.get(channel) ?? "0";
+          const rows = await this.sql<RealtimeSqlRow[]>`
+            select cursor::text, channel, type, payload, created_at from framekit_realtime_events
+            where channel = ${channel} and cursor > ${after}::bigint order by cursor asc limit 1000
+          `;
+          if (rows.length === 0) break;
+          for (const row of rows) {
+            const event = realtimeSqlRowToEvent(row);
+            this.deliveredCursors.set(channel, event.cursor!);
+            this.emit(event);
+          }
+          if (rows.length < 1_000) break;
+        }
+      }
+    })().finally(() => {
+      this.deliveryPumps.delete(channel);
+      if (this.dirtyChannels.has(channel) && this.listeners.has(channel)) void this.deliverChannel(channel).catch(() => undefined);
+    });
+    this.deliveryPumps.set(channel, pump);
+    return pump;
   }
 
   private emit(event: RuntimeRealtimeEvent): void {
-    for (const listener of this.listeners.get(event.channel) ?? []) listener(event);
+    for (const listener of this.listeners.get(event.channel) ?? []) {
+      try {
+        listener(event);
+      } catch {
+        // One subscriber must not prevent other subscribers from advancing.
+      }
+    }
   }
 }
 

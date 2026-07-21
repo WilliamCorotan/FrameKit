@@ -1044,32 +1044,89 @@ function toFilterValue(value: unknown): FilterValue {
 function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal, after?: string): Response {
   const encoder = new TextEncoder();
   let unsubscribe: (() => void) | undefined;
+  let closed = false;
+  let dispose = () => {
+    closed = true;
+    unsubscribe?.();
+  };
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       controller.enqueue(encoder.encode("retry: 3000\n\n"));
-      const buffered: RuntimeRealtimeEvent[] = [];
-      const seen = new Set<string>();
-      let replaying = true;
+      let lastCursor = after;
+      let ready = false;
+      let dirty = true;
+      let pump: Promise<void> | undefined;
+      const ephemeral: RuntimeRealtimeEvent[] = [];
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        unsubscribe?.();
+        signal.removeEventListener("abort", abort);
+      };
+      const abort = () => {
+        if (closed) return;
+        cleanup();
+        controller.close();
+      };
+      dispose = cleanup;
+      signal.addEventListener("abort", abort, { once: true });
       const send = (event: RuntimeRealtimeEvent) => {
-        if (event.cursor && seen.has(event.cursor)) return;
-        if (event.cursor) seen.add(event.cursor);
+        if (closed) return;
+        if (event.cursor && lastCursor && compareRealtimeCursors(event.cursor, lastCursor) <= 0) return;
+        if (event.cursor) lastCursor = event.cursor;
         const id = event.cursor ? `id: ${event.cursor}\n` : "";
         controller.enqueue(encoder.encode(`${id}event: ${event.type}\ndata: ${JSON.stringify(event.payload)}\n\n`));
       };
-      unsubscribe = runtime.subscribeRealtime(tenant, (event) => {
-        if (replaying) buffered.push(event);
-        else send(event);
-      });
-      for (const event of await runtime.realtimeEvents(tenant, { after, limit: 1_000 })) send(event);
-      replaying = false;
-      for (const event of buffered) send(event);
-      signal.addEventListener("abort", () => {
-        unsubscribe?.();
-        controller.close();
-      }, { once: true });
+      const replayAvailable = async () => {
+        while (!closed) {
+          const previousCursor = lastCursor;
+          const events = await runtime.realtimeEvents(tenant, { after: lastCursor, limit: 1_000, order: "asc" });
+          events.sort((left, right) => compareRealtimeCursors(left.cursor, right.cursor));
+          for (const event of events) send(event);
+          if (events.length < 1_000 || lastCursor === previousCursor) return;
+        }
+      };
+      const requestPump = () => {
+        dirty = true;
+        if (!ready || pump || closed) return;
+        pump = (async () => {
+          while (dirty && !closed) {
+            dirty = false;
+            await replayAvailable();
+          }
+        })().catch((error) => {
+          cleanup();
+          controller.error(error);
+        }).finally(() => {
+          pump = undefined;
+          if (dirty && !closed) requestPump();
+        });
+      };
+      try {
+        const subscribed = await runtime.subscribeRealtime(tenant, (event) => {
+          if (!event.cursor) {
+            if (!ready) ephemeral.push(event);
+            else send(event);
+            return;
+          }
+          requestPump();
+        });
+        unsubscribe = subscribed;
+        if (closed || signal.aborted) {
+          subscribed();
+          return;
+        }
+        ready = true;
+        requestPump();
+        await pump;
+        for (const event of ephemeral) send(event);
+      } catch (error) {
+        cleanup();
+        controller.error(error);
+      }
     },
     cancel() {
-      unsubscribe?.();
+      dispose();
     }
   });
   return new Response(stream, {
@@ -1079,6 +1136,18 @@ function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, s
       connection: "keep-alive"
     }
   });
+}
+
+function compareRealtimeCursors(left?: string, right?: string): number {
+  if (left === right) return 0;
+  if (left === undefined) return 1;
+  if (right === undefined) return -1;
+  if (/^\d+$/.test(left) && /^\d+$/.test(right)) {
+    const leftValue = BigInt(left);
+    const rightValue = BigInt(right);
+    return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+  }
+  return left.localeCompare(right);
 }
 
 function toErrorResponse(error: unknown): { statusCode: number; body: { error: true; code: string; message: string; details?: unknown } } {
