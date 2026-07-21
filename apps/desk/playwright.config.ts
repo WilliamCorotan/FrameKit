@@ -4,6 +4,7 @@ const port = Number(process.env.FRAMEKIT_DESK_PORT ?? 4173);
 
 export default defineConfig({
   testDir: "./e2e",
+  testMatch: "desk.spec.ts",
   fullyParallel: false,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? [["dot"], ["html", { open: "never" }]] : "list",

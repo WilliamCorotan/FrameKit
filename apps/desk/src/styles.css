@@ -40,6 +40,27 @@ textarea {
   font: inherit;
 }
 
+:focus-visible {
+  outline: 3px solid var(--accent-2);
+  outline-offset: 3px;
+}
+
+.skip-link {
+  position: fixed;
+  z-index: 10;
+  top: 10px;
+  left: 10px;
+  padding: 10px 14px;
+  color: #11100d;
+  background: var(--accent-2);
+  border-radius: 6px;
+  transform: translateY(-150%);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
 .desk {
   display: grid;
   grid-template-columns: 260px 1fr;
@@ -268,6 +289,10 @@ h2 {
   text-align: left;
 }
 
+button.row {
+  cursor: pointer;
+}
+
 .row span {
   color: var(--muted);
   overflow: hidden;
@@ -301,6 +326,52 @@ h2 {
 
 .row-actions button:hover {
   border-color: var(--accent-2);
+}
+
+.danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 40px;
+  border: 1px solid #d65d58;
+  color: #ffd9d6;
+  background: #351513;
+  border-radius: 6px;
+  padding: 0 12px;
+  cursor: pointer;
+}
+
+.editor-actions,
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.pagination {
+  justify-content: space-between;
+  padding: 12px 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.pagination button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  background: #12110e;
+  border-radius: 6px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.pagination button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .editor {
@@ -422,5 +493,15 @@ h2 {
 
   .fields {
     grid-template-columns: 1fr;
+  }
+
+  .workbench {
+    padding: 18px 14px;
+  }
+
+  .editor-head,
+  .editor-actions {
+    align-items: flex-start;
+    flex-wrap: wrap;
   }
 }

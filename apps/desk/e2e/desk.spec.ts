@@ -67,7 +67,7 @@ test("signs in, restores a session, and signs out", async ({ page }) => {
   await expect(page.evaluate(() => window.localStorage.getItem("framekit.token"))).resolves.toBeNull();
 });
 
-test("covers document list, create, edit, search, and workflow form controls", async ({ page }) => {
+test("covers document list, create, edit, delete, pagination, search, and workflow form controls", async ({ page }) => {
   await signIn(page);
 
   await expect(page.getByRole("button", { name: /CUSTOMER-001/ })).toBeVisible();
@@ -93,6 +93,32 @@ test("covers document list, create, edit, search, and workflow form controls", a
 
   await page.getByRole("button", { name: "Qualify" }).click();
   await expect(page.getByText("Transitioned")).toBeVisible();
+
+  await page.getByLabel("Filter records").fill("");
+  for (let index = 0; index < 5; index += 1) {
+    await page.getByRole("button", { name: "New document" }).click();
+    await page.getByLabel("Name *").fill(`Page record ${index}`);
+    await page.getByRole("button", { name: "Save" }).click();
+  }
+  const secondPageResponse = page.waitForResponse((response) => new URL(response.url()).searchParams.get("offset") === "5");
+  await page.getByRole("button", { name: "Next page" }).click();
+  await secondPageResponse;
+  await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.locator(".list button.row")).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Next page" })).toBeDisabled();
+  const firstPageResponse = page.waitForResponse((response) => new URL(response.url()).searchParams.get("offset") === "0");
+  await page.getByRole("button", { name: "Previous page" }).click();
+  await firstPageResponse;
+  await expect(page.getByText("Page 1")).toBeVisible();
+  await expect(page.locator(".list button.row")).toHaveCount(5);
+  const terminalPageResponse = page.waitForResponse((response) => new URL(response.url()).searchParams.get("offset") === "5");
+  await page.getByRole("button", { name: "Next page" }).click();
+  await terminalPageResponse;
+  await expect(page.locator(".list button.row")).toHaveCount(2);
+  await page.getByRole("button", { name: /CUSTOMER-001/ }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByText("Deleted")).toBeVisible();
 });
 
 test("covers auth administration screens", async ({ page }) => {
@@ -222,6 +248,9 @@ async function mockDeskApi(page: Page) {
     if (path === "/api/auth/login" && method === "POST") {
       return json(route, { token: "desk-token" });
     }
+    if (path === "/api/auth/logout" && method === "POST") {
+      return empty(route);
+    }
     if (path === "/api/meta" && method === "GET") {
       return json(route, metadata);
     }
@@ -231,7 +260,9 @@ async function mockDeskApi(page: Page) {
       const list = search
         ? customers.filter((record) => JSON.stringify(record.data).toLowerCase().includes(search) || record.id.toLowerCase().includes(search))
         : customers;
-      return json(route, list);
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      const limit = Number(url.searchParams.get("limit") ?? list.length);
+      return json(route, list.slice(offset, offset + limit));
     }
     if (path === "/api/doctypes/customer" && method === "POST" && body) {
       const record = {
@@ -249,6 +280,10 @@ async function mockDeskApi(page: Page) {
       const record = customers.find((item) => item.id === customerMatch[1]);
       Object.assign(record!.data, body);
       return json(route, record);
+    }
+    if (customerMatch && !path.endsWith("/transition") && method === "DELETE") {
+      customers.splice(customers.findIndex((item) => item.id === customerMatch[1]), 1);
+      return empty(route);
     }
     if (customerMatch && path.endsWith("/transition") && method === "POST") {
       const record = customers.find((item) => item.id === customerMatch[1]);
