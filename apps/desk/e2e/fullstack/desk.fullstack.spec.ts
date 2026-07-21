@@ -165,7 +165,7 @@ async function loginApi(request: APIRequestContext): Promise<string> {
 
 async function createCustomer(request: APIRequestContext, token: string, name: string): Promise<void> {
   const response = await request.post(`${apiOrigin}/api/doctypes/customer`, {
-    data: { name, status: "active", owner: "Browser", annual_revenue: 1000 },
+    data: { name, status: "active", owner: "Browser", annual_revenue: "1000.00" },
     headers: { ...tenantHeaders, authorization: `Bearer ${token}` }
   });
   expect(response.ok()).toBe(true);

@@ -43,7 +43,7 @@ export const customerDocType = defineDocType({
     { name: "name", label: "Name", type: "text", required: true, inList: true },
     { name: "status", label: "Status", type: "select", options: ["active", "paused"], default: "active", inList: true },
     { name: "owner", label: "Owner", type: "text", default: "Sales", inList: true },
-    { name: "annual_revenue", label: "Annual Revenue", type: "currency", default: 0, inList: true },
+    { name: "annual_revenue", label: "Annual Revenue", type: "currency", default: "0.00", inList: true },
     { name: "notes", label: "Notes", type: "long_text" }
   ],
   permissions: [
@@ -80,7 +80,7 @@ export const dealDocType = defineDocType({
   fields: [
     { name: "title", label: "Title", type: "text", required: true, inList: true },
     { name: "customer", label: "Customer", type: "link", linkTo: "customer", inList: true },
-    { name: "amount", label: "Amount", type: "currency", default: 0, inList: true },
+    { name: "amount", label: "Amount", type: "currency", default: "0.00", inList: true },
     { name: "stage", label: "Stage", type: "select", options: ["open", "qualified", "won", "lost"], default: "open", readOnly: true, inList: true }
   ],
   permissions: [
@@ -200,7 +200,7 @@ export async function seedDemo(): Promise<void> {
     name: "Acme Manufacturing",
     status: "active",
     owner: "Mina Torres",
-    annual_revenue: 1200000,
+    annual_revenue: "1200000.00",
     notes: "Pilot customer for the metadata desk."
   });
   await runtime.create(admin, "contact", {
@@ -212,7 +212,7 @@ export async function seedDemo(): Promise<void> {
   await runtime.create(admin, "deal", {
     title: "Factory rollout",
     customer: acme.id,
-    amount: 84000
+    amount: "84000.00"
   });
 }
 

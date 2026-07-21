@@ -4,6 +4,7 @@ export const fieldTypes = [
   "text",
   "long_text",
   "number",
+  "decimal",
   "currency",
   "boolean",
   "date",
@@ -17,10 +18,27 @@ export type FieldType = (typeof fieldTypes)[number];
 export type DocumentAction = "create" | "read" | "update" | "delete" | "submit" | "cancel" | "transition" | "transfer_owner";
 export type DocumentStatus = "draft" | "submitted" | "cancelled";
 
+export const FieldValidatorSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("length"), min: z.number().int().min(0).optional(), max: z.number().int().min(0).optional() }).strict(),
+  z.object({ kind: z.literal("range"), min: z.union([z.string(), z.number()]).optional(), max: z.union([z.string(), z.number()]).optional() }).strict(),
+  z.object({ kind: z.literal("pattern"), pattern: z.enum(["email", "uuid", "slug", "alphanumeric"]) }).strict(),
+  z.object({ kind: z.literal("domain"), values: z.array(z.union([z.string(), z.number(), z.boolean()])).min(1) }).strict()
+]);
+
+const ComputedDependenciesSchema = z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).min(1);
+export const ComputedFieldSchema = z.discriminatedUnion("operation", [
+  z.object({ operation: z.literal("sum"), dependencies: ComputedDependenciesSchema }).strict(),
+  z.object({ operation: z.literal("subtract"), dependencies: ComputedDependenciesSchema }).strict(),
+  z.object({ operation: z.literal("multiply"), dependencies: ComputedDependenciesSchema }).strict(),
+  z.object({ operation: z.literal("concat"), dependencies: ComputedDependenciesSchema, separator: z.string().optional() }).strict()
+]);
+
 export const FieldSchema = z.object({
   name: z.string().min(1).regex(/^[a-z][a-z0-9_]*$/),
   label: z.string().min(1),
   type: z.enum(fieldTypes),
+  precision: z.number().int().min(1).max(100).optional(),
+  scale: z.number().int().min(0).max(50).optional(),
   required: z.boolean().default(false),
   unique: z.boolean().default(false),
   options: z.array(z.string()).optional(),
@@ -28,10 +46,20 @@ export const FieldSchema = z.object({
   default: z.unknown().optional(),
   readOnly: z.boolean().default(false),
   inList: z.boolean().default(false),
-  description: z.string().optional()
+  description: z.string().optional(),
+  validators: z.array(FieldValidatorSchema).default([]),
+  computed: ComputedFieldSchema.optional()
 });
 
 export type FieldDefinition = z.infer<typeof FieldSchema>;
+
+export function decimalPrecision(field: Pick<FieldDefinition, "type" | "precision">): number {
+  return field.precision ?? 18;
+}
+
+export function decimalScale(field: Pick<FieldDefinition, "type" | "scale">): number {
+  return field.scale ?? (field.type === "currency" ? 2 : 6);
+}
 
 export const CustomFieldSchema = z.object({
   id: z.string().min(1),
@@ -440,6 +468,13 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
     throw new Error(`DocType "${doctype.name}" uses owner policies without ownership metadata`);
   }
   for (const field of doctype.fields) {
+    const exactDecimal = field.type === "decimal" || field.type === "currency";
+    if (exactDecimal) {
+      if (decimalScale(field) > decimalPrecision(field)) throw new Error(`Scale for "${doctype.name}.${field.name}" cannot exceed precision`);
+      if (field.default !== undefined) field.default = canonicalExactValue(field.default, field, `${doctype.name}.${field.name} default`);
+    } else if (field.precision !== undefined || field.scale !== undefined) {
+      throw new Error(`Only decimal and currency fields may declare precision or scale: "${doctype.name}.${field.name}"`);
+    }
     if (field.type === "select") {
       if (!field.options?.length) throw new Error(`Select field "${doctype.name}.${field.name}" requires options`);
       if (new Set(field.options).size !== field.options.length) throw new Error(`Select field "${doctype.name}.${field.name}" has duplicate options`);
@@ -452,7 +487,74 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
     if (field.type === "link" && !field.linkTo) throw new Error(`Link field "${doctype.name}.${field.name}" requires linkTo`);
     if (field.type !== "link" && field.linkTo) throw new Error(`Only link fields may define linkTo: "${doctype.name}.${field.name}"`);
     if (field.unique && field.type === "json") throw new Error(`JSON field "${doctype.name}.${field.name}" cannot be unique`);
+    if (field.computed) {
+      if (field.computed.dependencies.includes(field.name)) throw new Error(`Computed field "${doctype.name}.${field.name}" cannot depend on itself`);
+      for (const dependency of field.computed.dependencies) {
+        if (!fields.has(dependency)) throw new Error(`Computed field "${doctype.name}.${field.name}" references unknown dependency "${dependency}"`);
+      }
+      if (["sum", "subtract", "multiply"].includes(field.computed.operation) && !exactDecimal) {
+        throw new Error(`Computed ${field.computed.operation} field "${doctype.name}.${field.name}" must be decimal or currency`);
+      }
+      if (field.computed.operation === "concat" && !["text", "long_text"].includes(field.type)) {
+        throw new Error(`Computed concat field "${doctype.name}.${field.name}" must be text or long_text`);
+      }
+      if (field.computed.operation === "subtract" && field.computed.dependencies.length !== 2) throw new Error(`Computed subtract field "${doctype.name}.${field.name}" requires exactly two dependencies`);
+      if (field.computed.operation === "multiply" && field.computed.dependencies.length < 2) throw new Error(`Computed multiply field "${doctype.name}.${field.name}" requires at least two dependencies`);
+      for (const dependency of field.computed.dependencies) {
+        const dependencyType = fields.get(dependency)!.type;
+        if (["sum", "subtract", "multiply"].includes(field.computed.operation) && !["decimal", "currency"].includes(dependencyType)) {
+          throw new Error(`Computed ${field.computed.operation} field "${doctype.name}.${field.name}" requires decimal dependencies`);
+        }
+        if (field.computed.operation === "concat" && dependencyType === "json") throw new Error(`Computed concat field "${doctype.name}.${field.name}" cannot depend on JSON`);
+      }
+    }
+    for (const validator of field.validators) {
+      if (validator.kind === "length") {
+        if (!["text", "long_text", "select", "link"].includes(field.type)) throw new Error(`Length validator on "${doctype.name}.${field.name}" requires a string field`);
+        if (validator.min === undefined && validator.max === undefined) throw new Error(`Length validator on "${doctype.name}.${field.name}" requires min or max`);
+        if (validator.min !== undefined && validator.max !== undefined && validator.min > validator.max) throw new Error(`Length validator on "${doctype.name}.${field.name}" has min greater than max`);
+      }
+      if (validator.kind === "range") {
+        if (!["number", "decimal", "currency"].includes(field.type)) throw new Error(`Range validator on "${doctype.name}.${field.name}" requires a numeric field`);
+        if (validator.min === undefined && validator.max === undefined) throw new Error(`Range validator on "${doctype.name}.${field.name}" requires min or max`);
+        if (exactDecimal) {
+          const min = validator.min === undefined ? undefined : exactDecimalCoefficient(validator.min, field, `${doctype.name}.${field.name} minimum`);
+          const max = validator.max === undefined ? undefined : exactDecimalCoefficient(validator.max, field, `${doctype.name}.${field.name} maximum`);
+          if (min !== undefined && max !== undefined && min > max) throw new Error(`Range validator on "${doctype.name}.${field.name}" has min greater than max`);
+          if (validator.min !== undefined) validator.min = canonicalExactValue(validator.min, field, `${doctype.name}.${field.name} minimum`);
+          if (validator.max !== undefined) validator.max = canonicalExactValue(validator.max, field, `${doctype.name}.${field.name} maximum`);
+        } else {
+          for (const [label, bound] of [["minimum", validator.min], ["maximum", validator.max]] as const) {
+            if (bound !== undefined && (typeof bound !== "number" || !Number.isFinite(bound) || Math.abs(bound) > Number.MAX_SAFE_INTEGER)) {
+              throw new Error(`${label} for "${doctype.name}.${field.name}" must be a finite safe number`);
+            }
+          }
+          if (validator.min !== undefined && validator.max !== undefined && validator.min > validator.max) throw new Error(`Range validator on "${doctype.name}.${field.name}" has min greater than max`);
+        }
+      }
+      if (validator.kind === "pattern" && !["text", "long_text", "link"].includes(field.type)) throw new Error(`Pattern validator on "${doctype.name}.${field.name}" requires a string field`);
+      if (validator.kind === "domain") {
+        if (field.type === "json") throw new Error(`Domain validator on "${doctype.name}.${field.name}" cannot target JSON`);
+        const canonical = validator.values.map((value) => canonicalDomainValue(field, value, `${doctype.name}.${field.name}`));
+        if (new Set(canonical).size !== canonical.length) throw new Error(`Domain validator on "${doctype.name}.${field.name}" has duplicate canonical values`);
+        validator.values.splice(0, validator.values.length, ...canonical.map((value) => JSON.parse(value.slice(value.indexOf(":") + 1)) as string | number | boolean));
+      }
+    }
   }
+  const visitingComputed = new Set<string>();
+  const visitedComputed = new Set<string>();
+  const visitComputed = (name: string, path: string[]) => {
+    if (visitingComputed.has(name)) throw new Error(`Computed field dependency cycle: ${[...path, name].join(" -> ")}`);
+    if (visitedComputed.has(name)) return;
+    visitingComputed.add(name);
+    const field = fields.get(name);
+    for (const dependency of field?.computed?.dependencies ?? []) {
+      if (fields.get(dependency)?.computed) visitComputed(dependency, [...path, name]);
+    }
+    visitingComputed.delete(name);
+    visitedComputed.add(name);
+  };
+  for (const field of doctype.fields.filter((candidate) => candidate.computed)) visitComputed(field.name, []);
   const indexes = new Set<string>();
   for (const index of doctype.indexes) {
     if (new Set(index).size !== index.length) throw new Error(`Index on "${doctype.name}" repeats a field`);
@@ -500,6 +602,45 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
       endpoints.add(endpoint);
     }
   }
+}
+
+function exactDecimalCoefficient(value: unknown, field: FieldDefinition, label: string): bigint {
+  if (typeof value !== "string") throw new Error(`${label} must use an exact decimal string`);
+  const match = /^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?$/.exec(value);
+  if (!match) throw new Error(`${label} is not a base-10 decimal`);
+  const fraction = match[3] ?? "";
+  const scale = decimalScale(field);
+  if (fraction.length > scale) throw new Error(`${label} exceeds scale ${scale}`);
+  const integerDigits = match[2] === "0" ? 0 : match[2]!.length;
+  if (integerDigits + scale > decimalPrecision(field)) throw new Error(`${label} exceeds precision ${decimalPrecision(field)}`);
+  const coefficient = BigInt(`${match[1] === "-" ? "-" : ""}${match[2]}${fraction.padEnd(scale, "0")}`);
+  return coefficient;
+}
+
+function canonicalDomainValue(field: FieldDefinition, value: string | number | boolean, label: string): string {
+  if (field.type === "decimal" || field.type === "currency") {
+    return `string:${JSON.stringify(canonicalExactValue(value, field, `${label} domain value`))}`;
+  }
+  if (field.type === "number") {
+    if (typeof value !== "number" || !Number.isFinite(value) || Math.abs(value) > Number.MAX_SAFE_INTEGER) throw new Error(`Domain value for "${label}" must be a finite safe number`);
+    return `number:${JSON.stringify(value)}`;
+  }
+  if (field.type === "boolean") {
+    if (typeof value !== "boolean") throw new Error(`Domain value for "${label}" must be boolean`);
+    return `boolean:${JSON.stringify(value)}`;
+  }
+  if (typeof value !== "string") throw new Error(`Domain value for "${label}" must be a string`);
+  if (field.type === "select" && !field.options?.includes(value)) throw new Error(`Domain value for "${label}" must be a select option`);
+  return `string:${JSON.stringify(value)}`;
+}
+
+function canonicalExactValue(value: unknown, field: FieldDefinition, label: string): string {
+  const coefficient = exactDecimalCoefficient(value, field, label);
+  const scale = decimalScale(field);
+  const negative = coefficient < 0n;
+  const digits = (negative ? -coefficient : coefficient).toString().padStart(scale + 1, "0");
+  const normalized = scale === 0 ? digits : `${digits.slice(0, -scale)}.${digits.slice(-scale)}`;
+  return negative ? `-${normalized}` : normalized;
 }
 
 function assertAppReferences(app: AppDefinition): void {

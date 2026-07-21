@@ -137,4 +137,38 @@ describe("core metadata", () => {
     ] })).toThrow(/Duplicate command id/);
     expect(() => defineModule({ id: "typo", name: "Typo", commands: [{ ...command, maxOperatons: 2 }] as never })).toThrow(/unrecognized key/i);
   });
+
+  it("validates exact decimals, computed dependencies, and declarative validators", () => {
+    const invoice = defineDocType({
+      name: "invoice",
+      label: "Invoice",
+      fields: [
+        { name: "subtotal", label: "Subtotal", type: "decimal", precision: 24, scale: 4 },
+        { name: "tax", label: "Tax", type: "decimal", precision: 24, scale: 4 },
+        { name: "total", label: "Total", type: "decimal", precision: 24, scale: 4, computed: { operation: "sum", dependencies: ["subtotal", "tax"] } },
+        { name: "code", label: "Code", type: "text", validators: [{ kind: "length", min: 3, max: 12 }, { kind: "pattern", pattern: "slug" }] }
+      ]
+    });
+    expect(invoice.fields[2]?.computed?.dependencies).toEqual(["subtotal", "tax"]);
+    expect(defineDocType({ name: "fraction", label: "Fraction", fields: [{ name: "rate", label: "Rate", type: "decimal", precision: 2, scale: 2, default: "0.12" }] }).fields[0]?.default).toBe("0.12");
+    expect(() => defineDocType({ name: "bad", label: "Bad", fields: [{ name: "amount", label: "Amount", type: "decimal", precision: 2, scale: 3 }] })).toThrow(/scale/i);
+    expect(() => defineDocType({ name: "cycle", label: "Cycle", fields: [
+      { name: "a", label: "A", type: "text", computed: { operation: "concat", dependencies: ["b"] } },
+      { name: "b", label: "B", type: "text", computed: { operation: "concat", dependencies: ["a"] } }
+    ] })).toThrow(/cycle/i);
+    expect(() => defineDocType({ name: "bad", label: "Bad", fields: [{ name: "count", label: "Count", type: "number", validators: [{ kind: "length", min: 1 }] }] })).toThrow(/length validator/i);
+    expect(() => defineDocType({ name: "bad", label: "Bad", fields: [{ name: "count", label: "Count", type: "number", validators: [{ kind: "range", min: "not-a-number" }] }] })).toThrow(/finite safe number/i);
+    expect(() => defineDocType({ name: "bad", label: "Bad", fields: [{ name: "flag", label: "Flag", type: "boolean", validators: [{ kind: "domain", values: [true, "true"] }] }] })).toThrow(/must be boolean/i);
+    expect(() => defineDocType({ name: "bad", label: "Bad", fields: [{ name: "amount", label: "Amount", type: "decimal", precision: 8, scale: 2, validators: [{ kind: "domain", values: ["1", "1.00"] }] }] })).toThrow(/duplicate canonical/i);
+    expect(() => defineDocType({ name: "bad", label: "Bad", fields: [
+      { name: "a", label: "A", type: "decimal" },
+      { name: "total", label: "Total", type: "decimal", computed: { operation: "sum", dependencies: ["a"], separator: "," } as never }
+    ] })).toThrow(/unrecognized key/i);
+    expect(() => defineDocType({ name: "bad", label: "Bad", fields: [{ name: "code", label: "Code", type: "text", validators: [{ kind: "pattern", pattern: "slug", typo: true }] as never }] })).toThrow(/unrecognized key/i);
+    const canonical = defineDocType({ name: "canonical", label: "Canonical", fields: [{
+      name: "amount", label: "Amount", type: "decimal", precision: 8, scale: 2, default: "1",
+      validators: [{ kind: "range", min: "0", max: "2" }, { kind: "domain", values: ["1"] }]
+    }] });
+    expect(canonical.fields[0]).toMatchObject({ default: "1.00", validators: [{ min: "0.00", max: "2.00" }, { values: ["1.00"] }] });
+  });
 });

@@ -48,7 +48,7 @@ try {
       name: `Built Smoke ${Date.now()}`,
       status: "active",
       owner: "CI",
-      annual_revenue: 1
+      annual_revenue: "1.00"
     }
   });
   const diagnostics = await json(fetchHandler, "/api/diagnostics", { headers });

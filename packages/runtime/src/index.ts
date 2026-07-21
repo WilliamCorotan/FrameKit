@@ -5,6 +5,8 @@ import {
   defineApp,
   defineDocType,
   DocumentCommandRequestSchema,
+  decimalPrecision,
+  decimalScale,
   FramekitError,
   getDocType,
   hasRowAccess,
@@ -17,6 +19,7 @@ import {
   type DocumentCommandOperation,
   type DocumentCommandRequest,
   type DocumentRecord,
+  type FieldDefinition,
   type HookName,
   type OwnerTransferReceipt,
   type TenantContext,
@@ -539,8 +542,15 @@ export class FramekitRuntime {
           if (field.unique) {
             changes.push(migrationChange({ kind: "add_unique_constraint", doctype: nextDocType.name, field: field.name, destructive: false, to: field.name }));
           }
-        } else if (currentField.type !== field.type) {
-          changes.push(migrationChange({ kind: "change_field_type", doctype: nextDocType.name, field: field.name, destructive: true, from: currentField.type, to: field.type }));
+        } else if (fieldStorageContract(currentField) !== fieldStorageContract(field)) {
+          changes.push(migrationChange({
+            kind: "change_field_type",
+            doctype: nextDocType.name,
+            field: field.name,
+            destructive: true,
+            from: fieldStorageContract(currentField),
+            to: fieldStorageContract(field)
+          }));
         } else if (currentField.unique !== field.unique) {
           changes.push(migrationChange({
             kind: field.unique ? "add_unique_constraint" : "remove_unique_constraint",
@@ -656,13 +666,14 @@ export class FramekitRuntime {
     if (effective.fields.some((field) => field.name === parsedField.name)) {
       throw new FramekitError("FIELD_EXISTS", `Field "${parsedField.name}" already exists on ${base.name}`, 409);
     }
-    defineDocType({ ...effective, fields: [...effective.fields, parsedField] });
-    if (parsedField.type === "link") getDocType(this.app, parsedField.linkTo!);
+    const canonicalDocType = defineDocType({ ...effective, fields: [...effective.fields, parsedField] });
+    const canonicalField = canonicalDocType.fields.at(-1)!;
+    if (canonicalField.type === "link") getDocType(this.app, canonicalField.linkTo!);
     return this.customization.addCustomField(tenant, {
-      id: `${base.name}.${parsedField.name}`,
+      id: `${base.name}.${canonicalField.name}`,
       tenantId: tenant.tenantId,
       doctype: base.name,
-      field: parsedField
+      field: canonicalField
     });
   }
 
@@ -739,7 +750,7 @@ export class FramekitRuntime {
       }
       candidate[doctype.workflow.field] = doctype.workflow.initialState;
     }
-    const data = this.prepareInput(doctype, candidate, true);
+    const data = this.prepareInput(doctype, candidate, true, {}, input);
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data);
     const state = doctype.workflow?.initialState;
@@ -788,7 +799,7 @@ export class FramekitRuntime {
     assertDraftDocument(existing, "update");
     const candidate = { ...existing.data, ...input };
     await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
-    const data = this.prepareInput(doctype, candidate, false, existing.data);
+    const data = this.prepareInput(doctype, candidate, false, existing.data, input);
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data, id);
     const expectedRevision = options.expectedRevision ?? existing.revision;
@@ -868,7 +879,7 @@ export class FramekitRuntime {
     }
     const candidate = { ...existing.data, [workflow.field]: transition.to };
     await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
-    const data = this.prepareInput(doctype, candidate, false, candidate);
+    const data = this.prepareInput(doctype, candidate, false, candidate, {});
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data, id);
     const updated: DocumentRecord = {
@@ -1055,6 +1066,7 @@ export class FramekitRuntime {
       }
       throw new FramekitError("COMMAND_SAGA_FAILED", `Command "${commandId}" failed and compensation was attempted.`, 409, {
         cause: cause instanceof Error ? cause.message : String(cause),
+        ...(cause instanceof FramekitError ? { causeCode: cause.code, causeDetails: cause.details } : {}),
         compensationFailures
       });
     }
@@ -1081,7 +1093,7 @@ export class FramekitRuntime {
         if (suppliedState !== undefined && suppliedState !== doctype.workflow.initialState) throw new FramekitError("INVALID_INITIAL_STATE", `New ${doctype.name} documents must start in "${doctype.workflow.initialState}"`, 422);
         candidate[doctype.workflow.field] = doctype.workflow.initialState;
       }
-      const data = this.prepareInput(doctype, candidate, true);
+      const data = this.prepareInput(doctype, candidate, true, {}, operation.data ?? {});
       await this.assertLinksExist(tenant, doctype, data);
       await this.assertUniqueFields(tenant, doctype, data);
       const timestamp = this.now().toISOString();
@@ -1111,7 +1123,7 @@ export class FramekitRuntime {
         assertDraftDocument(existing, "update");
         const candidate = { ...existing.data, ...(operation.data ?? {}) };
         await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
-        const data = this.prepareInput(doctype, candidate, false, existing.data);
+        const data = this.prepareInput(doctype, candidate, false, existing.data, operation.data ?? {});
         await this.assertLinksExist(tenant, doctype, data);
         await this.assertUniqueFields(tenant, doctype, data, existing.id);
         document = { ...existing, revision: existing.revision + 1, data, updatedAt: this.now().toISOString() };
@@ -1182,7 +1194,7 @@ export class FramekitRuntime {
     }
     const candidate = { ...existing.data };
     await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
-    const data = this.prepareInput(doctype, candidate, false, candidate);
+    const data = this.prepareInput(doctype, candidate, false, candidate, {});
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data, id);
     const expectedRevision = options.expectedRevision ?? existing.revision;
@@ -1214,25 +1226,50 @@ export class FramekitRuntime {
     return saved;
   }
 
-  private prepareInput(doctype: DocTypeDefinition, input: DocumentData, inserting: boolean, protectedData: DocumentData = {}): DocumentData {
+  private prepareInput(
+    doctype: DocTypeDefinition,
+    input: DocumentData,
+    inserting: boolean,
+    protectedData: DocumentData = {},
+    clientInput: DocumentData = input
+  ): DocumentData {
     const output: DocumentData = {};
-    for (const field of doctype.fields) {
-      const value = input[field.name] ?? field.default;
-      if (field.required && (value === undefined || value === null || value === "")) {
-        throw new FramekitError("VALIDATION_FAILED", `Field "${field.label}" is required`, 422);
+    const fieldNames = new Set(doctype.fields.map((field) => field.name));
+    const unknownFields = Object.keys(clientInput).filter((key) => !fieldNames.has(key));
+    if (unknownFields.length > 0) {
+      throw new FramekitError("FIELD_VALIDATION_FAILED", "One or more fields failed validation.", 422, {
+        violations: unknownFields.map((field) => ({ field, rule: "schema", code: "unknown_field" }))
+      });
+    }
+    const computedFields = doctype.fields.filter((field) => field.computed);
+    for (const field of computedFields) {
+      if (Object.prototype.hasOwnProperty.call(clientInput, field.name)) {
+        throw new FramekitError("COMPUTED_FIELD_READ_ONLY", `Computed field "${doctype.name}.${field.name}" cannot be written.`, 422, {
+          field: field.name,
+          code: "computed_read_only"
+        });
       }
+    }
+    for (const field of doctype.fields.filter((candidate) => !candidate.computed)) {
+      const value = input[field.name] ?? field.default;
       if (field.readOnly && !inserting) {
         if (protectedData[field.name] !== undefined) output[field.name] = protectedData[field.name];
         continue;
       }
       if (value !== undefined) {
-        output[field.name] = coerceFieldValue(doctype.name, field.name, field.type, value, field.options);
+        output[field.name] = coerceFieldValue(doctype.name, field, value);
       }
     }
-    for (const [key, value] of Object.entries(input)) {
-      if (!(key in output) && !doctype.fields.some((field) => field.name === key)) {
-        output[key] = value;
-      }
+    const pending = new Set(computedFields.map((field) => field.name));
+    while (pending.size > 0) {
+      const field = computedFields.find((candidate) => pending.has(candidate.name) && candidate.computed!.dependencies.every((dependency) => !pending.has(dependency)));
+      if (!field) throw new FramekitError("COMPUTED_FIELD_CYCLE", `Computed field cycle detected on ${doctype.name}.`, 422);
+      output[field.name] = computeFieldValue(doctype.name, field, output);
+      pending.delete(field.name);
+    }
+    const violations = doctype.fields.flatMap((field) => validateFieldValue(doctype.name, field, output[field.name]));
+    if (violations.length > 0) {
+      throw new FramekitError("FIELD_VALIDATION_FAILED", "One or more fields failed validation.", 422, { violations });
     }
     return output;
   }
@@ -1486,6 +1523,13 @@ export class FramekitRuntime {
 
 const inMemoryRepositoryCheckpoint = Symbol("inMemoryRepositoryCheckpoint");
 const inMemoryRepositoryRestore = Symbol("inMemoryRepositoryRestore");
+
+function fieldStorageContract(field: FieldDefinition): string {
+  const exact = field.type === "decimal" || field.type === "currency"
+    ? `${field.type}(${decimalPrecision(field)},${decimalScale(field)})`
+    : field.type;
+  return field.computed ? `${exact}:computed:${JSON.stringify(field.computed)}` : exact;
+}
 
 export class InMemoryDocumentRepository implements DocumentRepository {
   private readonly records = new Map<string, DocumentRecord>();
@@ -2403,24 +2447,26 @@ function withoutRollback(change: MigrationChange): MigrationRollback {
   return rest;
 }
 
-function coerceFieldValue(doctype: string, field: string, type: string, value: unknown, options?: string[]): unknown {
+function coerceFieldValue(doctype: string, field: FieldDefinition, value: unknown): unknown {
   if (value === null) {
     return value;
   }
-  switch (type) {
-    case "number":
-    case "currency": {
+  switch (field.type) {
+    case "number": {
       const number = Number(value);
-      if (Number.isNaN(number)) {
-        throw new FramekitError("VALIDATION_FAILED", `${doctype}.${field} must be a number`, 422);
+      if (!Number.isFinite(number)) {
+        throw new FramekitError("VALIDATION_FAILED", `${doctype}.${field.name} must be a number`, 422);
       }
       return number;
     }
+    case "decimal":
+    case "currency":
+      return normalizeExactDecimal(value, decimalPrecision(field), decimalScale(field), `${doctype}.${field.name}`);
     case "boolean":
       return Boolean(value);
     case "select":
-      if (options && !options.includes(String(value))) {
-        throw new FramekitError("VALIDATION_FAILED", `${doctype}.${field} must be one of ${options.join(", ")}`, 422);
+      if (field.options && !field.options.includes(String(value))) {
+        throw new FramekitError("VALIDATION_FAILED", `${doctype}.${field.name} must be one of ${field.options.join(", ")}`, 422);
       }
       return String(value);
     case "json":
@@ -2428,6 +2474,126 @@ function coerceFieldValue(doctype: string, field: string, type: string, value: u
     default:
       return String(value);
   }
+}
+
+type ParsedDecimal = { coefficient: bigint; scale: number };
+
+export function normalizeExactDecimal(value: unknown, precision: number, scale: number, field = "decimal"): string {
+  if (typeof value !== "string") throw decimalError(field, "decimal_string_required", "Decimal value must be a canonical base-10 string.");
+  const match = /^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?$/.exec(value);
+  if (!match) throw decimalError(field, "decimal_format", "Decimal value is not in canonical base-10 notation.");
+  const fraction = match[3] ?? "";
+  if (fraction.length > scale) throw decimalError(field, "decimal_scale", `Decimal value exceeds scale ${scale}.`);
+  const whole = match[2]!;
+  const integerDigits = whole === "0" ? 0 : whole.length;
+  if (integerDigits + scale > precision) throw decimalError(field, "decimal_precision", `Decimal value exceeds precision ${precision}.`);
+  const padded = fraction.padEnd(scale, "0");
+  const zero = whole === "0" && [...padded].every((digit) => digit === "0");
+  const sign = match[1] === "-" && !zero ? "-" : "";
+  return scale === 0 ? `${sign}${whole}` : `${sign}${whole}.${padded}`;
+}
+
+export function addExactDecimals(values: string[], precision: number, scale: number): string {
+  const parsed = values.map(parseDecimal);
+  const commonScale = Math.max(0, ...parsed.map((value) => value.scale));
+  const coefficient = parsed.reduce((total, value) => total + rescaleCoefficient(value, commonScale), 0n);
+  const exact = { coefficient: rescaleCoefficient({ coefficient, scale: commonScale }, scale), scale };
+  return normalizeExactDecimal(formatDecimal(exact), precision, scale);
+}
+
+function decimalError(field: string, code: string, message: string): FramekitError {
+  return new FramekitError("DECIMAL_VALIDATION_FAILED", `${field}: ${message}`, 422, { field, code });
+}
+
+function parseDecimal(value: string): ParsedDecimal {
+  const negative = value.startsWith("-");
+  const unsigned = value.replace(/^[+-]/, "");
+  const [whole = "0", fraction = ""] = unsigned.split(".");
+  return { coefficient: BigInt(`${negative ? "-" : ""}${whole}${fraction}`), scale: fraction.length };
+}
+
+function rescaleCoefficient(value: ParsedDecimal, scale: number): bigint {
+  if (value.scale === scale) return value.coefficient;
+  if (value.scale < scale) return value.coefficient * (10n ** BigInt(scale - value.scale));
+  const divisor = 10n ** BigInt(value.scale - scale);
+  if (value.coefficient % divisor !== 0n) throw decimalError("computed", "decimal_scale", "Computed result cannot be represented at the target scale.");
+  return value.coefficient / divisor;
+}
+
+function formatDecimal(value: ParsedDecimal): string {
+  const negative = value.coefficient < 0n;
+  const digits = (negative ? -value.coefficient : value.coefficient).toString().padStart(value.scale + 1, "0");
+  const body = value.scale === 0 ? digits : `${digits.slice(0, -value.scale)}.${digits.slice(-value.scale)}`;
+  return negative ? `-${body}` : body;
+}
+
+function computeFieldValue(doctype: string, field: FieldDefinition, data: DocumentData): unknown {
+  const computed = field.computed!;
+  const values = computed.dependencies.map((dependency) => data[dependency]);
+  if (values.some((value) => value === undefined || value === null)) return null;
+  if (computed.operation === "concat") return values.map(String).join(computed.separator ?? "");
+  const decimals = values.map((value) => String(value)).map(parseDecimal);
+  let result: ParsedDecimal;
+  if (computed.operation === "sum") {
+    const scale = Math.max(...decimals.map((value) => value.scale));
+    result = { coefficient: decimals.reduce((total, value) => total + rescaleCoefficient(value, scale), 0n), scale };
+  } else if (computed.operation === "subtract") {
+    const scale = Math.max(...decimals.map((value) => value.scale));
+    result = { coefficient: rescaleCoefficient(decimals[0]!, scale) - rescaleCoefficient(decimals[1]!, scale), scale };
+  } else {
+    result = decimals.reduce<ParsedDecimal>((product, value) => ({ coefficient: product.coefficient * value.coefficient, scale: product.scale + value.scale }), { coefficient: 1n, scale: 0 });
+  }
+  const targetScale = decimalScale(field);
+  const exact = { coefficient: rescaleCoefficient(result, targetScale), scale: targetScale };
+  return normalizeExactDecimal(formatDecimal(exact), decimalPrecision(field), targetScale, `${doctype}.${field.name}`);
+}
+
+type FieldViolation = { field: string; rule: string; code: string; params?: Record<string, unknown> };
+
+function validateFieldValue(doctype: string, field: FieldDefinition, value: unknown): FieldViolation[] {
+  const violations: FieldViolation[] = [];
+  if (field.required && (value === undefined || value === null || value === "")) {
+    violations.push({ field: field.name, rule: "required", code: "required" });
+    return violations;
+  }
+  if (value === undefined || value === null) return violations;
+  for (const validator of field.validators) {
+    if (validator.kind === "length") {
+      const length = [...String(value)].length;
+      if (validator.min !== undefined && length < validator.min) violations.push({ field: field.name, rule: "length", code: "length_min", params: { min: validator.min, actual: length } });
+      if (validator.max !== undefined && length > validator.max) violations.push({ field: field.name, rule: "length", code: "length_max", params: { max: validator.max, actual: length } });
+    } else if (validator.kind === "range") {
+      const exact = field.type === "decimal" || field.type === "currency";
+      const compare = (bound: string | number) => exact
+        ? compareDecimalStrings(String(value), normalizeExactDecimal(bound, decimalPrecision(field), decimalScale(field)))
+        : Number(value) - Number(bound);
+      if (validator.min !== undefined && compare(validator.min) < 0) violations.push({ field: field.name, rule: "range", code: "range_min", params: { min: validator.min } });
+      if (validator.max !== undefined && compare(validator.max) > 0) violations.push({ field: field.name, rule: "range", code: "range_max", params: { max: validator.max } });
+    } else if (validator.kind === "pattern" && !matchesPattern(validator.pattern, String(value))) {
+      violations.push({ field: field.name, rule: "pattern", code: `pattern_${validator.pattern}`, params: { pattern: validator.pattern } });
+    } else if (validator.kind === "domain" && !validator.values.some((candidate) => String(candidate) === String(value))) {
+      violations.push({ field: field.name, rule: "domain", code: "domain", params: { values: validator.values } });
+    }
+  }
+  return violations;
+}
+
+function compareDecimalStrings(left: string, right: string): number {
+  const leftParsed = parseDecimal(left);
+  const rightParsed = parseDecimal(right);
+  const scale = Math.max(leftParsed.scale, rightParsed.scale);
+  const difference = rescaleCoefficient(leftParsed, scale) - rescaleCoefficient(rightParsed, scale);
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
+}
+
+function matchesPattern(pattern: "email" | "uuid" | "slug" | "alphanumeric", value: string): boolean {
+  if (pattern === "email") {
+    const at = value.indexOf("@");
+    return at > 0 && at === value.lastIndexOf("@") && value.indexOf(".", at + 2) > at + 1 && !value.includes(" ");
+  }
+  if (pattern === "uuid") return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  if (pattern === "slug") return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value);
+  return /^[a-z0-9]+$/i.test(value);
 }
 
 export function validateListOptions(doctype: DocTypeDefinition, options: ListOptions = {}): void {
@@ -2464,7 +2630,7 @@ export function validateListOptions(doctype: DocTypeDefinition, options: ListOpt
       throw new FramekitError("UNKNOWN_FILTER_FIELD", `Unknown filter field "${field}" for ${doctype.name}`, 422);
     }
     const fieldDefinition = doctype.fields.find((candidate) => candidate.name === field);
-    assertFilterShape(doctype.name, field, filter, fieldDefinition?.type);
+    assertFilterShape(doctype.name, field, filter, fieldDefinition);
     if (fieldDefinition?.type === "json" && !isJsonNullFilter(filter)) {
       throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `JSON field "${field}" only supports isNull filtering`, 422);
     }
@@ -2543,19 +2709,19 @@ function matchesFilter(actual: unknown, expected: FilterValue, fieldType?: strin
         return false;
       }
     }
-    if ("eq" in expected && !sameValue(actual, expected.eq)) {
+    if ("eq" in expected && !sameValue(actual, expected.eq, fieldType)) {
       return false;
     }
-    if ("ne" in expected && sameValue(actual, expected.ne)) {
+    if ("ne" in expected && sameValue(actual, expected.ne, fieldType)) {
       return false;
     }
-    if ("in" in expected && expected.in && !expected.in.some((item) => sameValue(actual, item))) {
+    if ("in" in expected && expected.in && !expected.in.some((item) => sameValue(actual, item, fieldType))) {
       return false;
     }
     if ("contains" in expected && expected.contains !== undefined && !String(actual ?? "").toLowerCase().includes(expected.contains.toLowerCase())) {
       return false;
     }
-    const missingNumericValue = (fieldType === "number" || fieldType === "currency") && (actual === undefined || actual === null || actual === "");
+    const missingNumericValue = ["number", "decimal", "currency"].includes(fieldType ?? "") && (actual === undefined || actual === null || actual === "");
     if ("gt" in expected && expected.gt !== undefined && (missingNumericValue || !(compareValues(actual, expected.gt, fieldType) > 0))) {
       return false;
     }
@@ -2571,20 +2737,30 @@ function matchesFilter(actual: unknown, expected: FilterValue, fieldType?: strin
     return true;
   }
   if (Array.isArray(expected)) {
-    return expected.some((item) => sameValue(actual, item));
+    return expected.some((item) => sameValue(actual, item, fieldType));
   }
-  return sameValue(actual, expected);
+  return sameValue(actual, expected, fieldType);
 }
 
-function assertFilterShape(doctype: string, field: string, filter: FilterValue, fieldType?: string): void {
+function assertFilterShape(doctype: string, field: string, filter: FilterValue, fieldDefinition?: FieldDefinition): void {
+  const fieldType = fieldDefinition?.type;
   const invalid = (message: string): never => {
     throw new FramekitError("INVALID_QUERY", `${doctype}.${field} ${message}`, 422);
   };
+  const validateExact = (value: unknown) => {
+    if ((fieldType === "decimal" || fieldType === "currency") && value !== null && value !== undefined) {
+      normalizeExactDecimal(value, decimalPrecision(fieldDefinition!), decimalScale(fieldDefinition!), `${doctype}.${field}`);
+    }
+  };
   if (Array.isArray(filter)) {
     if (!filter.every(isFilterPrimitive)) invalid("array filters must contain only scalar values");
+    filter.forEach(validateExact);
     return;
   }
-  if (!isFilterOperator(filter)) return;
+  if (!isFilterOperator(filter)) {
+    validateExact(filter);
+    return;
+  }
   const allowed = new Set(["eq", "ne", "in", "contains", "gt", "gte", "lt", "lte", "isNull"]);
   const unknown = Object.keys(filter).filter((key) => !allowed.has(key));
   if (unknown.length > 0) {
@@ -2595,11 +2771,13 @@ function assertFilterShape(doctype: string, field: string, filter: FilterValue, 
     invalid("in filter must be an array");
   }
   if (filter.in?.some((value) => !isFilterPrimitive(value))) invalid("in filter must contain only scalar values");
+  filter.in?.forEach(validateExact);
   if (filter.contains !== undefined && typeof filter.contains !== "string") invalid("contains filter must be a string");
   if (filter.isNull !== undefined && typeof filter.isNull !== "boolean") invalid("isNull filter must be a boolean");
   for (const operator of ["eq", "ne", "gt", "gte", "lt", "lte"] as const) {
     const value = filter[operator];
     if (value !== undefined && !isFilterPrimitive(value)) invalid(`${operator} filter must be a scalar value`);
+    if (value !== undefined) validateExact(value);
   }
   for (const operator of ["gt", "gte", "lt", "lte"] as const) {
     const value = filter[operator];
@@ -2607,7 +2785,7 @@ function assertFilterShape(doctype: string, field: string, filter: FilterValue, 
       invalid(`${operator} filter must be a string or finite number`);
     }
   }
-  if (fieldType === "number" || fieldType === "currency") {
+  if (fieldType === "number") {
     for (const operator of ["gt", "gte", "lt", "lte"] as const) {
       const value = filter[operator];
       if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
@@ -2629,14 +2807,16 @@ function isJsonNullFilter(value: FilterValue): boolean {
   return isFilterOperator(value) && Object.keys(value).length === 1 && value.isNull !== undefined;
 }
 
-function sameValue(left: unknown, right: unknown): boolean {
+function sameValue(left: unknown, right: unknown, fieldType?: string): boolean {
   if (left === undefined) return false;
   if (left === null || right === null) return left === right;
+  if (fieldType === "decimal" || fieldType === "currency") return compareDecimalStrings(String(left), String(right)) === 0;
   return String(left) === String(right);
 }
 
 function compareValues(left: unknown, right: unknown, fieldType?: string): number {
-  if (fieldType === "number" || fieldType === "currency") return Number(left) - Number(right);
+  if (fieldType === "number") return Number(left) - Number(right);
+  if (fieldType === "decimal" || fieldType === "currency") return compareDecimalStrings(String(left || "0"), String(right || "0"));
   return compareCodePoints(String(left ?? ""), String(right ?? ""));
 }
 
@@ -2693,7 +2873,7 @@ export function encodeDocumentCursor(record: DocumentRecord, sort: ListOptions["
   const normalized = normalizeSort(sort);
   const fieldType = doctype?.fields.find((field) => field.name === normalized.field)?.type;
   const rawValue = sortableValue(record, normalized.field);
-  const value = fieldType === "number" || fieldType === "currency" ? Number(rawValue) : String(rawValue);
+  const value = fieldType === "number" ? Number(rawValue) : String(rawValue);
   if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
     throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `Cannot create a cursor for ${normalized.field}`, 422);
   }
@@ -2723,11 +2903,14 @@ export function decodeDocumentCursor(cursor: string, sort: ListOptions["sort"], 
   if (field?.type === "json") {
     throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `Sorting JSON field "${field.name}" is not supported`, 422);
   }
-  const expectedValueType = field?.type === "number" || field?.type === "currency"
+  const expectedValueType = field?.type === "number"
     ? "number"
     : "string";
   if (typeof candidate.value !== expectedValueType || (expectedValueType === "number" && !Number.isFinite(candidate.value))) {
     throw new FramekitError("INVALID_CURSOR", "Cursor value does not match the requested sort field", 422);
+  }
+  if ((field?.type === "decimal" || field?.type === "currency") && normalizeExactDecimal(candidate.value, decimalPrecision(field), decimalScale(field)) !== candidate.value) {
+    throw new FramekitError("INVALID_CURSOR", "Cursor value is not a canonical exact decimal", 422);
   }
   return candidate as DocumentCursor;
 }

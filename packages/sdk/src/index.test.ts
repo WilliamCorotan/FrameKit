@@ -131,7 +131,11 @@ describe("generateSdkTypes", () => {
               fields: [
                 { name: "title", label: "Title", type: "text", required: true },
                 { name: "amount", label: "Amount", type: "currency" },
-                { name: "stage", label: "Stage", type: "select", options: ["open", "won"] }
+                { name: "stage", label: "Stage", type: "select", options: ["open", "won"] },
+                { name: "risk", label: "Risk", type: "text", validators: [{ kind: "domain", values: ["low", "high"] }] },
+                { name: "approved", label: "Approved", type: "boolean", validators: [{ kind: "domain", values: [true] }] },
+                { name: "rating", label: "Rating", type: "number", validators: [{ kind: "domain", values: [1, 2] }] },
+                { name: "total", label: "Total", type: "currency", computed: { operation: "sum", dependencies: ["amount", "amount"] } }
               ],
               workflow: {
                 field: "stage",
@@ -149,8 +153,12 @@ describe("generateSdkTypes", () => {
 
     expect(generated).toContain("export type DealInput");
     expect(generated).toContain("title: string;");
-    expect(generated).toContain("amount?: number;");
+    expect(generated).toContain("amount?: string;");
     expect(generated).toContain('stage?: "open" | "won";');
+    expect(generated).toContain('risk?: "low" | "high";');
+    expect(generated).toContain("approved?: true;");
+    expect(generated).toContain("rating?: 1 | 2;");
+    expect(generated.match(/total: string;/g)).toHaveLength(1);
     expect(generated).toContain('export type DealWorkflowAction = "win";');
     expect(generated).toContain("FramekitValidationError");
     expect(generated).toContain("FramekitClientConfigV2");

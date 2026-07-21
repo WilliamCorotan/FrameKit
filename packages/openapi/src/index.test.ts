@@ -17,7 +17,9 @@ describe("createOpenApiDocument", () => {
               ownership: { transferPermissions: ["deal.transfer"] },
               fields: [
                 { name: "title", label: "Title", type: "text", required: true },
-                { name: "amount", label: "Amount", type: "currency" },
+                { name: "amount", label: "Amount", type: "currency", precision: 20, scale: 4, validators: [{ kind: "range", min: "0.0000" }] },
+                { name: "tax", label: "Tax", type: "currency", precision: 20, scale: 4 },
+                { name: "total", label: "Total", type: "currency", precision: 20, scale: 4, computed: { operation: "sum", dependencies: ["amount", "tax"] } },
                 { name: "stage", label: "Stage", type: "select", options: ["open", "won"] }
               ],
               workflow: {
@@ -88,7 +90,17 @@ describe("createOpenApiDocument", () => {
     expect(doc.components.parameters).not.toHaveProperty("Permissions");
     const dealInput = doc.components.schemas.DealInput;
     expect(dealInput).toBeDefined();
+    expect(dealInput?.additionalProperties).toBe(false);
+    expect(doc.components.schemas.DealPatch?.additionalProperties).toBe(false);
     expect(dealInput?.required).toContain("title");
+    expect(dealInput?.properties?.amount).toMatchObject({ type: "string", "x-framekit-precision": 20, "x-framekit-scale": 4, "x-framekit-minimum": "0.0000" });
+    const amountPattern = new RegExp(dealInput?.properties?.amount?.pattern ?? "");
+    expect(amountPattern.test("1234567890123456.1234")).toBe(true);
+    expect(amountPattern.test("12345678901234567.1234")).toBe(false);
+    expect(amountPattern.test("1.12345")).toBe(false);
+    expect(amountPattern.test("+1.0000")).toBe(false);
+    expect(dealInput?.properties).not.toHaveProperty("total");
+    expect(doc.components.schemas.DealData?.properties?.total).toMatchObject({ type: ["string", "null"], readOnly: true, "x-framekit-computed": { operation: "sum" } });
     expect(doc.components.schemas.DealRecord?.required).toContain("documentStatus");
     expect(doc.components.schemas.DealRecord?.properties?.documentStatus).toEqual({ type: "string", enum: ["draft", "submitted", "cancelled"] });
     expect(doc.components.schemas.DealRecord?.properties?.ownerId).toEqual({ type: "string" });

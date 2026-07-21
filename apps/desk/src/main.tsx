@@ -11,6 +11,15 @@ type FieldDefinition = {
   options?: string[];
   inList?: boolean;
   readOnly?: boolean;
+  precision?: number;
+  scale?: number;
+  validators?: Array<
+    | { kind: "length"; min?: number; max?: number }
+    | { kind: "range"; min?: string | number; max?: string | number }
+    | { kind: "pattern"; pattern: "email" | "uuid" | "slug" | "alphanumeric" }
+    | { kind: "domain"; values: Array<string | number | boolean> }
+  >;
+  computed?: { operation: "sum" | "subtract" | "multiply" | "concat"; dependencies: string[]; separator?: string };
 };
 
 type DocTypeDefinition = {
@@ -211,9 +220,13 @@ function App() {
     try {
       setStatus("Saving…");
       const creating = !selected;
+      const invalid = active.fields.find((field) => !field.computed && !validDeskFieldValue(field, draft[field.name]));
+      if (invalid) { setStatus(`Invalid value for ${invalid.label}`); return; }
+      const payload = { ...draft };
+      for (const field of active.fields) if (field.computed) delete payload[field.name];
       const record = selected
-        ? await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { method: "PATCH", body: draft, token })
-        : await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}`, { method: "POST", body: draft, token });
+        ? await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { method: "PATCH", body: payload, token })
+        : await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}`, { method: "POST", body: payload, token });
       setSelected(record);
       setDraft(record.data);
       if (creating) {
@@ -743,20 +756,60 @@ function orderedFields(doctype: DocTypeDefinition, preferred: string[] | undefin
 }
 
 function FieldInput({ field, value, onChange }: { field: FieldDefinition; value: unknown; onChange: (value: unknown) => void }) {
+  const domain = field.validators?.find((validator) => validator.kind === "domain");
+  const disabled = field.readOnly || Boolean(field.computed);
+  if (domain?.kind === "domain") {
+    const selectedIndex = Math.max(0, domain.values.findIndex((option) => Object.is(option, value)));
+    return <select value={String(selectedIndex)} onChange={(event) => onChange(domain.values[Number(event.target.value)])} disabled={disabled}>{domain.values.map((option, index) => <option key={`${typeof option}:${String(option)}`} value={String(index)}>{String(option)}</option>)}</select>;
+  }
+  if (field.type === "boolean") {
+    return <input type="checkbox" checked={Boolean(value)} onChange={(event) => onChange(event.target.checked)} disabled={disabled} />;
+  }
   if (field.type === "select") {
+    const options = field.options ?? [];
     return (
-      <select value={String(value ?? field.options?.[0] ?? "")} onChange={(event) => onChange(event.target.value)} disabled={field.readOnly}>
-        {(field.options ?? []).map((option) => <option key={option} value={option}>{option}</option>)}
+      <select value={String(value ?? options[0] ?? "")} onChange={(event) => onChange(event.target.value)} disabled={disabled}>
+        {options.map((option) => <option key={String(option)} value={String(option)}>{String(option)}</option>)}
       </select>
     );
   }
-  if (field.type === "boolean") {
-    return <input type="checkbox" checked={Boolean(value)} onChange={(event) => onChange(event.target.checked)} disabled={field.readOnly} />;
-  }
   if (field.type === "long_text") {
-    return <textarea value={String(value ?? "")} onChange={(event) => onChange(event.target.value)} disabled={field.readOnly} />;
+    const length = field.validators?.find((validator) => validator.kind === "length");
+    return <textarea value={String(value ?? "")} onChange={(event) => onChange(event.target.value)} disabled={disabled} minLength={length?.kind === "length" ? length.min : undefined} maxLength={length?.kind === "length" ? length.max : undefined} />;
   }
-  return <input type={field.type === "number" || field.type === "currency" ? "number" : "text"} value={String(value ?? "")} onChange={(event) => onChange(event.target.value)} disabled={field.readOnly} />;
+  const length = field.validators?.find((validator) => validator.kind === "length");
+  const range = field.validators?.find((validator) => validator.kind === "range");
+  const pattern = field.validators?.find((validator) => validator.kind === "pattern");
+  const exact = field.type === "decimal" || field.type === "currency";
+  const patternValue = pattern?.kind === "pattern" ? ({ email: "[^@\\s]+@[^@\\s]+\\.[^@\\s]+", uuid: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}", slug: "[a-z0-9]+(?:-[a-z0-9]+)*", alphanumeric: "[A-Za-z0-9]+" })[pattern.pattern] : undefined;
+  return <input type={field.type === "number" ? "number" : "text"} inputMode={exact ? "decimal" : undefined} value={String(value ?? "")} onChange={(event) => onChange(event.target.value)} disabled={disabled} minLength={length?.kind === "length" ? length.min : undefined} maxLength={length?.kind === "length" ? length.max : undefined} min={field.type === "number" && range?.kind === "range" ? range.min : undefined} max={field.type === "number" && range?.kind === "range" ? range.max : undefined} pattern={exact ? exactDeskPattern(field) : patternValue} data-min={exact && range?.kind === "range" ? range.min : undefined} data-max={exact && range?.kind === "range" ? range.max : undefined} data-precision={exact ? field.precision ?? 18 : undefined} data-scale={exact ? field.scale ?? (field.type === "currency" ? 2 : 6) : undefined} />;
+}
+
+function exactDeskPattern(field: FieldDefinition): string {
+  const precision = field.precision ?? 18;
+  const scale = field.scale ?? (field.type === "currency" ? 2 : 6);
+  const integerDigits = precision - scale;
+  const whole = integerDigits === 0 ? "0" : `(?:0|[1-9][0-9]{0,${integerDigits - 1}})`;
+  return scale === 0 ? `-?${whole}` : `-?${whole}(?:\\.[0-9]{1,${scale}})?`;
+}
+
+function validDeskFieldValue(field: FieldDefinition, value: unknown): boolean {
+  if (value === undefined || value === null || value === "") return !field.required;
+  const domain = field.validators?.find((validator) => validator.kind === "domain");
+  if (domain?.kind === "domain" && !domain.values.some((option) => Object.is(option, value))) return false;
+  if (field.type !== "decimal" && field.type !== "currency") return true;
+  if (typeof value !== "string" || !new RegExp(`^(?:${exactDeskPattern(field)})$`).test(value)) return false;
+  const scale = field.scale ?? (field.type === "currency" ? 2 : 6);
+  const coefficient = (candidate: string) => {
+    const negative = candidate.startsWith("-");
+    const [whole, fraction = ""] = candidate.replace(/^-/, "").split(".");
+    const result = BigInt(`${whole}${fraction.padEnd(scale, "0")}`);
+    return negative ? -result : result;
+  };
+  const range = field.validators?.find((validator) => validator.kind === "range");
+  return range?.kind !== "range" ||
+    (range.min === undefined || coefficient(value) >= coefficient(String(range.min))) &&
+    (range.max === undefined || coefficient(value) <= coefficient(String(range.max)));
 }
 
 async function fetchJson<T>(path: string, options: { method?: string; body?: unknown; token?: string; expectedRevision?: number } = {}): Promise<T> {

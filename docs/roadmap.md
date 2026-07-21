@@ -1,6 +1,6 @@
 # Framekit Roadmap
 
-> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-21, Framekit is assessed at 83% implementation toward a production-ready 1.0 and is a beta.
+> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-21, Framekit is assessed at 85% implementation toward a production-ready 1.0 and is a beta.
 
 ## Implemented
 

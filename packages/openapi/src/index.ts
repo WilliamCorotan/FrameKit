@@ -1,4 +1,4 @@
-import { listDocTypes, type AppDefinition, type DocTypeDefinition, type FieldDefinition } from "@framekit/core";
+import { decimalPrecision, decimalScale, listDocTypes, type AppDefinition, type DocTypeDefinition, type FieldDefinition } from "@framekit/core";
 
 export type OpenApiOptions = {
   basePath?: string;
@@ -10,7 +10,7 @@ type JsonSchema = {
   type?: string | string[];
   const?: string;
   format?: string;
-  enum?: string[];
+  enum?: unknown[];
   properties?: Record<string, JsonSchema>;
   required?: string[];
   additionalProperties?: boolean | JsonSchema;
@@ -20,7 +20,14 @@ type JsonSchema = {
   maximum?: number;
   oneOf?: JsonSchema[];
   minLength?: number;
+  maxLength?: number;
   pattern?: string;
+  readOnly?: boolean;
+  "x-framekit-precision"?: number;
+  "x-framekit-scale"?: number;
+  "x-framekit-minimum"?: string;
+  "x-framekit-maximum"?: string;
+  "x-framekit-computed"?: unknown;
 };
 
 type Operation = {
@@ -710,11 +717,13 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
 
   for (const doctype of listDocTypes(app)) {
     const inputName = schemaName(doctype, "Input");
+    const dataName = schemaName(doctype, "Data");
     const recordName = schemaName(doctype, "Record");
     const patchName = schemaName(doctype, "Patch");
     schemas[inputName] = doctypeInputSchema(doctype, false);
     schemas[patchName] = doctypeInputSchema(doctype, true);
-    schemas[recordName] = documentRecordSchema(ref(inputName), Boolean(doctype.ownership));
+    schemas[dataName] = doctypeOutputSchema(doctype);
+    schemas[recordName] = documentRecordSchema(ref(dataName), Boolean(doctype.ownership));
 
     const collectionPath = `${basePath}/doctypes/${doctype.name}`;
     const itemPath = `${collectionPath}/{id}`;
@@ -843,11 +852,20 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
   };
 }
 
+function doctypeOutputSchema(doctype: DocTypeDefinition): JsonSchema {
+  return {
+    type: "object",
+    properties: Object.fromEntries(doctype.fields.map((field) => [field.name, fieldSchema(field)])),
+    required: doctype.fields.filter((field) => field.required || field.computed).map((field) => field.name),
+    additionalProperties: false
+  };
+}
+
 function doctypeInputSchema(doctype: DocTypeDefinition, partial: boolean): JsonSchema {
   const properties: Record<string, JsonSchema> = {};
   const required: string[] = [];
   for (const field of doctype.fields) {
-    if (field.readOnly && partial) {
+    if (field.computed || (field.readOnly && partial)) {
       continue;
     }
     properties[field.name] = fieldSchema(field);
@@ -859,29 +877,84 @@ function doctypeInputSchema(doctype: DocTypeDefinition, partial: boolean): JsonS
     type: "object",
     properties,
     required: required.length > 0 ? required : undefined,
-    additionalProperties: true
+    additionalProperties: false
   };
 }
 
 function fieldSchema(field: FieldDefinition): JsonSchema {
   const description = field.description;
+  let schema: JsonSchema;
   switch (field.type) {
     case "number":
+      schema = { type: "number", description };
+      break;
+    case "decimal":
     case "currency":
-      return { type: "number", description };
+      schema = {
+        type: "string",
+        pattern: exactDecimalPattern(field),
+        description,
+        "x-framekit-precision": decimalPrecision(field),
+        "x-framekit-scale": decimalScale(field)
+      };
+      break;
     case "boolean":
-      return { type: "boolean", description };
+      schema = { type: "boolean", description };
+      break;
     case "date":
-      return { type: "string", format: "date", description };
+      schema = { type: "string", format: "date", description };
+      break;
     case "datetime":
-      return { type: "string", format: "date-time", description };
+      schema = { type: "string", format: "date-time", description };
+      break;
     case "select":
-      return { type: "string", enum: field.options, description };
+      schema = { type: "string", enum: field.options, description };
+      break;
     case "json":
-      return { description };
+      schema = { description };
+      break;
     default:
-      return { type: "string", description };
+      schema = { type: "string", description };
   }
+  for (const validator of field.validators) {
+    if (validator.kind === "length") {
+      schema.minLength = validator.min;
+      schema.maxLength = validator.max;
+    } else if (validator.kind === "range") {
+      if (field.type === "number") {
+        schema.minimum = validator.min === undefined ? undefined : Number(validator.min);
+        schema.maximum = validator.max === undefined ? undefined : Number(validator.max);
+      } else {
+        schema["x-framekit-minimum"] = validator.min === undefined ? undefined : String(validator.min);
+        schema["x-framekit-maximum"] = validator.max === undefined ? undefined : String(validator.max);
+      }
+    } else if (validator.kind === "pattern") {
+      schema.pattern = patternSource(validator.pattern);
+    } else if (validator.kind === "domain") {
+      schema.enum = validator.values;
+    }
+  }
+  if (field.computed) {
+    if (typeof schema.type === "string") schema.type = [schema.type, "null"];
+    schema.readOnly = true;
+    schema["x-framekit-computed"] = field.computed;
+  }
+  return schema;
+}
+
+function patternSource(pattern: "email" | "uuid" | "slug" | "alphanumeric"): string {
+  if (pattern === "email") return "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$";
+  if (pattern === "uuid") return "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
+  if (pattern === "slug") return "^[a-z0-9]+(?:-[a-z0-9]+)*$";
+  return "^[A-Za-z0-9]+$";
+}
+
+function exactDecimalPattern(field: FieldDefinition): string {
+  const precision = decimalPrecision(field);
+  const scale = decimalScale(field);
+  const integerDigits = precision - scale;
+  const whole = integerDigits === 0 ? "0" : `(?:0|[1-9][0-9]{0,${integerDigits - 1}})`;
+  return scale === 0 ? `^-?${whole}$` : `^-?${whole}(?:\\.[0-9]{1,${scale}})?$`;
 }
 
 function userWriteSchema(creating: boolean): JsonSchema {
