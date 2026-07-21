@@ -54,6 +54,57 @@ describe("createNitroHandler", () => {
     })).resolves.toMatchObject({ replayed: true, documents: [{ id: "item-header" }] });
   });
 
+  it("preserves exact values and computed output across HTTP", async () => {
+    const invoice = defineDocType({
+      name: "exact_invoice",
+      label: "Exact Invoice",
+      fields: [
+        { name: "subtotal", label: "Subtotal", type: "decimal", precision: 30, scale: 4, required: true },
+        { name: "tax", label: "Tax", type: "decimal", precision: 30, scale: 4, required: true },
+        { name: "total", label: "Total", type: "decimal", precision: 30, scale: 4, computed: { operation: "sum", dependencies: ["subtotal", "tax"] } }
+      ],
+      permissions: [
+        { action: "create", permissions: ["invoice.write"] },
+        { action: "update", permissions: ["invoice.write"] },
+        { action: "read", permissions: ["invoice.read"] }
+      ]
+    });
+    const runtime = createRuntime(defineApp({ name: "Exact HTTP", modules: [defineModule({ id: "billing", name: "Billing", doctypes: [invoice] })] }), { idGenerator: () => "exact-1" });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { development: { allowHeaderIdentity: true } }));
+    const fetch = toWebHandler(h3);
+    await expect(json(fetch, "/api/doctypes/exact_invoice", {
+      method: "POST",
+      headers: { "x-user-id": "accountant", "x-permissions": "invoice.write" },
+      body: { subtotal: "1.0000", tax: "0.2000", subttoal: "1.0000" }
+    })).rejects.toMatchObject({
+      code: "FIELD_VALIDATION_FAILED",
+      details: { violations: [{ field: "subttoal", rule: "schema", code: "unknown_field" }] }
+    });
+    const created = await json<{ id: string; revision: number; data: Record<string, unknown> }>(fetch, "/api/doctypes/exact_invoice", {
+      method: "POST",
+      headers: { "x-user-id": "accountant", "x-permissions": "invoice.write" },
+      body: { subtotal: "9007199254740993.1000", tax: "0.2000" }
+    });
+    expect(created.data).toMatchObject({ subtotal: "9007199254740993.1000", tax: "0.2000", total: "9007199254740993.3000" });
+    await expect(json(fetch, `/api/doctypes/exact_invoice/${created.id}`, {
+      method: "PATCH",
+      headers: { "x-user-id": "accountant", "x-permissions": "invoice.write", "if-match": String(created.revision) },
+      body: { total: created.data.total }
+    })).rejects.toMatchObject({ code: "COMPUTED_FIELD_READ_ONLY" });
+    await expect(json(fetch, `/api/doctypes/exact_invoice/${created.id}`, {
+      method: "PATCH",
+      headers: { "x-user-id": "accountant", "x-permissions": "invoice.write", "if-match": String(created.revision) },
+      body: { subttoal: "2.0000" }
+    })).rejects.toMatchObject({
+      code: "FIELD_VALIDATION_FAILED",
+      details: { violations: [{ field: "subttoal", rule: "schema", code: "unknown_field" }] }
+    });
+    await expect(json(fetch, `/api/doctypes/exact_invoice/${created.id}`, {
+      headers: { "x-user-id": "accountant", "x-permissions": "invoice.read" }
+    })).resolves.toMatchObject({ revision: created.revision, data: { subtotal: "9007199254740993.1000" } });
+  });
+
   it("exposes submit and cancel document lifecycle commands", async () => {
     const invoice = defineDocType({
       name: "invoice",

@@ -8,6 +8,7 @@ Framekit 1.0 treats metadata as a versioned contract shared by core, runtime, pe
 - Select fields require unique options and valid defaults. Link fields require an existing target DocType. JSON fields cannot be unique.
 - Indexes, naming fields, views, workflow fields, workflow states, transition endpoints, and hook DocType references must resolve without ambiguity.
 - Tenant custom fields are checked against the same field and link invariants before persistence.
+- Decimal and currency values are canonical base-10 strings with bounded precision and scale. Computed fields use an acyclic declarative dependency graph, and validators use portable length, range, fixed-pattern, or domain rules. See [Exact decimals, computed fields, and validators](./domain-fields.md).
 - Every document starts as `draft`, may be submitted once, and may then be cancelled once: `draft -> submitted -> cancelled`.
 - New workflow documents always persist the configured initial value in both lifecycle `state` and `data[workflow.field]`. Callers cannot select another initial value; a workflow-field default is optional, but when present it must equal the workflow initial state.
 - Update, delete, and workflow transition commands only accept draft documents. Submitted and cancelled records remain readable but immutable.
@@ -32,7 +33,6 @@ The following are deliberately outside the bounded 1.0 metadata slice and have s
 | Priority | Primitive | Tracking |
 | --- | --- | --- |
 | P2 | Child/repeating records and attachments | [#39](https://github.com/WilliamCorotan/FrameKit/issues/39) |
-| P2 | Exact decimals, computed fields, and richer validators | [#40](https://github.com/WilliamCorotan/FrameKit/issues/40) |
 | Implemented | Ownership and row-level policies | [#41](https://github.com/WilliamCorotan/FrameKit/issues/41), [policy](row-permissions.md) |
 | P2 | Localization and typed settings | [#42](https://github.com/WilliamCorotan/FrameKit/issues/42) |
 

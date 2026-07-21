@@ -16,7 +16,10 @@ describe("runtime document service", () => {
     const record = defineDocType({
       name: "command_record",
       label: "Command Record",
-      fields: [{ name: "code", label: "Code", type: "text", required: true, unique: true }],
+      fields: [
+        { name: "code", label: "Code", type: "text", required: true, unique: true },
+        { name: "display", label: "Display", type: "text", computed: { operation: "concat", dependencies: ["code"] } }
+      ],
       permissions: ["create", "read", "update", "delete"].map((action) => ({ action: action as "create", permissions: ["crm.records"] }))
     });
     const note = defineDocType({
@@ -41,6 +44,29 @@ describe("runtime document service", () => {
     await expect(runtime.executeDocumentCommand(tenant, "atomic-records", { operations: [
       { operation: "create", doctype: record.name, id: "forbidden", data: { code: "NO" } }
     ] })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [
+      { operation: "create", doctype: record.name, id: "computed-atomic", data: { code: "COMPUTED", display: "COMPUTED" } }
+    ] })).rejects.toMatchObject({ code: "COMPUTED_FIELD_READ_ONLY" });
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [
+      { operation: "create", doctype: record.name, id: "unknown-atomic", data: { code: "UNKNOWN", typo: true } }
+    ] })).rejects.toMatchObject({
+      code: "FIELD_VALIDATION_FAILED",
+      details: { violations: [{ field: "typo", rule: "schema", code: "unknown_field" }] }
+    });
+    await expect(runtime.get(commandTenant, record.name, "unknown-atomic")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", { operations: [{
+      operation: "create", doctype: record.name, id: "computed-saga", data: { code: "COMPUTED", display: "COMPUTED" },
+      compensation: { operation: "delete", doctype: record.name, id: "computed-saga", expectedRevision: 1 }
+    }] })).rejects.toMatchObject({ code: "COMMAND_SAGA_FAILED", details: { cause: expect.stringContaining("cannot be written") } });
+    await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", { operations: [{
+      operation: "create", doctype: record.name, id: "unknown-saga", data: { code: "UNKNOWN", typo: true },
+      compensation: { operation: "delete", doctype: record.name, id: "unknown-saga", expectedRevision: 1 }
+    }] })).rejects.toMatchObject({ code: "COMMAND_SAGA_FAILED", details: {
+      cause: "One or more fields failed validation.",
+      causeCode: "FIELD_VALIDATION_FAILED",
+      causeDetails: { violations: [{ field: "typo", rule: "schema", code: "unknown_field" }] }
+    } });
+    await expect(runtime.get(commandTenant, record.name, "unknown-saga")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
 
     const request = { operations: [
       { operation: "create" as const, doctype: record.name, id: "record-a", data: { code: "A" } },
@@ -60,6 +86,9 @@ describe("runtime document service", () => {
     await expect(runtime.executeDocumentCommand(bob, "atomic-records", { operations: [
       { operation: "update", doctype: note.name, id: "note-a", expectedRevision: 1, data: { title: "stolen" } }
     ] })).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [
+      { operation: "update", doctype: record.name, id: "record-a", expectedRevision: 1, data: { display: "A" } }
+    ] })).rejects.toMatchObject({ code: "COMPUTED_FIELD_READ_ONLY" });
     await runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [
       { operation: "update", doctype: note.name, id: "note-a", expectedRevision: 1, data: { title: "updated later" } }
     ] });
@@ -220,6 +249,62 @@ describe("runtime document service", () => {
     expect(list).toHaveLength(1);
   });
 
+  it("round-trips exact decimals, computes deterministic fields, and reports validator violations", async () => {
+    const app = defineApp({ name: "Billing", modules: [defineModule({ id: "billing", name: "Billing", doctypes: [defineDocType({
+      name: "invoice",
+      label: "Invoice",
+      fields: [
+        { name: "subtotal", label: "Subtotal", type: "decimal", precision: 30, scale: 4, required: true },
+        { name: "tax", label: "Tax", type: "decimal", precision: 30, scale: 4, required: true },
+        { name: "total", label: "Total", type: "decimal", precision: 30, scale: 4, computed: { operation: "sum", dependencies: ["subtotal", "tax"] } },
+        { name: "code", label: "Code", type: "text", validators: [{ kind: "length", min: 3 }, { kind: "pattern", pattern: "slug" }] }
+      ],
+      permissions: [
+        { action: "create", permissions: ["crm.customer"] },
+        { action: "update", permissions: ["crm.customer"] },
+        { action: "read", permissions: ["crm.customer"] }
+      ]
+    })] })] });
+    let exactId = 0;
+    const runtime = createRuntime(app, { idGenerator: () => `invoice${++exactId}234` });
+    const created = await runtime.create(tenant, "invoice", { subtotal: "9007199254740993.1000", tax: "0.2000", code: "acme-1" });
+    expect(created.data).toMatchObject({ subtotal: "9007199254740993.1000", tax: "0.2000", total: "9007199254740993.3000" });
+    const fractional = await runtime.create(tenant, "invoice", { subtotal: "0.1000", tax: "0.2000", code: "fraction" });
+    expect(fractional.data.total).toBe("0.3000");
+    await expect(runtime.create(tenant, "invoice", { subtotal: 0.1, tax: "0", code: "acme-1" })).rejects.toMatchObject({ code: "DECIMAL_VALIDATION_FAILED", details: { code: "decimal_string_required" } });
+    await expect(runtime.create(tenant, "invoice", { subtotal: "1", tax: "2", total: "3", code: "acme-1" })).rejects.toMatchObject({ code: "COMPUTED_FIELD_READ_ONLY" });
+    await expect(runtime.update(tenant, "invoice", created.id, { total: created.data.total }, { expectedRevision: created.revision })).rejects.toMatchObject({ code: "COMPUTED_FIELD_READ_ONLY" });
+    await expect(runtime.create(tenant, "invoice", { subtotal: "1", tax: "2", code: "!" })).rejects.toMatchObject({
+      code: "FIELD_VALIDATION_FAILED",
+      details: { violations: expect.arrayContaining([expect.objectContaining({ code: "length_min" }), expect.objectContaining({ code: "pattern_slug" })]) }
+    });
+  });
+
+  it("rescales computed decimal DAGs exactly without rounding", async () => {
+    const arithmetic = defineDocType({ name: "arithmetic", label: "Arithmetic", fields: [
+      { name: "left", label: "Left", type: "decimal", precision: 8, scale: 2, required: true },
+      { name: "right", label: "Right", type: "decimal", precision: 8, scale: 2, required: true },
+      { name: "sum", label: "Sum", type: "decimal", precision: 8, scale: 1, computed: { operation: "sum", dependencies: ["left", "right"] } },
+      { name: "difference", label: "Difference", type: "decimal", precision: 8, scale: 1, computed: { operation: "subtract", dependencies: ["left", "right"] } },
+      { name: "product", label: "Product", type: "decimal", precision: 8, scale: 2, computed: { operation: "multiply", dependencies: ["left", "right"] } },
+      { name: "nested", label: "Nested", type: "decimal", precision: 8, scale: 2, computed: { operation: "sum", dependencies: ["product", "left"] } }
+    ] });
+    const runtime = createRuntime(defineApp({ name: "Arithmetic", modules: [defineModule({ id: "math", name: "Math", doctypes: [arithmetic] })] }), { idGenerator: (() => { let id = 0; return () => `${String(++id).padStart(8, "0")}math`; })() });
+    await expect(runtime.create(tenant, arithmetic.name, { left: "2.00", right: "3.00" })).resolves.toMatchObject({ data: {
+      sum: "5.0", difference: "-1.0", product: "6.00", nested: "8.00"
+    } });
+    await expect(runtime.create(tenant, arithmetic.name, { left: "0.00", right: "-3.00" })).resolves.toMatchObject({ data: { product: "0.00", nested: "0.00" } });
+    await expect(runtime.create(tenant, arithmetic.name, { left: "2.25", right: "3.00" })).rejects.toMatchObject({ code: "DECIMAL_VALIDATION_FAILED", details: { code: "decimal_scale" } });
+
+    const overflow = defineDocType({ name: "overflow", label: "Overflow", fields: [
+      { name: "left", label: "Left", type: "decimal", precision: 4, scale: 2, required: true },
+      { name: "right", label: "Right", type: "decimal", precision: 4, scale: 2, required: true },
+      { name: "product", label: "Product", type: "decimal", precision: 4, scale: 2, computed: { operation: "multiply", dependencies: ["left", "right"] } }
+    ] });
+    const overflowRuntime = createRuntime(defineApp({ name: "Overflow", modules: [defineModule({ id: "math", name: "Math", doctypes: [overflow] })] }));
+    await expect(overflowRuntime.create(tenant, overflow.name, { left: "99.00", right: "2.00" })).rejects.toMatchObject({ code: "DECIMAL_VALIDATION_FAILED", details: { code: "decimal_precision" } });
+  });
+
   it("filters, sorts, and offsets document lists", async () => {
     const app = defineApp({
       name: "CRM",
@@ -335,11 +420,11 @@ describe("runtime document service", () => {
     let id = 0;
     const runtime = createRuntime(app, { idGenerator: () => `deal${++id}abcdef` });
 
-    await runtime.create(tenant, "deal", { title: "North expansion", amount: 50, stage: "open" });
-    await runtime.create(tenant, "deal", { title: "South renewal", amount: 120, stage: "won" });
-    await runtime.create(tenant, "deal", { title: "West churn", amount: 20, stage: "lost" });
+    await runtime.create(tenant, "deal", { title: "North expansion", amount: "50.00", stage: "open" });
+    await runtime.create(tenant, "deal", { title: "South renewal", amount: "120.00", stage: "won" });
+    await runtime.create(tenant, "deal", { title: "West churn", amount: "20.00", stage: "lost" });
 
-    await expect(runtime.list(tenant, "deal", { filters: { amount: { gt: 40 }, stage: { in: ["open", "won"] } }, sort: { field: "amount", direction: "desc" } })).resolves.toMatchObject([
+    await expect(runtime.list(tenant, "deal", { filters: { amount: { gt: "40.00" }, stage: { in: ["open", "won"] } }, sort: { field: "amount", direction: "desc" } })).resolves.toMatchObject([
       { data: { title: "South renewal" } },
       { data: { title: "North expansion" } }
     ]);
@@ -352,9 +437,9 @@ describe("runtime document service", () => {
     const missingAndNull = [
       { id: "missing", doctype: "deal", tenantId: tenant.tenantId, revision: 1, documentStatus: "draft" as const, data: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
       { id: "null", doctype: "deal", tenantId: tenant.tenantId, revision: 1, documentStatus: "draft" as const, data: { amount: null }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
-      { id: "zero", doctype: "deal", tenantId: tenant.tenantId, revision: 1, documentStatus: "draft" as const, data: { amount: 0 }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }
+      { id: "zero", doctype: "deal", tenantId: tenant.tenantId, revision: 1, documentStatus: "draft" as const, data: { amount: "0.00" }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }
     ];
-    expect(applyFilters(missingAndNull, { amount: { lte: 0 } }, doctype).map((record) => record.id)).toEqual(["zero"]);
+    expect(applyFilters(missingAndNull, { amount: { lte: "0.00" } }, doctype).map((record) => record.id)).toEqual(["zero"]);
 
     const forgedCursor = btoa(JSON.stringify({ v: 1, field: "amount", direction: "asc", value: "50", id: "deal1abcdef" }))
       .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
@@ -788,7 +873,7 @@ describe("runtime document service", () => {
               name: "customer",
               label: "Customer",
               fields: [{ name: "name", label: "Name", type: "text", required: true }],
-              permissions: [{ action: "create", permissions: ["crm.customer"] }, { action: "read", permissions: ["crm.customer"] }]
+              permissions: [{ action: "create", permissions: ["crm.customer"] }, { action: "read", permissions: ["crm.customer"] }, { action: "update", permissions: ["crm.customer"] }]
             })
           ]
         })
@@ -804,6 +889,15 @@ describe("runtime document service", () => {
     const metadata = await runtime.metadata(tenant);
 
     expect(created.data.region).toBe("apac");
+    await expect(runtime.create(tenant, "customer", { name: "Typo Co", region: "apac", reigon: "apac" })).rejects.toMatchObject({
+      code: "FIELD_VALIDATION_FAILED",
+      details: { violations: [{ field: "reigon", rule: "schema", code: "unknown_field" }] }
+    });
+    await expect(runtime.update(tenant, "customer", created.id, { region: "emea", reigon: "emea" }, { expectedRevision: created.revision })).rejects.toMatchObject({
+      code: "FIELD_VALIDATION_FAILED",
+      details: { violations: [{ field: "reigon", rule: "schema", code: "unknown_field" }] }
+    });
+    await expect(runtime.get(tenant, "customer", created.id)).resolves.toMatchObject({ revision: 1, data: { region: "apac" } });
     expect(metadata.modules[0]?.doctypes[0]?.fields.map((field) => field.name)).toContain("region");
     await expect(runtime.addCustomField(tenant, {
       doctype: "customer",
@@ -962,6 +1056,11 @@ describe("runtime document service", () => {
     const mismatchedPlan = { ...mismatchedUnsigned, checksum: await migrationChecksum(mismatchedUnsigned) };
     await expect(validateMigrationPlan(mismatchedPlan)).rejects.toMatchObject({ code: "INVALID_MIGRATION_CONVERSION" });
     await expect(runtime.migrationHistory(tenant)).resolves.toHaveLength(1);
+
+    const exactCurrent = defineApp({ name: "Exact", modules: [defineModule({ id: "billing", name: "Billing", doctypes: [defineDocType({ name: "invoice", label: "Invoice", fields: [{ name: "amount", label: "Amount", type: "decimal", precision: 18, scale: 2 }] })] })] });
+    const exactNext = defineApp({ name: "Exact", modules: [defineModule({ id: "billing", name: "Billing", doctypes: [defineDocType({ name: "invoice", label: "Invoice", fields: [{ name: "amount", label: "Amount", type: "decimal", precision: 24, scale: 4 }] })] })] });
+    const exactPlan = await createRuntime(exactCurrent, { idGenerator: () => "exact-change" }).planMigration(tenant, exactNext);
+    expect(exactPlan.changes).toEqual([expect.objectContaining({ kind: "change_field_type", destructive: true, from: "decimal(18,2)", to: "decimal(24,4)" })]);
 
     const supplier = defineDocType({ name: "supplier", label: "Supplier", fields: [{ name: "name", label: "Name", type: "text" }] });
     const replacement = defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [supplier] })] });

@@ -367,7 +367,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
     let nextCursor: string | undefined;
     if (hasMore && lastRow) {
       const last = items.at(-1)!;
-      const cursorValue = sortField?.type === "number" || sortField?.type === "currency" ? Number(lastRow.cursorValue) : lastRow.cursorValue;
+      const cursorValue = sortField?.type === "number" ? Number(lastRow.cursorValue) : lastRow.cursorValue;
       nextCursor = encodeDocumentCursor({
         ...last,
         data: sortField ? { ...last.data, [sort.field]: cursorValue } : last.data
@@ -2397,9 +2397,11 @@ function immutableOnlineParameters(parameters: MigrationConversion["parameters"]
 function assertOnlineConversionValue(conversion: MigrationConversion, value: unknown, documentId: string): void {
   assertJsonSafeOnlineValue(value, `${conversion.id}@${conversion.version} document ${documentId}`);
   let compatible = value === null;
-  switch (conversion.toType) {
+  const exact = /^(decimal|currency)\(([1-9][0-9]*),([0-9]+)\)(?::computed:.*)?$/.exec(conversion.toType);
+  if (exact && value !== null) {
+    compatible = typeof value === "string" && isCanonicalExactConversionValue(value, Number(exact[2]), Number(exact[3]));
+  } else switch (conversion.toType) {
     case "number":
-    case "currency":
       compatible ||= typeof value === "number" && Number.isFinite(value);
       break;
     case "boolean":
@@ -2418,6 +2420,17 @@ function assertOnlineConversionValue(conversion: MigrationConversion, value: unk
       422
     );
   }
+}
+
+function isCanonicalExactConversionValue(value: string, precision: number, scale: number): boolean {
+  if (!Number.isSafeInteger(precision) || !Number.isSafeInteger(scale) || precision < 1 || scale < 0 || scale > precision) return false;
+  const match = /^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?$/.exec(value);
+  if (!match) return false;
+  const fraction = match[3] ?? "";
+  if (fraction.length !== scale) return false;
+  const integerDigits = match[2] === "0" ? 0 : match[2]!.length;
+  if (integerDigits + scale > precision) return false;
+  return !(match[1] === "-" && match[2] === "0" && [...fraction].every((digit) => digit === "0"));
 }
 
 async function retryOnlineChunk<T>(maxRetries: number, operation: () => Promise<T>): Promise<T> {
@@ -2706,7 +2719,7 @@ function documentSortExpression(field: string, fieldType?: string): SQL<string |
   if (field === "id") return drizzleSql<string>`${framekitDocuments.id} collate "C"`;
   if (field === "createdAt") return drizzleSql<string>`to_char(${framekitDocuments.createdAt} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') collate "C"`;
   if (field === "updatedAt") return drizzleSql<string>`to_char(${framekitDocuments.updatedAt} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') collate "C"`;
-  if (fieldType === "number" || fieldType === "currency") {
+  if (fieldType === "number" || fieldType === "decimal" || fieldType === "currency") {
     return drizzleSql<number>`coalesce((${framekitDocuments.data} ->> ${field})::numeric, 0)`;
   }
   return drizzleSql<string>`coalesce(${framekitDocuments.data} ->> ${field}, '') collate "C"`;
@@ -2733,15 +2746,16 @@ function compileDocumentFilters(doctype: DocTypeDefinition, filters: ListOptions
       throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `JSON field "${field}" only supports isNull filtering`, 422);
     }
     const text = drizzleSql<string>`coalesce(${framekitDocuments.data} ->> ${field}, '')`;
-    const comparable = fieldType === "number" || fieldType === "currency"
-      ? drizzleSql<number>`coalesce((${framekitDocuments.data} ->> ${field})::numeric, 0)`
+    const numericComparable = drizzleSql<number>`coalesce((${framekitDocuments.data} ->> ${field})::numeric, 0)`;
+    const comparable = fieldType === "number" || fieldType === "decimal" || fieldType === "currency"
+      ? numericComparable
       : text;
     if (Array.isArray(filter)) {
-      conditions.push(filter.length === 0 ? drizzleSql`false` : or(...filter.map((value) => equalityFilter(field, text, value)))!);
+      conditions.push(filter.length === 0 ? drizzleSql`false` : or(...filter.map((value) => equalityFilter(field, text, value, fieldType === "decimal" || fieldType === "currency" ? numericComparable : undefined)))!);
       continue;
     }
     if (!filter || typeof filter !== "object") {
-      conditions.push(equalityFilter(field, text, filter));
+      conditions.push(equalityFilter(field, text, filter, fieldType === "decimal" || fieldType === "currency" ? numericComparable : undefined));
       continue;
     }
     const operator = filter as FilterOperator;
@@ -2757,23 +2771,23 @@ function compileDocumentFilters(doctype: DocTypeDefinition, filters: ListOptions
       )!;
       conditions.push(operator.isNull ? isNull : drizzleSql`not (${isNull})`);
     }
-    if (operator.eq !== undefined) conditions.push(equalityFilter(field, text, operator.eq));
+    if (operator.eq !== undefined) conditions.push(equalityFilter(field, text, operator.eq, fieldType === "decimal" || fieldType === "currency" ? numericComparable : undefined));
     if (operator.ne !== undefined) {
       conditions.push(operator.ne === null
         ? or(drizzleSql`not (${framekitDocuments.data} ? ${field})`, drizzleSql`${framekitDocuments.data} -> ${field} <> 'null'::jsonb` )!
         : or(
             drizzleSql`not (${framekitDocuments.data} ? ${field})`,
             drizzleSql`${framekitDocuments.data} -> ${field} = 'null'::jsonb`,
-            ne(text, String(operator.ne))
+            fieldType === "decimal" || fieldType === "currency" ? ne(numericComparable, operator.ne) : ne(text, String(operator.ne))
           )!);
     }
     if (operator.in !== undefined) {
-      conditions.push(operator.in.length === 0 ? drizzleSql`false` : or(...operator.in.map((value) => equalityFilter(field, text, value)))!);
+      conditions.push(operator.in.length === 0 ? drizzleSql`false` : or(...operator.in.map((value) => equalityFilter(field, text, value, fieldType === "decimal" || fieldType === "currency" ? numericComparable : undefined)))!);
     }
     if (operator.contains !== undefined) {
       conditions.push(drizzleSql`lower(${text}) like ${containsPattern(operator.contains.toLowerCase())} escape '\\'`);
     }
-    const present = fieldType === "number" || fieldType === "currency"
+    const present = fieldType === "number" || fieldType === "decimal" || fieldType === "currency"
       ? and(drizzleSql`${framekitDocuments.data} ? ${field}`, ne(text, ""))!
       : undefined;
     if (operator.gt !== undefined) conditions.push(present ? and(present, gt(comparable, operator.gt))! : gt(comparable, operator.gt));
@@ -2791,12 +2805,12 @@ function compileRowPolicy(tenant: TenantContext, doctype: DocTypeDefinition, ope
   return drizzleSql`false`;
 }
 
-function equalityFilter(field: string, text: SQL<string>, value: unknown): SQL {
+function equalityFilter(field: string, text: SQL<string>, value: unknown, exactComparable?: SQL<number>): SQL {
   if (value === null) return drizzleSql`${framekitDocuments.data} -> ${field} = 'null'::jsonb`;
   return and(
     drizzleSql`${framekitDocuments.data} ? ${field}`,
     drizzleSql`${framekitDocuments.data} -> ${field} <> 'null'::jsonb`,
-    eq(text, String(value))
+    exactComparable ? eq(exactComparable, value as string | number) : eq(text, String(value))
   )!;
 }
 

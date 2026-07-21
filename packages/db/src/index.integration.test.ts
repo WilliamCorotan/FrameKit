@@ -89,6 +89,7 @@ const queryDocType = defineDocType({
     { name: "name", label: "Name", type: "text" },
     { name: "status", label: "Status", type: "select", options: ["active", "paused"] },
     { name: "score", label: "Score", type: "number" },
+    { name: "amount", label: "Amount", type: "decimal", precision: 30, scale: 4 },
     { name: "enabled", label: "Enabled", type: "boolean" },
     { name: "notes", label: "Notes", type: "long_text" },
     { name: "metadata", label: "Metadata", type: "json" }
@@ -674,11 +675,11 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     const memory = new InMemoryDocumentRepository();
     const timestamp = "2026-07-06T00:00:00.000Z";
     const fixtures = [
-      { id: "query-01", data: { name: "Alpha", status: "active", score: 2, notes: "needle one", metadata: { rank: 1 } } },
-      { id: "query-02", data: { name: "Beta", status: "paused", score: 10, notes: "other", metadata: { rank: 2 } } },
-      { id: "query-03", data: { name: "Gamma", status: "active", score: 10, notes: "needle two", metadata: { rank: 3 } } },
-      { id: "query-04", data: { name: "Delta", status: "active", score: 25, notes: "other", metadata: { rank: 4 } } },
-      { id: "query-05", data: { name: "%_' literal", status: "active", score: 30, notes: "escaped", metadata: { rank: 5 } } }
+      { id: "query-01", data: { name: "Alpha", status: "active", score: 2, amount: "9007199254740993.0001", notes: "needle one", metadata: { rank: 1 } } },
+      { id: "query-02", data: { name: "Beta", status: "paused", score: 10, amount: "0.1000", notes: "other", metadata: { rank: 2 } } },
+      { id: "query-03", data: { name: "Gamma", status: "active", score: 10, amount: "10.0000", notes: "needle two", metadata: { rank: 3 } } },
+      { id: "query-04", data: { name: "Delta", status: "active", score: 25, amount: "2.0000", notes: "other", metadata: { rank: 4 } } },
+      { id: "query-05", data: { name: "%_' literal", status: "active", score: 30, amount: "100.0000", notes: "escaped", metadata: { rank: 5 } } }
     ];
     for (const fixture of fixtures) {
       const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, documentStatus: "draft" as const, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
@@ -693,7 +694,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       { filters: { status: "active", score: { gte: 10 } }, sort: { field: "score", direction: "asc" }, fields: ["name", "score"], limit: 10 },
       { search: "needle", sort: { field: "name", direction: "desc" }, fields: ["name", "notes"], limit: 10 },
       { filters: { name: { contains: "%_'" } }, sort: { field: "name", direction: "asc" }, limit: 10 },
-      { filters: { score: { in: [2, 25] } }, sort: { field: "score", direction: "desc" }, offset: 1, limit: 1 }
+      { filters: { score: { in: [2, 25] } }, sort: { field: "score", direction: "desc" }, offset: 1, limit: 1 },
+      { filters: { amount: { gt: "1.0000", lt: "1000.0000" } }, sort: { field: "amount", direction: "asc" }, fields: ["name", "amount"], limit: 10 }
     ];
     for (const options of shapes) {
       const postgresPage = await stores.repository.listPage(tenant, queryDocType, options);
@@ -960,10 +962,21 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
 
   it("executes cross-DocType command batches atomically with replay and stale-revision rollback", async () => {
     const commandTenant = { ...tenant, tenantId: "pg_command_batch_tenant" };
+    const exactDocType = defineDocType({
+      name: "exact_command", label: "Exact Command", fields: [
+        { name: "amount", label: "Amount", type: "decimal", precision: 30, scale: 4, required: true },
+        { name: "tax", label: "Tax", type: "decimal", precision: 30, scale: 4, required: true },
+        { name: "total", label: "Total", type: "decimal", precision: 30, scale: 4, computed: { operation: "sum", dependencies: ["amount", "tax"] } }
+      ],
+      permissions: [
+        { action: "create", permissions: ["commands.manage"] },
+        { action: "read", permissions: ["commands.manage"] }
+      ]
+    });
     const commandApp = defineApp({ name: "Postgres Commands", modules: [defineModule({
-      id: "commands", name: "Commands", doctypes: [customerDocType, dealDocType, securedDocType], commands: [{
+      id: "commands", name: "Commands", doctypes: [customerDocType, dealDocType, securedDocType, exactDocType], commands: [{
         id: "customer-deal", label: "Customer and deal", permission: "commands.manage", mode: "atomic",
-        doctypes: [customerDocType.name, dealDocType.name], operations: ["create", "update", "delete"], maxOperations: 10
+        doctypes: [customerDocType.name, dealDocType.name, exactDocType.name], operations: ["create", "update", "delete"], maxOperations: 10
       }, {
         id: "secure-records", label: "Secure records", permission: "commands.manage", mode: "atomic",
         doctypes: [securedDocType.name], operations: ["create", "update", "delete"], maxOperations: 10
@@ -984,6 +997,28 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       expect(applied).toMatchObject({ replayed: false, documents: [{ id: "command-customer" }, { id: "command-deal" }] });
       await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", request)).resolves.toMatchObject({ replayed: true });
       expect((await stores.audit.list(commandTenant)).filter((event) => ["command-customer", "command-deal"].includes(event.documentId))).toHaveLength(2);
+
+      const exactRequest = { operations: [{
+        operation: "create" as const, doctype: exactDocType.name, id: "command-exact",
+        data: { amount: "9007199254740993.1000", tax: "0.2000" }
+      }], idempotencyKey: "command-exact-1" };
+      const exactResult = await runtime.executeDocumentCommand(commandTenant, "customer-deal", exactRequest);
+      expect(exactResult).toMatchObject({ replayed: false, documents: [{ data: {
+        amount: "9007199254740993.1000", tax: "0.2000", total: "9007199254740993.3000"
+      } }] });
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", exactRequest)).resolves.toMatchObject({
+        replayed: true, documents: [{ data: { total: "9007199254740993.3000" } }]
+      });
+      const exactRows = await sql<{ data: Record<string, unknown> }[]>`
+        select data from framekit_documents
+        where tenant_id = ${commandTenant.tenantId} and doctype = ${exactDocType.name} and id = 'command-exact'
+      `;
+      expect(exactRows).toEqual([{ data: {
+        amount: "9007199254740993.1000", tax: "0.2000", total: "9007199254740993.3000"
+      } }]);
+      expect((await stores.outbox.list(commandTenant)).find((event) => event.payload.id === "command-exact")?.payload).toMatchObject({
+        data: { amount: "9007199254740993.1000", tax: "0.2000", total: "9007199254740993.3000" }
+      });
 
       injectedStage = "outbox";
       await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [

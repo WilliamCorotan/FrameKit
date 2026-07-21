@@ -77,17 +77,35 @@ test("covers document list, create, edit, delete, pagination, search, and workfl
   await page.getByRole("button", { name: "New document" }).click();
   await page.getByLabel("Name *").fill("Acme Browser Co");
   await page.getByLabel("Status").selectOption("active");
+  await page.getByLabel("Revenue").fill("-0.0001");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByText("Invalid value for Revenue")).toBeVisible();
+  await page.getByLabel("Revenue").fill("1.00001");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByText("Invalid value for Revenue")).toBeVisible();
   await page.getByLabel("Revenue").fill("2500");
+  await expect(page.getByLabel("Revenue")).toHaveAttribute("type", "text");
+  await expect(page.getByLabel("Revenue")).toHaveAttribute("inputmode", "decimal");
+  await expect(page.getByLabel("Revenue")).toHaveAttribute("data-precision", "24");
+  await expect(page.getByLabel("Revenue")).toHaveAttribute("data-scale", "4");
   await page.getByLabel("Notes").fill("Created from browser smoke test");
   await page.getByRole("checkbox", { name: "Active" }).check();
+  await page.getByLabel("Approved").selectOption("1");
+  await page.getByLabel("Rating").selectOption({ label: "2" });
+  const createRequest = page.waitForRequest((request) => request.url().endsWith("/api/doctypes/customer") && request.method() === "POST");
   await page.getByRole("button", { name: "Save" }).click();
+  expect((await createRequest).postDataJSON()).toMatchObject({ approved: false, rating: 2 });
 
   await expect(page.getByText("Saved")).toBeVisible();
   await expect(page.getByRole("button", { name: /CUSTOMER-002/ })).toBeVisible();
   await expect(page.getByText("Acme Browser Co")).toBeVisible();
+  await expect(page.getByLabel("Display name")).toBeDisabled();
+  await expect(page.getByLabel("Display name")).toHaveValue("Acme Browser Co active");
 
   await page.getByLabel("Revenue").fill("3000");
+  const editRequest = page.waitForRequest((request) => request.url().endsWith("/api/doctypes/customer/CUSTOMER-002") && request.method() === "PATCH");
   await page.getByRole("button", { name: "Save" }).click();
+  expect((await editRequest).postDataJSON()).not.toHaveProperty("display_name");
   await expect(page.getByLabel("Revenue")).toHaveValue("3000");
 
   await page.getByPlaceholder("Filter records").fill("Acme");
@@ -243,9 +261,12 @@ async function mockDeskApi(page: Page) {
       data: {
         name: "Northwind Traders",
         status: "active",
-        revenue: 1200,
+        revenue: "1200.0000",
+        display_name: "Northwind active",
         notes: "Seed record",
-        is_active: true
+        is_active: true,
+        approved: true,
+        rating: 1
       },
       updatedAt: now
     }
@@ -301,7 +322,7 @@ async function mockDeskApi(page: Page) {
         state: "Lead",
         documentStatus: "draft" as const,
         ownerId: "admin",
-        data: body,
+        data: { ...body, display_name: `${String(body.name)} ${String(body.status ?? "lead")}` },
         updatedAt: now
       };
       customers.unshift(record);
@@ -451,13 +472,16 @@ const metadata = {
           fields: [
             { name: "name", label: "Name", type: "text", required: true, inList: true },
             { name: "status", label: "Status", type: "select", options: ["lead", "active", "closed"], inList: true },
-            { name: "revenue", label: "Revenue", type: "currency", inList: true },
+            { name: "revenue", label: "Revenue", type: "currency", precision: 24, scale: 4, validators: [{ kind: "range", min: "0.0000" }], inList: true },
+            { name: "display_name", label: "Display name", type: "text", computed: { operation: "concat", dependencies: ["name", "status"], separator: " " } },
             { name: "notes", label: "Notes", type: "long_text" },
-            { name: "is_active", label: "Active", type: "boolean" }
+            { name: "is_active", label: "Active", type: "boolean" },
+            { name: "approved", label: "Approved", type: "boolean", validators: [{ kind: "domain", values: [true, false] }] },
+            { name: "rating", label: "Rating", type: "number", validators: [{ kind: "domain", values: [1, 2] }] }
           ],
           views: [
             { id: "customer-list", doctype: "customer", type: "list", fields: ["name", "status", "revenue"] },
-            { id: "customer-form", doctype: "customer", type: "form", fields: ["name", "status", "revenue", "notes", "is_active"] }
+            { id: "customer-form", doctype: "customer", type: "form", fields: ["name", "status", "revenue", "display_name", "notes", "is_active", "approved", "rating"] }
           ],
           workflow: {
             field: "state",

@@ -618,12 +618,17 @@ export function generateSdkTypes(app: AppDefinition): string {
   for (const doctype of listDocTypes(app)) {
     const name = pascal(doctype.name);
     lines.push(`export type ${name}Input = {`);
-    for (const field of doctype.fields) {
+    for (const field of doctype.fields.filter((candidate) => !candidate.computed)) {
       lines.push(`  ${field.name}${field.required ? "" : "?"}: ${tsType(field)};`);
     }
     lines.push("};", "");
     lines.push(`export type ${name}Patch = Partial<${name}Input>;`);
-    lines.push(`export type ${name}Record = DocumentRecord<${name}Input>;`);
+    lines.push(`export type ${name}Data = {`);
+    for (const field of doctype.fields) {
+      lines.push(`  ${field.name}${field.required || field.computed ? "" : "?"}: ${tsType(field)};`);
+    }
+    lines.push("};", "");
+    lines.push(`export type ${name}Record = DocumentRecord<${name}Data>;`);
     if (doctype.workflow) {
       const actions = [...new Set(doctype.workflow.transitions.map((transition) => transition.action))];
       lines.push(`export type ${name}WorkflowAction = ${actions.map((action) => JSON.stringify(action)).join(" | ") || "never"};`);
@@ -766,10 +771,14 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 function tsType(field: FieldDefinition): string {
+  const domain = field.validators.find((validator) => validator.kind === "domain");
+  if (domain?.kind === "domain") return domain.values.map((value) => JSON.stringify(value)).join(" | ");
   switch (field.type) {
     case "number":
-    case "currency":
       return "number";
+    case "decimal":
+    case "currency":
+      return "string";
     case "boolean":
       return "boolean";
     case "json":

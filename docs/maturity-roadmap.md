@@ -18,7 +18,7 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 
 ## Overall Assessment
 
-- Component-average implementation: **84%**.
+- Component-average implementation: **85%**.
 - Functional breadth: approximately **89%**.
 - Production readiness: approximately **79%**.
 - Current stage: **beta**.
@@ -28,15 +28,15 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 
 | Component | Implementation | In place | Missing or incomplete |
 | --- | ---: | --- | --- |
-| Core metadata and domain model | 84% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, immutable ownership, composable row policies, typed command metadata, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics, localization, typed settings |
+| Core metadata and domain model | 88% | DocTypes, modules, exact decimals/currency, acyclic computed fields, declarative validators, immutable ownership, composable row policies, typed command metadata, field/link/index/naming/view/workflow invariants, permissions, hooks, navigation, and views | Child records, attachments, localization, typed settings |
 | Runtime and command lifecycle | 97% | CRUD, ordered validation/hooks, document lifecycle, ownership transfer, permission and row-policy gates, atomic bulk commands, explicit saga compensation, revisions, idempotency, audit/outbox/realtime, diagnostics, and ordered start/close/dispose | Durable long-running saga coordinator and deeper cancellation propagation |
-| Data, query, and persistence | 84% | In-memory and Postgres adapters, pushed-down filters/sorts/projections, opaque cursors, durable uniqueness, revisions, locking, and atomic document/outbox persistence | Load/performance evidence, sharding/partition guidance, broader physical schema modeling |
-| HTTP API and OpenAPI | 85% | Secure routing defaults, broad Nitro/OpenAPI surface including typed command execution, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
+| Data, query, and persistence | 86% | In-memory and Postgres adapters, exact-value JSONB persistence, pushed-down numeric filters/sorts, opaque cursors, durable uniqueness, revisions, locking, and atomic document/outbox persistence | Load/performance evidence, sharding/partition guidance, broader physical schema modeling |
+| HTTP API and OpenAPI | 87% | Secure routing defaults, broad Nitro/OpenAPI surface including typed command execution and exact/computed field schemas, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
 | Authentication and IAM | 78% | Password sessions, cookies, refresh/logout/revocation, lockout, API tokens, roles, durable audit and identity links, OIDC discovery/JWKS authorization-code/PKCE, single-use invitations and recovery, forged-header and cross-tenant protection | Native WebAuthn/TOTP enrollment and step-up assurance policy; provider-enforced MFA is the current production scope |
-| Schema evolution | 94% | Executable HTTP/CLI contract, schema fingerprints, full DocType diffs, checksums, destructive and irreversible guards, atomic apply/rollback, versioned deterministic conversion hooks, durable approval evidence, resumable chunk checkpoints, bounded tenant/app locking, drift/replay guards, and legacy uniqueness backfill | Physical-schema inspection beyond managed indexes, automated dual-read/write rollout coordination, and production-scale migration performance evidence |
+| Schema evolution | 94% | Executable HTTP/CLI contract, exact/computed compatibility detection, schema fingerprints, full DocType diffs, checksums, destructive and irreversible guards, atomic apply/rollback, trusted conversion artifact registry, durable approval evidence, resumable chunk checkpoints, bounded tenant/app locking, drift/replay guards, and legacy uniqueness backfill | Physical-schema inspection beyond managed indexes, automated dual-read/write rollout coordination, and production-scale migration performance evidence |
 | Jobs, events, and realtime | 85% | BullMQ queues/workers, atomic outbox leases, retry/backoff/dead-letter behavior, idempotency keys, scheduling, Postgres fanout/replay, SSE, lifecycle and cancellation | Operational load evidence, poison-message tooling, richer scheduler persistence |
-| Desk and admin UI | 82% | Metadata lists/forms, workflows, auth administration, customization, operations screens, real-stack Chromium/Firefox journeys, accessibility checks | Richer field errors, keyboard depth, visual regression policy |
-| SDK, CLI, and developer experience | 75% | Broad HTTP parity, generated model types, scaffolding, migration commands, packed standalone consumer proof | Typed/retriable errors, upgrade/config workflows, packaged Desk template |
+| Desk and admin UI | 85% | Metadata lists/forms with exact input and validator constraints, computed read-only controls, workflows, auth administration, customization, operations screens, real-stack browser journeys, accessibility checks | Richer field error summaries, keyboard depth, visual regression policy |
+| SDK, CLI, and developer experience | 80% | Broad HTTP parity, exact-string and computed-output generated types, scaffolding, migration commands, packed standalone consumer proof | Typed/retriable errors, upgrade/config workflows, packaged Desk template |
 | Operations, security, and release | 82% | Secure defaults, lifecycle, bounded readiness, OpenTelemetry-compatible adapters/redaction, tested compatibility, provenance publication, dependency audit, CodeQL, Dependabot, and SBOM artifacts | Alert/runbook examples, SLO guidance, sustained fault/load evidence |
 | Testing and CI | 88% | Unit, service, concurrency/fault, built smoke, standalone package, full-stack browser, package-local, compatibility matrix, and enforced coverage gates | Sustained load/soak testing, more failure injection, visual regression |
 | Documentation and adoption | 72% | README, architecture, deployment, security, identity, consistency, querying, migrations, observability, compatibility, contribution, disclosure, support, release, and roadmaps | Generated API reference site, versioned upgrade guides, external tutorial feedback |
@@ -88,7 +88,7 @@ Exit criteria:
 
 ## Highest-Risk Technical Findings
 
-1. The metadata model still lacks the selected child-record, attachment, computed-field, localization, and decimal semantics required for 1.0.
+1. The metadata model still lacks the selected child-record, attachment, localization, and typed-settings semantics required for 1.0.
 2. Compatibility gates prove supported combinations functionally, but sustained load, soak, and infrastructure fault testing remain limited.
 3. Nitro and H3 remain pre-release dependencies; upgrades require explicit compatibility evidence.
 4. OpenTelemetry adapters are exporter-neutral and tested for redaction, but production sampling, alerting, and SLOs remain operator responsibilities.
