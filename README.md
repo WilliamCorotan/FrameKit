@@ -84,6 +84,8 @@ Migration planning, executable apply/replay, drift rules, upgrade backfill, and 
 
 Auth lifecycle, provider login, audit, and admin APIs:
 
+Production identity-linking, OIDC Authorization Code + PKCE, invitation, recovery, and MFA policy are documented in [docs/identity.md](docs/identity.md).
+
 ```txt
 POST /api/auth/login
 GET  /api/auth/me

@@ -411,6 +411,46 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         security: []
       }
     },
+    [`${basePath}/auth/providers/{id}/authorize`]: {
+      get: { operationId: "beginOidcAuthorization", summary: "Redirect to an OIDC authorization endpoint using state, nonce, and PKCE", tags: ["Auth"],
+        parameters: [pathParam("id"), queryParam("returnTo", "string")], responses: { "302": { description: "OIDC authorization redirect" }, ...errorResponses() }, security: [] }
+    },
+    [`${basePath}/auth/providers/{id}/callback`]: {
+      get: { operationId: "completeOidcAuthorization", summary: "Validate the OIDC callback and establish a session", tags: ["Auth"],
+        parameters: [pathParam("id"), queryParam("code", "string"), queryParam("state", "string")], responses: { "303": { description: "Same-origin post-login redirect" }, ...errorResponses() }, security: [] }
+    },
+    [`${basePath}/auth/invitations`]: {
+      post: { operationId: "createInvitation", summary: "Create an expiring single-use tenant invitation", tags: ["Auth"],
+        requestBody: jsonBody({ type: "object", required: ["email", "name", "roles", "permissions"], properties: {
+          email: { type: "string", format: "email" }, name: { type: "string" }, roles: { type: "array", items: { type: "string" } },
+          permissions: { type: "array", items: { type: "string" } }, expiresAt: { type: "string", format: "date-time" }
+        } }, true), responses: createdResponse({ type: "object", additionalProperties: true }) }
+    },
+    [`${basePath}/auth/identity-links`]: {
+      post: { operationId: "linkProviderIdentity", summary: "Link a provider subject to one tenant user", tags: ["Auth"],
+        requestBody: jsonBody({ type: "object", required: ["providerId", "subject", "userId"], properties: {
+          providerId: { type: "string" }, subject: { type: "string" }, userId: { type: "string" }, email: { type: "string", format: "email" }
+        } }, true), responses: createdResponse({ type: "object", additionalProperties: true }) }
+    },
+    [`${basePath}/auth/invitations/accept`]: {
+      post: { operationId: "acceptInvitation", summary: "Consume an invitation and create the tenant user", tags: ["Auth"], security: [],
+        requestBody: jsonBody({ type: "object", required: ["token", "password"], properties: { token: { type: "string" }, password: { type: "string", format: "password" } } }, true),
+        responses: okResponse(ref("AuthSession")) }
+    },
+    [`${basePath}/auth/password/reset/request`]: {
+      post: { operationId: "requestPasswordReset", summary: "Request an expiring password reset without account enumeration", tags: ["Auth"], security: [],
+        requestBody: jsonBody({ type: "object", required: ["email"], properties: { email: { type: "string", format: "email" } } }, true),
+        responses: { "202": { description: "Accepted" }, ...errorResponses() } }
+    },
+    [`${basePath}/auth/password/reset/complete`]: {
+      post: { operationId: "completePasswordReset", summary: "Consume a single-use password reset token", tags: ["Auth"], security: [],
+        requestBody: jsonBody({ type: "object", required: ["token", "newPassword"], properties: { token: { type: "string" }, newPassword: { type: "string", format: "password" } } }, true),
+        responses: { "204": { description: "Password reset" }, ...errorResponses() } }
+    },
+    [`${basePath}/auth/users/{id}/recovery`]: {
+      post: { operationId: "createRecoveryToken", summary: "Create an expiring single-use recovery token", tags: ["Auth"], parameters: [pathParam("id")],
+        responses: createdResponse({ type: "object", additionalProperties: true }) }
+    },
     [`${basePath}/auth/me`]: {
       get: {
         operationId: "getCurrentUser",

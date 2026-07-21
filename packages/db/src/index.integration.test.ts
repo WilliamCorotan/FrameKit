@@ -4,6 +4,9 @@ import { defineApp, defineDocType, defineModule, type TenantContext } from "@fra
 import { createRuntime, InMemoryDocumentRepository, migrationChecksum, type ListOptions } from "@framekit/runtime";
 import {
   PostgresApiTokenStore,
+  PostgresAuthAuditStore,
+  PostgresAuthIdentityLinkStore,
+  PostgresAuthLifecycleTokenStore,
   PostgresAuditStore,
   PostgresCustomizationStore,
   PostgresDocumentRepository,
@@ -13,6 +16,7 @@ import {
   PostgresNamingSeriesStore,
   PostgresOutboxStore,
   PostgresRealtimePublisher,
+  PostgresOidcAuthorizationStateStore,
   PostgresRoleStore,
   PostgresSessionRevocationStore,
   PostgresUserStore
@@ -93,7 +97,11 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     userStore: new PostgresUserStore({ connectionString: connectionString! }),
     roleStore: new PostgresRoleStore({ connectionString: connectionString! }),
     apiTokenStore: new PostgresApiTokenStore({ connectionString: connectionString! }),
-    sessionRevocations: new PostgresSessionRevocationStore({ connectionString: connectionString! })
+    sessionRevocations: new PostgresSessionRevocationStore({ connectionString: connectionString! }),
+    identityLinks: new PostgresAuthIdentityLinkStore({ connectionString: connectionString! }),
+    lifecycleTokens: new PostgresAuthLifecycleTokenStore({ connectionString: connectionString! }),
+    oidcStates: new PostgresOidcAuthorizationStateStore({ connectionString: connectionString! }),
+    authAudit: new PostgresAuthAuditStore({ connectionString: connectionString! })
   };
 
   beforeAll(async () => {
@@ -206,6 +214,23 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(true);
     await stores.sessionRevocations.revoke("pg-integration-session", new Date(Date.now() - 60_000).toISOString());
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(false);
+  });
+
+  it("atomically persists tenant identity links and consumes lifecycle/OIDC state once", async () => {
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    await stores.identityLinks.upsert({ tenantId: tenant.tenantId, providerId: "oidc", subject: "subject", userId: "user-1", createdAt: now, updatedAt: now });
+    await expect(stores.identityLinks.upsert({ tenantId: tenant.tenantId, providerId: "oidc", subject: "subject", userId: "user-2", createdAt: now, updatedAt: now }))
+      .rejects.toMatchObject({ code: "PROVIDER_IDENTITY_COLLISION" });
+    await stores.lifecycleTokens.create({ id: "reset-1", tenantId: tenant.tenantId, kind: "password_reset", tokenHash: "reset-hash", userId: "user-1", createdAt: now, expiresAt });
+    await expect(stores.lifecycleTokens.consume(tenant.tenantId, "password_reset", "reset-hash", now)).resolves.toMatchObject({ id: "reset-1" });
+    await expect(stores.lifecycleTokens.consume(tenant.tenantId, "password_reset", "reset-hash", now)).resolves.toBeUndefined();
+    await stores.oidcStates.create({ id: "state-1", providerId: "oidc", tenantId: tenant.tenantId, stateHash: "state-hash", nonceHash: "nonce-hash",
+      encryptedCodeVerifier: "encrypted", returnTo: "/", redirectUri: "https://app.example/callback", createdAt: now, expiresAt });
+    await expect(stores.oidcStates.consume("oidc", "state-hash", now)).resolves.toMatchObject({ id: "state-1" });
+    await expect(stores.oidcStates.consume("oidc", "state-hash", now)).resolves.toBeUndefined();
+    await stores.authAudit.record({ id: "auth-audit-1", tenantId: tenant.tenantId, action: "password_reset.completed", success: true, createdAt: now });
+    await expect(stores.authAudit.list(tenant.tenantId)).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ id: "auth-audit-1", success: true })]));
   });
 
   it("serializes executable migrations, rolls back atomically, detects drift, and upgrades legacy uniqueness", async () => {
@@ -768,6 +793,10 @@ type StoreSet = {
   roleStore: PostgresRoleStore;
   apiTokenStore: PostgresApiTokenStore;
   sessionRevocations: PostgresSessionRevocationStore;
+  identityLinks: PostgresAuthIdentityLinkStore;
+  lifecycleTokens: PostgresAuthLifecycleTokenStore;
+  oidcStates: PostgresOidcAuthorizationStateStore;
+  authAudit: PostgresAuthAuditStore;
 };
 
 async function migrateAll(stores: StoreSet) {
@@ -782,6 +811,10 @@ async function migrateAll(stores: StoreSet) {
   await stores.roleStore.migrate();
   await stores.apiTokenStore.migrate();
   await stores.sessionRevocations.migrate();
+  await stores.identityLinks.migrate();
+  await stores.lifecycleTokens.migrate();
+  await stores.oidcStates.migrate();
+  await stores.authAudit.migrate();
 }
 
 async function closeStores(stores: StoreSet) {
@@ -809,6 +842,10 @@ async function cleanup(sql: postgres.Sql) {
   await sql`delete from framekit_roles where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_api_tokens where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_session_revocations where session_id = 'pg-integration-session'`;
+  await sql`delete from framekit_auth_identity_links where tenant_id = ${tenant.tenantId}`;
+  await sql`delete from framekit_auth_lifecycle_tokens where tenant_id = ${tenant.tenantId}`;
+  await sql`delete from framekit_oidc_authorization_states where tenant_id = ${tenant.tenantId}`;
+  await sql`delete from framekit_auth_audit_events where tenant_id = ${tenant.tenantId}`;
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {

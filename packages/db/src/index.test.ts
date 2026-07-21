@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { migrationChecksum, type MigrationPlan } from "@framekit/runtime";
 import {
   createApiTokenTableSql,
+  createAuthIdentityLifecycleTablesSql,
   createAuditTableSql,
   createCustomFieldTableSql,
   createDocumentTableSql,
@@ -28,6 +29,13 @@ describe("db migration sql", () => {
     expect(createApiTokenTableSql()).toContain("token_hash");
     expect(createSessionRevocationTableSql()).toContain("framekit_session_revocations");
     expect(createSessionRevocationTableSql()).toContain("session_id");
+    const authLifecycleSql = createAuthIdentityLifecycleTablesSql();
+    expect(authLifecycleSql).toContain("framekit_auth_identity_links");
+    expect(authLifecycleSql).toContain("unique (tenant_id, provider_id, subject)");
+    expect(authLifecycleSql).toContain("framekit_auth_lifecycle_tokens");
+    expect(authLifecycleSql).toContain("framekit_oidc_authorization_states");
+    expect(authLifecycleSql).toContain("encrypted_code_verifier");
+    expect(authLifecycleSql).toContain("framekit_auth_audit_events");
     expect(createAuditTableSql()).toContain("framekit_audit_events");
     expect(createOutboxTableSql()).toContain("framekit_outbox_events");
     expect(createCustomFieldTableSql()).toContain("framekit_custom_fields");
