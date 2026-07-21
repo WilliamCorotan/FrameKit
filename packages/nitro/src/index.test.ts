@@ -2,7 +2,7 @@ import { H3, toWebHandler } from "h3";
 import { describe, expect, it, vi } from "vitest";
 import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
-import { createRuntime, type RuntimeRealtimeEvent } from "@framekit/runtime";
+import { createRuntime, migrationChecksum, type RuntimeRealtimeEvent } from "@framekit/runtime";
 import { assertSecureProductionCredentials, createNitroHandler } from "./index.js";
 
 describe("createNitroHandler", () => {
@@ -769,6 +769,27 @@ describe("createNitroHandler", () => {
       }
     });
     expect(migration.changes).toMatchObject([{ field: "tier" }]);
+    const destructive = await json<Awaited<ReturnType<typeof runtime.planMigration>>>(fetch, "/api/migrations/plan", {
+      method: "POST",
+      headers,
+      body: {
+        app: defineApp({
+          name: "Smoke",
+          modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+            name: "customer",
+            label: "Customer",
+            fields: [{ name: "name", label: "Name", type: "text", required: true, unique: true }]
+          })] })]
+        })
+      }
+    });
+    await expect(json(fetch, "/api/migrations/apply", { method: "POST", headers, body: { plan: destructive } }))
+      .rejects.toMatchObject({ code: "DESTRUCTIVE_MIGRATION" });
+    const forgedChanges = destructive.changes.map((change) => change.kind === "remove_field" ? { ...change, destructive: false } : change);
+    const forged = { ...destructive, changes: forgedChanges };
+    const signedForgery = { ...forged, checksum: await migrationChecksum(forged as never) };
+    await expect(json(fetch, "/api/migrations/apply", { method: "POST", headers, body: { plan: signedForgery, allowDestructive: true } }))
+      .rejects.toMatchObject({ code: "INVALID_MIGRATION_PLAN" });
     const appliedMigration = await json<{ id: string; checksum: string }>(fetch, "/api/migrations/apply", {
       method: "POST",
       headers,

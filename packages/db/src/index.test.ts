@@ -44,6 +44,7 @@ describe("db migration sql", () => {
     expect(sql).toContain("jsonb_set");
     expect(sql).toContain("create index if not exists framekit_documents_customer_region_idx");
     expect(sql).toContain("create unique index if not exists framekit_documents_customer_region_uniq");
+    expect(sql).toContain("data ->> 'region' <> ''");
     expect(sql).toContain("tenant_id = 'tenant_1'");
   });
 

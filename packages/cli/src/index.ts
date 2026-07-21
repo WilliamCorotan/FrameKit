@@ -4,7 +4,17 @@ import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { AppDefinition } from "@framekit/core";
 import { PostgresMigrationStore, createPostgresMigrationSql } from "@framekit/db";
-import { createExecutableMigrationArtifact, createRuntime, type MigrationPlan, type MigrationRecord } from "@framekit/runtime";
+import {
+  assertDestructiveMigration,
+  assertMigrationIdentity,
+  assertSupportedMigration,
+  createExecutableMigrationArtifact,
+  createRollbackMigrationPlan,
+  createRuntime,
+  validateMigrationPlan,
+  type MigrationPlan,
+  type MigrationRecord
+} from "@framekit/runtime";
 import { generateSdkTypes } from "@framekit/sdk";
 
 export async function runCli(argv = process.argv.slice(2), io: { stdout?: Pick<NodeJS.WriteStream, "write">; log?: (message: string) => void } = {}): Promise<void> {
@@ -165,29 +175,40 @@ async function generateMigration(currentModulePath: string, args: string[], stdo
 
 async function applyMigration(migrationPath: string, args: string[], log: (message: string) => void): Promise<void> {
   const migration = await loadMigration(migrationPath);
+  const operator = migrationOperatorContext(args);
+  await validateMigrationPlan(migration);
+  assertMigrationIdentity(operator.tenant, operator.appName, migration);
+  assertDestructiveMigration(migration, { allowDestructive: args.includes("--allow-destructive") });
+  assertSupportedMigration(migration);
   const databaseUrl = optionValue(args, "--database-url") ?? process.env.DATABASE_URL;
   if (!databaseUrl) {
     throw new Error("Missing --database-url or DATABASE_URL for apply-migration");
   }
   const store = new PostgresMigrationStore({ connectionString: databaseUrl });
   await store.migrate();
-  await store.applyPlan(tenantFromMigration(migration), migration, { allowDestructive: args.includes("--allow-destructive") });
+  await store.applyPlan(operator.tenant, migration, { allowDestructive: args.includes("--allow-destructive") });
   log(`Applied migration ${migration.id}`);
 }
 
 async function rollbackMigration(migrationPath: string, args: string[], log: (message: string) => void): Promise<void> {
   const migration = await loadMigration(migrationPath);
-  const databaseUrl = optionValue(args, "--database-url") ?? process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    throw new Error("Missing --database-url or DATABASE_URL for rollback-migration");
-  }
+  const operator = migrationOperatorContext(args);
+  await validateMigrationPlan(migration);
+  assertMigrationIdentity(operator.tenant, operator.appName, migration);
   const record: MigrationRecord = {
     ...migration,
     appliedAt: "appliedAt" in migration && typeof migration.appliedAt === "string" ? migration.appliedAt : new Date().toISOString()
   };
+  const rollbackPlan = await createRollbackMigrationPlan(record, { id: optionValue(args, "--id"), createdAt: record.appliedAt });
+  assertDestructiveMigration(rollbackPlan, { allowDestructive: args.includes("--allow-destructive") });
+  assertSupportedMigration(rollbackPlan);
+  const databaseUrl = optionValue(args, "--database-url") ?? process.env.DATABASE_URL;
+  if (!databaseUrl) {
+    throw new Error("Missing --database-url or DATABASE_URL for rollback-migration");
+  }
   const store = new PostgresMigrationStore({ connectionString: databaseUrl });
   await store.migrate();
-  await store.rollback(tenantFromMigration(record), record, { allowDestructive: args.includes("--allow-destructive"), id: optionValue(args, "--id") });
+  await store.rollback(operator.tenant, record, { allowDestructive: args.includes("--allow-destructive"), id: optionValue(args, "--id") });
   log(`Rolled back migration ${record.id}`);
 }
 
@@ -237,12 +258,17 @@ function optionValue(args: string[], option: string): string | undefined {
   return value;
 }
 
-function tenantFromMigration(migration: MigrationPlan): { tenantId: string; userId: string; roles: string[]; permissions: string[] } {
-  return { tenantId: migration.tenantId, userId: "migration", roles: ["administrator"], permissions: ["*"] };
+function migrationOperatorContext(args: string[]): { tenant: { tenantId: string; userId: string; roles: string[]; permissions: string[] }; appName: string } {
+  const tenantId = optionValue(args, "--tenant-id") ?? process.env.FRAMEKIT_MIGRATION_TENANT_ID;
+  const appName = optionValue(args, "--app-name") ?? process.env.FRAMEKIT_MIGRATION_APP_NAME;
+  if (!tenantId || !appName) {
+    throw new Error("Migration execution requires --tenant-id and --app-name (or FRAMEKIT_MIGRATION_TENANT_ID and FRAMEKIT_MIGRATION_APP_NAME).");
+  }
+  return { tenant: { tenantId, userId: "migration", roles: ["administrator"], permissions: ["*"] }, appName };
 }
 
 function printHelp(log: (message: string) => void): void {
-  log(`framekit commands:\n  create-app <name>\n  new-module <name>\n  new-doctype <name>\n  generate-sdk <module-path> [--out file]\n  generate-migration <current-module-path> <next-module-path> [--format ts|json|sql] [--out file]\n  apply-migration <migration-module-path> [--database-url url] [--allow-destructive]\n  replay-migration <migration-module-path> [--database-url url] [--allow-destructive]\n  rollback-migration <migration-module-path> [--database-url url] [--allow-destructive] [--id id]`);
+  log(`framekit commands:\n  create-app <name>\n  new-module <name>\n  new-doctype <name>\n  generate-sdk <module-path> [--out file]\n  generate-migration <current-module-path> <next-module-path> [--format ts|json|sql] [--out file]\n  apply-migration <migration-module-path> --tenant-id id --app-name name [--database-url url] [--allow-destructive]\n  replay-migration <migration-module-path> --tenant-id id --app-name name [--database-url url] [--allow-destructive]\n  rollback-migration <migration-module-path> --tenant-id id --app-name name [--database-url url] [--allow-destructive] [--id id]`);
 }
 
 function slug(value: string): string {

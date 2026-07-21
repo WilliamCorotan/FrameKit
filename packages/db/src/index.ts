@@ -206,7 +206,7 @@ export const framekitMigrations = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
     appliedAt: timestamp("applied_at", { withTimezone: true }).notNull()
   },
-  (table) => [uniqueIndex("framekit_migrations_identity").on(table.tenantId, table.id)]
+  (table) => [uniqueIndex("framekit_migrations_identity").on(table.tenantId, table.appName, table.id)]
 );
 
 export type PostgresRepositoryOptions = {
@@ -935,8 +935,10 @@ export class PostgresMigrationStore implements MigrationStore {
     };
   }
 
-  async list(tenant: TenantContext): Promise<MigrationRecord[]> {
-    const rows = await this.db.select().from(framekitMigrations).where(eq(framekitMigrations.tenantId, tenant.tenantId));
+  async list(tenant: TenantContext, options: { appName?: string } = {}): Promise<MigrationRecord[]> {
+    const rows = await this.db.select().from(framekitMigrations).where(options.appName
+      ? and(eq(framekitMigrations.tenantId, tenant.tenantId), eq(framekitMigrations.appName, options.appName))
+      : eq(framekitMigrations.tenantId, tenant.tenantId));
     return rows.map(rowToMigration).sort((a, b) => b.appliedAt.localeCompare(a.appliedAt));
   }
 
@@ -966,12 +968,12 @@ export class PostgresMigrationStore implements MigrationStore {
     const appliedAt = options.appliedAt ?? new Date().toISOString();
     const record: MigrationRecord = { ...plan, appliedAt };
     return this.sql.begin(async (sql) => {
-      await sql`select pg_advisory_xact_lock(hashtextextended(${`framekit:migration:${tenant.tenantId}`}, 0))`;
+      await sql`select pg_advisory_xact_lock(hashtextextended(${`framekit:migration:${tenant.tenantId}:${plan.appName}`}, 0))`;
       const existing = await sql<MigrationSqlRow[]>`
         select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
                to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
                to_unique_constraints as "toUniqueConstraints", changes, checksum, created_at as "createdAt", applied_at as "appliedAt"
-        from framekit_migrations where tenant_id = ${tenant.tenantId} and id = ${plan.id} limit 1
+        from framekit_migrations where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and id = ${plan.id} limit 1
       `;
       if (existing[0]) {
         const applied = migrationSqlRowToRecord(existing[0]);
@@ -982,7 +984,7 @@ export class PostgresMigrationStore implements MigrationStore {
         select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
                to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
                to_unique_constraints as "toUniqueConstraints", changes, checksum, created_at as "createdAt", applied_at as "appliedAt"
-        from framekit_migrations where tenant_id = ${tenant.tenantId} order by applied_at desc, id desc limit 1
+        from framekit_migrations where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} order by applied_at desc, id desc limit 1
       `;
       assertMigrationDrift(latestRows[0] ? migrationSqlRowToRecord(latestRows[0]) : undefined, plan);
       await assertLegacyUniqueValues(sql, tenant.tenantId, plan.toUniqueConstraints);
@@ -1222,13 +1224,15 @@ create table if not exists framekit_migrations (
   checksum text not null default '',
   created_at timestamptz not null,
   applied_at timestamptz not null,
-  constraint framekit_migrations_identity unique (tenant_id, id)
+  constraint framekit_migrations_identity unique (tenant_id, app_name, id)
 );
 alter table framekit_migrations add column if not exists checksum text not null default '';
 alter table framekit_migrations add column if not exists from_schema_checksum text not null default '';
 alter table framekit_migrations add column if not exists to_schema_checksum text not null default '';
 alter table framekit_migrations add column if not exists from_unique_constraints jsonb not null default '[]'::jsonb;
 alter table framekit_migrations add column if not exists to_unique_constraints jsonb not null default '[]'::jsonb;
+alter table framekit_migrations drop constraint if exists framekit_migrations_identity;
+create unique index if not exists framekit_migrations_identity on framekit_migrations (tenant_id, app_name, id);
 create index if not exists framekit_migrations_lookup on framekit_migrations (tenant_id, applied_at desc);
 `;
 }
@@ -1280,7 +1284,7 @@ function statementsForChange(tenantId: string, change: MigrationChange | Migrati
     case "remove_index":
       return [`drop index if exists ${indexIdentifier(change, "idx")};`];
     case "add_unique_constraint":
-      return [`create unique index if not exists ${indexIdentifier(change, "uniq")} on framekit_documents (tenant_id, doctype, (data ->> ${sqlLiteral(change.field)})) where doctype = ${sqlLiteral(change.doctype)} and data ? ${sqlLiteral(change.field)};`];
+      return [`create unique index if not exists ${indexIdentifier(change, "uniq")} on framekit_documents (tenant_id, doctype, (data ->> ${sqlLiteral(change.field)})) where doctype = ${sqlLiteral(change.doctype)} and data ? ${sqlLiteral(change.field)} and data ->> ${sqlLiteral(change.field)} <> '';`];
     case "remove_unique_constraint":
       return [`drop index if exists ${indexIdentifier(change, "uniq")};`];
   }
@@ -1325,6 +1329,7 @@ async function assertLegacyUniqueValues(
         from framekit_documents
         where tenant_id = ${tenantId} and doctype = ${constraint.doctype}
           and data ? ${constraint.field} and data -> ${constraint.field} <> 'null'::jsonb
+          and data ->> ${constraint.field} <> ''
       ) legacy_values
       group by value
       having count(*) > 1
@@ -1355,9 +1360,13 @@ async function resynchronizeUniqueValues(
   }
   for (const constraint of toConstraints) {
     const indexName = indexIdentifier({ doctype: constraint.doctype, field: constraint.field }, "uniq");
+    const definitions = await sql<{ definition: string }[]>`select pg_get_indexdef(to_regclass(${indexName})) as definition`;
+    if (definitions[0]?.definition && !definitions[0].definition.includes("<> ''::text")) {
+      await sql.unsafe(`drop index ${indexName}`);
+    }
     await sql.unsafe(
       `create unique index if not exists ${indexName} on framekit_documents (tenant_id, doctype, (data ->> ${sqlLiteral(constraint.field)})) ` +
-      `where doctype = ${sqlLiteral(constraint.doctype)} and data ? ${sqlLiteral(constraint.field)};`
+      `where doctype = ${sqlLiteral(constraint.doctype)} and data ? ${sqlLiteral(constraint.field)} and data ->> ${sqlLiteral(constraint.field)} <> '';`
     );
     const indexRows = await sql<{ indexName: string | null }[]>`select to_regclass(${indexName})::text as "indexName"`;
     if (!indexRows[0]?.indexName) {

@@ -237,12 +237,17 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
 
       const planner = createRuntime(baseApp, { migrations: stores.migrations, idGenerator: () => "migration-concurrent" });
       const plan = await planner.planMigration(migrationTenant, targetApp);
+      const otherApp = defineApp({ name: "Other Migration App", modules: [] });
+      const otherPlan = await createRuntime(otherApp, { idGenerator: () => "migration-concurrent" }).planMigration(migrationTenant, otherApp);
       const concurrent = await Promise.all([
         stores.migrations.applyPlan(migrationTenant, plan),
-        stores.migrations.applyPlan(migrationTenant, plan)
+        stores.migrations.applyPlan(migrationTenant, plan),
+        stores.migrations.applyPlan(migrationTenant, otherPlan)
       ]);
       expect(concurrent[1]).toEqual(concurrent[0]);
-      await expect(stores.migrations.list(migrationTenant)).resolves.toHaveLength(1);
+      expect(concurrent[2]?.id).toBe(plan.id);
+      await expect(stores.migrations.list(migrationTenant, { appName: plan.appName })).resolves.toHaveLength(1);
+      await expect(stores.migrations.list(migrationTenant, { appName: otherPlan.appName })).resolves.toHaveLength(1);
       const migratedRows = await sql<{ data: Record<string, unknown> }[]>`select data from framekit_documents where tenant_id = ${migrationTenant.tenantId}`;
       expect(migratedRows[0]?.data).toEqual({ name: "Legacy", region: "APAC" });
 
@@ -278,8 +283,13 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
         insert into framekit_migrations (tenant_id, id, app_name, changes, checksum, created_at, applied_at)
         values (${upgradeTenant.tenantId}, 'legacy-history', ${upgradeApp.name}, '[]'::jsonb, 'legacy-checksum', now() - interval '1 day', now() - interval '1 day')
       `;
-      await sql.unsafe("create unique index if not exists framekit_documents_legacy_upgrade_code_uniq on framekit_documents (tenant_id, doctype, (data ->> 'code')) where doctype = 'legacy_upgrade' and data ? 'code'");
-      const beforeIndex = await sql<{ oid: number }[]>`select 'framekit_documents_legacy_upgrade_code_uniq'::regclass::oid as oid`;
+      await sql.unsafe("create unique index if not exists framekit_documents_legacy_upgrade_code_uniq on framekit_documents (tenant_id, doctype, (data ->> 'code')) where doctype = 'legacy_upgrade' and data ? 'code' and data ->> 'code' <> ''");
+      const compatibleIndex = await sql<{ oid: number }[]>`select 'framekit_documents_legacy_upgrade_code_uniq'::regclass::oid as oid`;
+      await sql`
+        insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+        values (${upgradeTenant.tenantId}, ${upgradeDocType.name}, 'legacy-empty-a', 1, null, ${sql.json({ code: "" })}, now(), now()),
+               (${upgradeTenant.tenantId}, ${upgradeDocType.name}, 'legacy-empty-b', 1, null, ${sql.json({ code: "" })}, now(), now())
+      `;
       const upgradePlanner = createRuntime(upgradeApp, { idGenerator: () => "migration-upgrade" });
       const upgradePlan = await upgradePlanner.planMigration(upgradeTenant, upgradeApp);
       await stores.migrations.applyPlan(upgradeTenant, upgradePlan);
@@ -290,8 +300,10 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       `;
       expect(reservations.map((row) => row.documentId)).toEqual(["legacy-a", "legacy-b"]);
       await expect(stores.migrations.list(upgradeTenant)).resolves.toHaveLength(2);
-      const afterIndex = await sql<{ oid: number }[]>`select 'framekit_documents_legacy_upgrade_code_uniq'::regclass::oid as oid`;
-      expect(afterIndex[0]?.oid).toBe(beforeIndex[0]?.oid);
+      const normalizedIndex = await sql<{ definition: string }[]>`select pg_get_indexdef('framekit_documents_legacy_upgrade_code_uniq'::regclass) as definition`;
+      expect(normalizedIndex[0]?.definition).toContain("<> ''::text");
+      const preservedIndex = await sql<{ oid: number }[]>`select 'framekit_documents_legacy_upgrade_code_uniq'::regclass::oid as oid`;
+      expect(preservedIndex[0]?.oid).toBe(compatibleIndex[0]?.oid);
 
       const conflictDocType = defineDocType({ name: "legacy_conflict", label: "Legacy Conflict", fields: [{ name: "code", label: "Code", type: "text", unique: true }] });
       const conflictApp = defineApp({ name: "Conflict Integration", modules: [defineModule({ id: "conflict", name: "Conflict", doctypes: [conflictDocType] })] });

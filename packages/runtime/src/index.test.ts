@@ -582,6 +582,14 @@ describe("runtime document service", () => {
       fields: [{ name: "customer", label: "Customer", type: "link", linkTo: "missing" }]
     })] })] });
     await expect(createRuntime(current).planMigration(tenant, invalidLinks)).rejects.toMatchObject({ code: "INVALID_MIGRATION_METADATA" });
+
+    const invalidViews = defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+      name: "customer",
+      label: "Customer",
+      fields: [{ name: "name", label: "Name", type: "text" }],
+      views: [{ id: "customer.list", doctype: "customer", type: "list", fields: ["missing"] }]
+    })] })] });
+    await expect(createRuntime(current).planMigration(tenant, invalidViews)).rejects.toMatchObject({ code: "INVALID_MIGRATION_METADATA" });
   });
 
   it("generates predictable naming series", async () => {
