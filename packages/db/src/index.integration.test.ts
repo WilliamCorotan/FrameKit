@@ -62,6 +62,7 @@ const queryDocType = defineDocType({
     { name: "name", label: "Name", type: "text" },
     { name: "status", label: "Status", type: "select", options: ["active", "paused"] },
     { name: "score", label: "Score", type: "number" },
+    { name: "enabled", label: "Enabled", type: "boolean" },
     { name: "notes", label: "Notes", type: "long_text" },
     { name: "metadata", label: "Metadata", type: "json" }
   ]
@@ -297,6 +298,39 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     expect(unicodeFirst.items.map((record) => record.id)).toEqual(["query-unicode-bmp"]);
     const unicodeNextOptions = { ...unicodeOptions, cursor: unicodeFirst.nextCursor };
     expect(await stores.repository.listPage(tenant, queryDocType, unicodeNextOptions)).toEqual(await memory.listPage(tenant, queryDocType, unicodeNextOptions));
+
+    const booleanFixtures = [
+      { id: "query-boolean-missing", data: { status: "boolean" } },
+      { id: "query-boolean-null", data: { status: "boolean", enabled: null } },
+      { id: "query-boolean-false-a", data: { status: "boolean", enabled: false } },
+      { id: "query-boolean-false-b", data: { status: "boolean", enabled: false } },
+      { id: "query-boolean-true", data: { status: "boolean", enabled: true } }
+    ];
+    for (const fixture of booleanFixtures) {
+      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
+      await memory.create(tenant, queryDocType, record);
+      await sql`
+        insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+        values (${record.tenantId}, ${record.doctype}, ${record.id}, 1, null, ${sql.json(record.data)}, ${record.createdAt}, ${record.updatedAt})
+      `;
+    }
+    for (const direction of ["asc", "desc"] as const) {
+      let postgresCursor: string | undefined;
+      let memoryCursor: string | undefined;
+      const seen: string[] = [];
+      do {
+        const options = { filters: { status: "boolean" }, sort: { field: "enabled", direction }, cursor: postgresCursor, limit: 2 };
+        const postgresPage = await stores.repository.listPage(tenant, queryDocType, options);
+        const memoryPage = await memory.listPage(tenant, queryDocType, { ...options, cursor: memoryCursor });
+        expect(postgresPage).toEqual(memoryPage);
+        seen.push(...postgresPage.items.map((record) => record.id));
+        postgresCursor = postgresPage.nextCursor;
+        memoryCursor = memoryPage.nextCursor;
+      } while (postgresCursor);
+      expect(seen).toEqual(direction === "asc"
+        ? ["query-boolean-missing", "query-boolean-null", "query-boolean-false-a", "query-boolean-false-b", "query-boolean-true"]
+        : ["query-boolean-true", "query-boolean-false-a", "query-boolean-false-b", "query-boolean-missing", "query-boolean-null"]);
+    }
 
     await expect(stores.repository.listPage(tenant, queryDocType, { filters: { name: { contains: 42 } } as never })).rejects.toMatchObject({ code: "INVALID_QUERY", statusCode: 422 });
     const forgedNumericCursor = btoa(JSON.stringify({ v: 1, field: "score", direction: "asc", value: "10", id: "query-02" }))

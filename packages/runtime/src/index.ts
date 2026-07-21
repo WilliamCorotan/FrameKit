@@ -1654,7 +1654,7 @@ export function encodeDocumentCursor(record: DocumentRecord, sort: ListOptions["
   const normalized = normalizeSort(sort);
   const fieldType = doctype?.fields.find((field) => field.name === normalized.field)?.type;
   const rawValue = sortableValue(record, normalized.field);
-  const value = fieldType === "number" || fieldType === "currency" ? Number(rawValue) : rawValue;
+  const value = fieldType === "number" || fieldType === "currency" ? Number(rawValue) : String(rawValue);
   if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
     throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `Cannot create a cursor for ${normalized.field}`, 422);
   }
@@ -1686,9 +1686,7 @@ export function decodeDocumentCursor(cursor: string, sort: ListOptions["sort"], 
   }
   const expectedValueType = field?.type === "number" || field?.type === "currency"
     ? "number"
-    : field?.type === "boolean"
-      ? "boolean"
-      : "string";
+    : "string";
   if (typeof candidate.value !== expectedValueType || (expectedValueType === "number" && !Number.isFinite(candidate.value))) {
     throw new FramekitError("INVALID_CURSOR", "Cursor value does not match the requested sort field", 422);
   }
