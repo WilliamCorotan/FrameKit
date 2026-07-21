@@ -1,7 +1,7 @@
 import postgres from "postgres";
 import { describe, expect, it, afterAll, beforeAll } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
-import { createRuntime, InMemoryDocumentRepository, type ListOptions } from "@framekit/runtime";
+import { createRuntime, InMemoryDocumentRepository, migrationChecksum, type ListOptions } from "@framekit/runtime";
 import {
   PostgresApiTokenStore,
   PostgresAuditStore,
@@ -205,6 +205,127 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(true);
     await stores.sessionRevocations.revoke("pg-integration-session", new Date(Date.now() - 60_000).toISOString());
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(false);
+  });
+
+  it("serializes executable migrations, rolls back atomically, detects drift, and upgrades legacy uniqueness", async () => {
+    const migrationTenant = { ...tenant, tenantId: "pg_migration_state_tenant" };
+    const upgradeTenant = { ...tenant, tenantId: "pg_migration_upgrade_tenant" };
+    const conflictTenant = { ...tenant, tenantId: "pg_migration_conflict_tenant" };
+    const tenantIds = [migrationTenant.tenantId, upgradeTenant.tenantId, conflictTenant.tenantId];
+    const baseDocType = defineDocType({ name: "migration_record", label: "Migration Record", fields: [{ name: "name", label: "Name", type: "text" }] });
+    const targetDocType = defineDocType({
+      ...baseDocType,
+      fields: [...baseDocType.fields, { name: "region", label: "Region", type: "text", default: "APAC" }],
+      indexes: [["region"]]
+    });
+    const baseApp = defineApp({ name: "Migration Integration", modules: [defineModule({ id: "migration", name: "Migration", doctypes: [baseDocType] })] });
+    const targetApp = defineApp({ name: "Migration Integration", modules: [defineModule({ id: "migration", name: "Migration", doctypes: [targetDocType] })] });
+    const faultStore = new PostgresMigrationStore({
+      connectionString: connectionString!,
+      faultInjector: (stage, plan, statementIndex) => {
+        if (plan.id === "migration-partial" && stage === "statement" && statementIndex === 0) throw new Error("injected migration failure");
+      }
+    });
+    try {
+      await sql`delete from framekit_documents where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_document_unique_values where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_migrations where tenant_id = any(${tenantIds})`;
+      await sql`
+        insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+        values (${migrationTenant.tenantId}, ${baseDocType.name}, 'migration-row', 1, null, ${sql.json({ name: "Legacy" })}, now(), now())
+      `;
+
+      const planner = createRuntime(baseApp, { migrations: stores.migrations, idGenerator: () => "migration-concurrent" });
+      const plan = await planner.planMigration(migrationTenant, targetApp);
+      const otherApp = defineApp({ name: "Other Migration App", modules: [] });
+      const otherPlan = await createRuntime(otherApp, { idGenerator: () => "migration-concurrent" }).planMigration(migrationTenant, otherApp);
+      const concurrent = await Promise.all([
+        stores.migrations.applyPlan(migrationTenant, plan),
+        stores.migrations.applyPlan(migrationTenant, plan),
+        stores.migrations.applyPlan(migrationTenant, otherPlan)
+      ]);
+      expect(concurrent[1]).toEqual(concurrent[0]);
+      expect(concurrent[2]?.id).toBe(plan.id);
+      await expect(stores.migrations.list(migrationTenant, { appName: plan.appName })).resolves.toHaveLength(1);
+      await expect(stores.migrations.list(migrationTenant, { appName: otherPlan.appName })).resolves.toHaveLength(1);
+      const migratedRows = await sql<{ data: Record<string, unknown> }[]>`select data from framekit_documents where tenant_id = ${migrationTenant.tenantId}`;
+      expect(migratedRows[0]?.data).toEqual({ name: "Legacy", region: "APAC" });
+
+      const differentTarget = { ...plan, toSchemaChecksum: "different-target" };
+      const conflictingId = { ...differentTarget, checksum: await migrationChecksum(differentTarget) };
+      await expect(stores.migrations.applyPlan(migrationTenant, conflictingId)).rejects.toMatchObject({ code: "MIGRATION_ID_CONFLICT" });
+      await expect(stores.migrations.applyPlan({ ...migrationTenant, tenantId: "wrong" }, plan)).rejects.toMatchObject({ code: "MIGRATION_TENANT_MISMATCH" });
+      await expect(stores.migrations.applyPlan(migrationTenant, { ...plan, changes: [] })).rejects.toMatchObject({ code: "MIGRATION_CHECKSUM_MISMATCH" });
+
+      const targetPlanner = createRuntime(targetApp, { idGenerator: () => "migration-drift" });
+      const staleAfterRollback = await targetPlanner.planMigration(migrationTenant, targetApp);
+      const rolledBack = await stores.migrations.rollback(migrationTenant, concurrent[0]!, { allowDestructive: true, id: "migration-concurrent-down" });
+      expect(rolledBack.id).toBe("migration-concurrent-down");
+      const rolledBackRows = await sql<{ data: Record<string, unknown> }[]>`select data from framekit_documents where tenant_id = ${migrationTenant.tenantId}`;
+      expect(rolledBackRows[0]?.data).toEqual({ name: "Legacy" });
+      await expect(stores.migrations.applyPlan(migrationTenant, staleAfterRollback)).rejects.toMatchObject({ code: "MIGRATION_SCHEMA_DRIFT" });
+
+      const partialPlanner = createRuntime(baseApp, { idGenerator: () => "migration-partial" });
+      const partialPlan = await partialPlanner.planMigration(migrationTenant, targetApp);
+      await expect(faultStore.applyPlan(migrationTenant, partialPlan)).rejects.toThrow("injected migration failure");
+      const afterPartial = await sql<{ data: Record<string, unknown> }[]>`select data from framekit_documents where tenant_id = ${migrationTenant.tenantId}`;
+      expect(afterPartial[0]?.data).toEqual({ name: "Legacy" });
+      expect((await stores.migrations.list(migrationTenant)).map((record) => record.id)).not.toContain("migration-partial");
+
+      const upgradeDocType = defineDocType({ name: "legacy_upgrade", label: "Legacy Upgrade", fields: [{ name: "code", label: "Code", type: "text", unique: true }] });
+      const upgradeApp = defineApp({ name: "Upgrade Integration", modules: [defineModule({ id: "upgrade", name: "Upgrade", doctypes: [upgradeDocType] })] });
+      await sql`
+        insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+        values (${upgradeTenant.tenantId}, ${upgradeDocType.name}, 'legacy-a', 1, null, ${sql.json({ code: "A" })}, now(), now()),
+               (${upgradeTenant.tenantId}, ${upgradeDocType.name}, 'legacy-b', 1, null, ${sql.json({ code: "B" })}, now(), now())
+      `;
+      await sql`
+        insert into framekit_migrations (tenant_id, id, app_name, changes, checksum, created_at, applied_at)
+        values (${upgradeTenant.tenantId}, 'legacy-history', ${upgradeApp.name}, '[]'::jsonb, 'legacy-checksum', now() - interval '1 day', now() - interval '1 day')
+      `;
+      await sql.unsafe("create unique index if not exists framekit_documents_legacy_upgrade_code_uniq on framekit_documents (tenant_id, doctype, (data ->> 'code')) where doctype = 'legacy_upgrade' and data ? 'code' and data ->> 'code' <> ''");
+      const compatibleIndex = await sql<{ oid: number }[]>`select 'framekit_documents_legacy_upgrade_code_uniq'::regclass::oid as oid`;
+      await sql`
+        insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+        values (${upgradeTenant.tenantId}, ${upgradeDocType.name}, 'legacy-empty-a', 1, null, ${sql.json({ code: "" })}, now(), now()),
+               (${upgradeTenant.tenantId}, ${upgradeDocType.name}, 'legacy-empty-b', 1, null, ${sql.json({ code: "" })}, now(), now())
+      `;
+      const upgradePlanner = createRuntime(upgradeApp, { idGenerator: () => "migration-upgrade" });
+      const upgradePlan = await upgradePlanner.planMigration(upgradeTenant, upgradeApp);
+      await stores.migrations.applyPlan(upgradeTenant, upgradePlan);
+      await stores.migrations.applyPlan(upgradeTenant, upgradePlan);
+      const reservations = await sql<{ documentId: string }[]>`
+        select document_id as "documentId" from framekit_document_unique_values
+        where tenant_id = ${upgradeTenant.tenantId} and doctype = ${upgradeDocType.name} order by document_id
+      `;
+      expect(reservations.map((row) => row.documentId)).toEqual(["legacy-a", "legacy-b"]);
+      await expect(stores.migrations.list(upgradeTenant)).resolves.toHaveLength(2);
+      const normalizedIndex = await sql<{ definition: string }[]>`select pg_get_indexdef('framekit_documents_legacy_upgrade_code_uniq'::regclass) as definition`;
+      expect(normalizedIndex[0]?.definition).toContain("<> ''::text");
+      const preservedIndex = await sql<{ oid: number }[]>`select 'framekit_documents_legacy_upgrade_code_uniq'::regclass::oid as oid`;
+      expect(preservedIndex[0]?.oid).toBe(compatibleIndex[0]?.oid);
+
+      const conflictDocType = defineDocType({ name: "legacy_conflict", label: "Legacy Conflict", fields: [{ name: "code", label: "Code", type: "text", unique: true }] });
+      const conflictApp = defineApp({ name: "Conflict Integration", modules: [defineModule({ id: "conflict", name: "Conflict", doctypes: [conflictDocType] })] });
+      await sql`
+        insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+        values (${conflictTenant.tenantId}, ${conflictDocType.name}, 'duplicate-a', 1, null, ${sql.json({ code: "DUP" })}, now(), now()),
+               (${conflictTenant.tenantId}, ${conflictDocType.name}, 'duplicate-b', 1, null, ${sql.json({ code: "DUP" })}, now(), now())
+      `;
+      const conflictPlanner = createRuntime(conflictApp, { idGenerator: () => "migration-conflict" });
+      const conflictPlan = await conflictPlanner.planMigration(conflictTenant, conflictApp);
+      await expect(stores.migrations.applyPlan(conflictTenant, conflictPlan)).rejects.toMatchObject({ code: "LEGACY_UNIQUE_CONFLICT" });
+      await expect(stores.migrations.list(conflictTenant)).resolves.toHaveLength(0);
+      const conflictReservations = await sql<{ count: number }[]>`select count(*)::int as count from framekit_document_unique_values where tenant_id = ${conflictTenant.tenantId}`;
+      expect(conflictReservations[0]?.count).toBe(0);
+    } finally {
+      await sql`delete from framekit_documents where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_document_unique_values where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_migrations where tenant_id = any(${tenantIds})`;
+      await sql.unsafe("drop index if exists framekit_documents_legacy_upgrade_code_uniq");
+      await sql.unsafe("drop index if exists framekit_documents_legacy_conflict_code_uniq");
+      await (faultStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
+    }
   });
 
   it("pushes list operations into parameterized SQL with in-memory parity", async () => {

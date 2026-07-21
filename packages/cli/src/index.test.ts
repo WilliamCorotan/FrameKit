@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { defineApp, defineDocType, defineModule } from "@framekit/core";
+import { createExecutableMigrationArtifact, createRuntime, migrationChecksum } from "@framekit/runtime";
 import { runCli } from "./index.js";
 
 describe("framekit CLI", () => {
@@ -71,5 +76,44 @@ describe("framekit CLI", () => {
       up: [],
       down: []
     });
+  });
+
+  it("requires independent operator identity and rejects forged destructive classifications before connecting", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "framekit-cli-migration-"));
+    const tenant = { tenantId: "tenant_expected", userId: "migration", roles: ["administrator"], permissions: ["*"] };
+    const current = defineApp({ name: "CLI Identity", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+      name: "customer",
+      label: "Customer",
+      fields: [{ name: "name", label: "Name", type: "text" }]
+    })] })] });
+    const next = defineApp({ name: "CLI Identity", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+      name: "customer",
+      label: "Customer",
+      fields: []
+    })] })] });
+    try {
+      const plan = await createRuntime(current, { idGenerator: () => "cli-destructive" }).planMigration(tenant, next);
+      const planPath = join(directory, "migration.json");
+      await writeFile(planPath, JSON.stringify(createExecutableMigrationArtifact(plan)));
+
+      await expect(runCli(["apply-migration", planPath, "--tenant-id", tenant.tenantId, "--app-name", current.name]))
+        .rejects.toMatchObject({ code: "DESTRUCTIVE_MIGRATION" });
+      await expect(runCli(["apply-migration", planPath, "--tenant-id", "wrong", "--app-name", current.name, "--allow-destructive"]))
+        .rejects.toMatchObject({ code: "MIGRATION_TENANT_MISMATCH" });
+      await expect(runCli(["apply-migration", planPath, "--tenant-id", tenant.tenantId, "--app-name", "Wrong App", "--allow-destructive"]))
+        .rejects.toMatchObject({ code: "MIGRATION_APP_MISMATCH" });
+      await expect(runCli(["rollback-migration", planPath, "--tenant-id", "wrong", "--app-name", current.name, "--allow-destructive"]))
+        .rejects.toMatchObject({ code: "MIGRATION_TENANT_MISMATCH" });
+
+      const changes = plan.changes.map((change) => change.kind === "remove_field" ? { ...change, destructive: false } : change);
+      const forged = { ...plan, changes };
+      const signedForgery = { ...forged, checksum: await migrationChecksum(forged) };
+      const forgedPath = join(directory, "forged.json");
+      await writeFile(forgedPath, JSON.stringify(createExecutableMigrationArtifact(signedForgery as never)));
+      await expect(runCli(["apply-migration", forgedPath, "--tenant-id", tenant.tenantId, "--app-name", current.name, "--allow-destructive"]))
+        .rejects.toMatchObject({ code: "INVALID_MIGRATION_PLAN" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

@@ -80,6 +80,8 @@ GET  /api/openapi.json
 
 `/health/dependencies` runs adapter-provided dependency checks, for example Postgres, Redis, queues, or downstream services.
 
+Migration planning, executable apply/replay, drift rules, upgrade backfill, and rollback limits are documented in [Executable migrations](docs/migrations.md).
+
 Auth lifecycle, provider login, audit, and admin APIs:
 
 ```txt

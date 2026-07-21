@@ -144,7 +144,7 @@ export type NamingSeriesStore = {
 };
 
 export type MigrationChange = {
-  kind: "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint";
+  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint";
   doctype: string;
   field: string;
   destructive: boolean;
@@ -159,6 +159,10 @@ export type MigrationPlan = {
   id: string;
   tenantId: string;
   appName: string;
+  fromSchemaChecksum: string;
+  toSchemaChecksum: string;
+  fromUniqueConstraints: Array<{ doctype: string; field: string }>;
+  toUniqueConstraints: Array<{ doctype: string; field: string }>;
   createdAt: string;
   changes: MigrationChange[];
   checksum: string;
@@ -174,8 +178,10 @@ export type ExecutableMigrationArtifact = MigrationPlan & {
 };
 
 export type MigrationStore = {
-  list(tenant: TenantContext): Promise<MigrationRecord[]>;
+  list(tenant: TenantContext, options?: { appName?: string }): Promise<MigrationRecord[]>;
   record(tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord>;
+  applyPlan?(tenant: TenantContext, plan: MigrationPlan, options?: { allowDestructive?: boolean; appliedAt?: string }): Promise<MigrationRecord>;
+  rollback?(tenant: TenantContext, migration: MigrationRecord, options?: { allowDestructive?: boolean; id?: string; appliedAt?: string }): Promise<MigrationRecord>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
@@ -290,7 +296,7 @@ export class FramekitRuntime {
   }
 
   async migrationHistory(tenant: TenantContext): Promise<MigrationRecord[]> {
-    return this.migrations.list(tenant);
+    return this.migrations.list(tenant, { appName: this.app.name });
   }
 
   async realtimeEvents(tenant: TenantContext, options: { limit?: number } = {}): Promise<RuntimeRealtimeEvent[]> {
@@ -309,10 +315,15 @@ export class FramekitRuntime {
 
   async planMigration(tenant: TenantContext, nextApp: AppDefinition): Promise<MigrationPlan> {
     const parsed = defineApp(nextApp);
+    assertMigrationMetadata(this.app);
+    assertMigrationMetadata(parsed);
     const changes: MigrationChange[] = [];
-    for (const nextDocType of parsed.modules.flatMap((module) => module.doctypes)) {
-      const currentDocType = this.app.modules.flatMap((module) => module.doctypes).find((doctype) => doctype.name === nextDocType.name);
+    const currentDocTypes = this.app.modules.flatMap((module) => module.doctypes);
+    const nextDocTypes = parsed.modules.flatMap((module) => module.doctypes);
+    for (const nextDocType of nextDocTypes) {
+      const currentDocType = currentDocTypes.find((doctype) => doctype.name === nextDocType.name);
       if (!currentDocType) {
+        changes.push(migrationChange({ kind: "add_doctype", doctype: nextDocType.name, field: "*", destructive: false, to: nextDocType }));
         for (const field of nextDocType.fields) {
           changes.push(migrationChange({ kind: "add_field", doctype: nextDocType.name, field: field.name, destructive: false, to: field }));
           if (field.unique) {
@@ -363,10 +374,24 @@ export class FramekitRuntime {
         }
       }
     }
+    for (const currentDocType of currentDocTypes) {
+      if (nextDocTypes.some((doctype) => doctype.name === currentDocType.name)) continue;
+      for (const index of currentDocType.indexes) {
+        changes.push(migrationChange({ kind: "remove_index", doctype: currentDocType.name, field: indexKey(index), destructive: false, from: index }));
+      }
+      for (const field of currentDocType.fields.filter((candidate) => candidate.unique)) {
+        changes.push(migrationChange({ kind: "remove_unique_constraint", doctype: currentDocType.name, field: field.name, destructive: false, from: field.name }));
+      }
+      changes.push(migrationChange({ kind: "remove_doctype", doctype: currentDocType.name, field: "*", destructive: true, from: currentDocType }));
+    }
     const plan = {
       id: this.idGenerator(),
       tenantId: tenant.tenantId,
       appName: parsed.name,
+      fromSchemaChecksum: await appSchemaChecksum(this.app),
+      toSchemaChecksum: await appSchemaChecksum(parsed),
+      fromUniqueConstraints: appUniqueConstraints(this.app),
+      toUniqueConstraints: appUniqueConstraints(parsed),
       createdAt: this.now().toISOString(),
       changes
     };
@@ -375,19 +400,22 @@ export class FramekitRuntime {
 
   async applyMigration(tenant: TenantContext, plan: MigrationPlan, options: { allowDestructive?: boolean } = {}): Promise<MigrationRecord> {
     await validateMigrationPlan(plan);
+    assertMigrationIdentity(tenant, this.app.name, plan);
     const destructive = plan.changes.filter((change) => change.destructive);
     if (destructive.length > 0 && !options.allowDestructive) {
       throw new FramekitError("DESTRUCTIVE_MIGRATION", "Migration contains destructive changes.", 409, destructive);
     }
-    const record: MigrationRecord = {
-      ...plan,
-      tenantId: tenant.tenantId,
-      appliedAt: this.now().toISOString()
-    };
-    return this.migrations.record(tenant, record);
+    if (!this.migrations.applyPlan) {
+      throw new FramekitError("MIGRATION_EXECUTOR_UNAVAILABLE", "The configured migration store cannot execute migration plans.", 501);
+    }
+    return this.migrations.applyPlan(tenant, plan, { ...options, appliedAt: this.now().toISOString() });
   }
 
   async rollbackMigration(tenant: TenantContext, migration: MigrationRecord, options: { allowDestructive?: boolean; id?: string } = {}): Promise<MigrationRecord> {
+    assertMigrationIdentity(tenant, this.app.name, migration);
+    if (this.migrations.rollback) {
+      return this.migrations.rollback(tenant, migration, { ...options, appliedAt: this.now().toISOString() });
+    }
     const plan = await createRollbackMigrationPlan(migration, {
       id: options.id ?? `${migration.id}-rollback`,
       createdAt: this.now().toISOString()
@@ -1172,6 +1200,7 @@ export class InMemoryNamingSeriesStore implements NamingSeriesStore {
 
 export class InMemoryMigrationStore implements MigrationStore {
   private readonly records: MigrationRecord[] = [];
+  private applyTail: Promise<void> = Promise.resolve();
 
   describe(): RepositoryDiagnostics {
     return {
@@ -1181,14 +1210,46 @@ export class InMemoryMigrationStore implements MigrationStore {
     };
   }
 
-  async list(tenant: TenantContext): Promise<MigrationRecord[]> {
-    return this.records.filter((record) => record.tenantId === tenant.tenantId).map(cloneMigrationRecord);
+  async list(tenant: TenantContext, options: { appName?: string } = {}): Promise<MigrationRecord[]> {
+    return this.records
+      .filter((record) => record.tenantId === tenant.tenantId && (!options.appName || record.appName === options.appName))
+      .map(cloneMigrationRecord);
   }
 
   async record(tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord> {
+    assertMigrationIdentity(tenant, migration.appName, migration);
     const saved = { ...migration, tenantId: tenant.tenantId, changes: migration.changes.map((change) => ({ ...change })) };
     this.records.push(saved);
     return cloneMigrationRecord(saved);
+  }
+
+  async applyPlan(tenant: TenantContext, plan: MigrationPlan, options: { allowDestructive?: boolean; appliedAt?: string } = {}): Promise<MigrationRecord> {
+    const previous = this.applyTail;
+    let release!: () => void;
+    this.applyTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      await validateMigrationPlan(plan);
+      assertMigrationIdentity(tenant, plan.appName, plan);
+      assertDestructiveMigration(plan, options);
+      assertSupportedMigration(plan);
+      const existing = this.records.find((record) => record.tenantId === tenant.tenantId && record.appName === plan.appName && record.id === plan.id);
+      if (existing) {
+        if (existing.checksum === plan.checksum) return cloneMigrationRecord(existing);
+        throw new FramekitError("MIGRATION_ID_CONFLICT", `Migration ID "${plan.id}" was already applied with a different checksum.`, 409);
+      }
+      const latest = this.records.filter((record) => record.tenantId === tenant.tenantId && record.appName === plan.appName).at(-1);
+      assertMigrationDrift(latest, plan);
+      const record: MigrationRecord = { ...plan, appliedAt: options.appliedAt ?? new Date().toISOString() };
+      return this.record(tenant, record);
+    } finally {
+      release();
+    }
+  }
+
+  async rollback(tenant: TenantContext, migration: MigrationRecord, options: { allowDestructive?: boolean; id?: string; appliedAt?: string } = {}): Promise<MigrationRecord> {
+    const plan = await createRollbackMigrationPlan(migration, { id: options.id, createdAt: options.appliedAt });
+    return this.applyPlan(tenant, plan, options);
   }
 }
 
@@ -1255,15 +1316,20 @@ function assertMemoryIdempotencyFingerprint(key: string, expected: string, actua
 }
 
 function migrationChange(change: Omit<MigrationChange, "rollback">): MigrationChange {
+  if (change.kind === "remove_doctype" || change.kind === "remove_field") return { ...change };
   return { ...change, rollback: rollbackFor(change) };
 }
 
 function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollback {
   switch (change.kind) {
+    case "add_doctype":
+      return { kind: "remove_doctype", doctype: change.doctype, field: "*", destructive: true, from: change.to };
+    case "remove_doctype":
+      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing DocType "${change.doctype}" cannot be rolled back automatically.`, 409);
     case "add_field":
       return { kind: "remove_field", doctype: change.doctype, field: change.field, destructive: true, from: change.to };
     case "remove_field":
-      return { kind: "add_field", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing field ${change.doctype}.${change.field} cannot restore deleted values automatically.`, 409);
     case "change_field_type":
       return { kind: "change_field_type", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
     case "add_index":
@@ -1277,16 +1343,45 @@ function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollba
   }
 }
 
-export async function migrationChecksum(plan: Pick<MigrationPlan, "tenantId" | "appName" | "changes">): Promise<string> {
+export async function migrationChecksum(plan: Pick<MigrationPlan, "tenantId" | "appName" | "fromSchemaChecksum" | "toSchemaChecksum" | "fromUniqueConstraints" | "toUniqueConstraints" | "changes">): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableJson({
     tenantId: plan.tenantId,
     appName: plan.appName,
+    fromSchemaChecksum: plan.fromSchemaChecksum,
+    toSchemaChecksum: plan.toSchemaChecksum,
+    fromUniqueConstraints: plan.fromUniqueConstraints,
+    toUniqueConstraints: plan.toUniqueConstraints,
     changes: plan.changes
   })));
   return base64Url(new Uint8Array(digest));
 }
 
 export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> {
+  if (!plan.id || !plan.tenantId || !plan.appName || !plan.fromSchemaChecksum || !plan.toSchemaChecksum ||
+      !Array.isArray(plan.fromUniqueConstraints) || !Array.isArray(plan.toUniqueConstraints) || !Array.isArray(plan.changes)) {
+    throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration plan identity, schema checksums, uniqueness metadata, and changes are required.", 422);
+  }
+  const identifier = /^[a-z][a-z0-9_]*$/;
+  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint"]);
+  const constraints = [...plan.fromUniqueConstraints, ...plan.toUniqueConstraints];
+  if (constraints.some((constraint) => !constraint || !identifier.test(constraint.doctype) || !identifier.test(constraint.field))) {
+    throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration uniqueness metadata contains an invalid DocType or field identifier.", 422);
+  }
+  for (const change of plan.changes) {
+    if (!change || !changeKinds.has(change.kind) || !identifier.test(change.doctype) || typeof change.field !== "string") {
+      throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration changes contain an invalid DocType or field identifier.", 422);
+    }
+    const fields = change.field === "*" ? ["*"] : change.field.split(",");
+    if (fields.some((field) => field !== "*" && !identifier.test(field))) {
+      throw new FramekitError("INVALID_MIGRATION_PLAN", `Migration change ${change.kind} contains an invalid field identifier.`, 422);
+    }
+    if (change.destructive !== migrationChangeIsDestructive(change)) {
+      throw new FramekitError("INVALID_MIGRATION_PLAN", `Migration change ${change.kind} has an invalid destructive classification.`, 422);
+    }
+    if (change.rollback && change.rollback.destructive !== migrationChangeIsDestructive(change.rollback)) {
+      throw new FramekitError("INVALID_MIGRATION_PLAN", `Rollback for ${change.kind} has an invalid destructive classification.`, 422);
+    }
+  }
   const expectedChecksum = await migrationChecksum(plan);
   if (plan.checksum !== expectedChecksum) {
     throw new FramekitError("MIGRATION_CHECKSUM_MISMATCH", "Migration checksum does not match the planned changes.", 409, {
@@ -1297,11 +1392,14 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
 }
 
 export function createExecutableMigrationArtifact(plan: MigrationPlan): ExecutableMigrationArtifact {
+  const irreversible = plan.changes.filter((change) => !change.rollback);
   return {
     ...plan,
     changes: plan.changes.map(cloneMigrationChange),
     up: plan.changes.map(cloneMigrationChange),
-    down: plan.changes.slice().reverse().map((change) => ({ ...(change.rollback ?? rollbackFor(change)) }))
+    down: irreversible.length === 0
+      ? plan.changes.slice().reverse().map((change) => ({ ...change.rollback! }))
+      : []
   };
 }
 
@@ -1310,17 +1408,118 @@ export async function createRollbackMigrationPlan(
   options: { id?: string; createdAt?: string } = {}
 ): Promise<MigrationPlan> {
   await validateMigrationPlan(migration);
+  const irreversible = migration.changes.filter((change) => !change.rollback);
+  if (irreversible.length > 0) {
+    throw new FramekitError("IRREVERSIBLE_MIGRATION", "Migration contains changes that cannot be rolled back automatically.", 409, irreversible);
+  }
   const plan = {
     id: options.id ?? `${migration.id}-rollback`,
     tenantId: migration.tenantId,
     appName: migration.appName,
+    fromSchemaChecksum: migration.toSchemaChecksum,
+    toSchemaChecksum: migration.fromSchemaChecksum,
+    fromUniqueConstraints: migration.toUniqueConstraints.map((constraint) => ({ ...constraint })),
+    toUniqueConstraints: migration.fromUniqueConstraints.map((constraint) => ({ ...constraint })),
     createdAt: options.createdAt ?? new Date().toISOString(),
     changes: migration.changes.slice().reverse().map((change) => ({
-      ...(change.rollback ?? rollbackFor(change)),
+      ...change.rollback!,
       rollback: withoutRollback(change)
     }))
   };
   return { ...plan, checksum: await migrationChecksum(plan) };
+}
+
+export async function appSchemaChecksum(app: AppDefinition): Promise<string> {
+  const metadata = {
+    name: app.name,
+    version: app.version,
+    modules: app.modules.map(({ hooks: _hooks, ...module }) => module)
+  };
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableJson(metadata)));
+  return base64Url(new Uint8Array(digest));
+}
+
+function appUniqueConstraints(app: AppDefinition): Array<{ doctype: string; field: string }> {
+  return app.modules.flatMap((module) => module.doctypes.flatMap((doctype) =>
+    doctype.fields.filter((field) => field.unique).map((field) => ({ doctype: doctype.name, field: field.name }))
+  )).sort((left, right) => `${left.doctype}.${left.field}`.localeCompare(`${right.doctype}.${right.field}`));
+}
+
+function assertMigrationMetadata(app: AppDefinition): void {
+  const doctypes = new Map(app.modules.flatMap((module) => module.doctypes).map((doctype) => [doctype.name, doctype]));
+  for (const doctype of doctypes.values()) {
+    const fields = new Set(doctype.fields.map((field) => field.name));
+    for (const index of doctype.indexes) {
+      const unknown = index.filter((field) => !fields.has(field));
+      if (unknown.length > 0) throw new FramekitError("INVALID_MIGRATION_METADATA", `Index on ${doctype.name} references unknown fields: ${unknown.join(", ")}`, 422);
+    }
+    if (doctype.naming.field && !fields.has(doctype.naming.field)) {
+      throw new FramekitError("INVALID_MIGRATION_METADATA", `Naming field "${doctype.naming.field}" does not exist on ${doctype.name}.`, 422);
+    }
+    if (doctype.workflow && !fields.has(doctype.workflow.field)) {
+      throw new FramekitError("INVALID_MIGRATION_METADATA", `Workflow field "${doctype.workflow.field}" does not exist on ${doctype.name}.`, 422);
+    }
+    for (const field of doctype.fields.filter((candidate) => candidate.type === "link")) {
+      if (!field.linkTo || !doctypes.has(field.linkTo)) {
+        throw new FramekitError("INVALID_MIGRATION_METADATA", `Link field ${doctype.name}.${field.name} references unknown DocType "${field.linkTo ?? ""}".`, 422);
+      }
+    }
+    const unsupportedUnique = doctype.fields.find((field) => field.unique && field.type === "json");
+    if (unsupportedUnique) {
+      throw new FramekitError("INVALID_MIGRATION_METADATA", `JSON field ${doctype.name}.${unsupportedUnique.name} cannot use a normalized unique constraint.`, 422);
+    }
+    for (const view of doctype.views) {
+      if (view.doctype !== doctype.name) {
+        throw new FramekitError("INVALID_MIGRATION_METADATA", `View "${view.id}" belongs to ${view.doctype}, not ${doctype.name}.`, 422);
+      }
+      const unknown = view.fields.filter((field) => !fields.has(field));
+      if (unknown.length > 0) {
+        throw new FramekitError("INVALID_MIGRATION_METADATA", `View "${view.id}" on ${doctype.name} references unknown fields: ${unknown.join(", ")}`, 422);
+      }
+    }
+  }
+}
+
+export function assertMigrationIdentity(tenant: TenantContext, appName: string, plan: MigrationPlan): void {
+  if (plan.tenantId !== tenant.tenantId) {
+    throw new FramekitError("MIGRATION_TENANT_MISMATCH", `Migration tenant "${plan.tenantId}" does not match request tenant "${tenant.tenantId}".`, 409);
+  }
+  if (plan.appName !== appName) {
+    throw new FramekitError("MIGRATION_APP_MISMATCH", `Migration app "${plan.appName}" does not match "${appName}".`, 409);
+  }
+}
+
+export function assertMigrationDrift(latest: MigrationRecord | undefined, plan: MigrationPlan): void {
+  if (!latest) return;
+  if (latest.appName !== plan.appName) {
+    throw new FramekitError("MIGRATION_APP_MISMATCH", `Latest migration belongs to app "${latest.appName}".`, 409);
+  }
+  // Records created before schema fingerprints were introduced have an empty target.
+  // The first hardened apply establishes the chain after all other validation succeeds.
+  if (latest.toSchemaChecksum && latest.toSchemaChecksum !== plan.fromSchemaChecksum) {
+    throw new FramekitError("MIGRATION_SCHEMA_DRIFT", "Migration baseline does not match the latest applied schema.", 409, {
+      expected: latest.toSchemaChecksum,
+      actual: plan.fromSchemaChecksum
+    });
+  }
+}
+
+export function assertDestructiveMigration(plan: MigrationPlan, options: { allowDestructive?: boolean }): void {
+  const destructive = plan.changes.filter(migrationChangeIsDestructive);
+  if (destructive.length > 0 && !options.allowDestructive) {
+    throw new FramekitError("DESTRUCTIVE_MIGRATION", "Migration contains destructive changes.", 409, destructive);
+  }
+}
+
+export function migrationChangeIsDestructive(change: Pick<MigrationChange, "kind"> | MigrationRollback): boolean {
+  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type";
+}
+
+export function assertSupportedMigration(plan: MigrationPlan): void {
+  const unsupported = plan.changes.filter((change) => change.kind === "change_field_type");
+  if (unsupported.length > 0) {
+    throw new FramekitError("UNSUPPORTED_MIGRATION_CONVERSION", "Automatic field type conversion is not supported; provide an operator-reviewed data migration.", 422, unsupported);
+  }
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -1348,15 +1547,18 @@ function indexKey(fields: string[]): string {
 function cloneMigrationRecord(record: MigrationRecord): MigrationRecord {
   return {
     ...record,
+    fromUniqueConstraints: record.fromUniqueConstraints.map((constraint) => ({ ...constraint })),
+    toUniqueConstraints: record.toUniqueConstraints.map((constraint) => ({ ...constraint })),
     changes: record.changes.map(cloneMigrationChange)
   };
 }
 
 function cloneMigrationChange(change: MigrationChange): MigrationChange {
-  return {
-    ...change,
-    rollback: change.rollback ? { ...change.rollback } : undefined
-  };
+  if (!change.rollback) {
+    const { rollback: _rollback, ...rest } = change;
+    return rest;
+  }
+  return { ...change, rollback: { ...change.rollback } };
 }
 
 function withoutRollback(change: MigrationChange): MigrationRollback {

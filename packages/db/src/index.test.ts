@@ -44,6 +44,7 @@ describe("db migration sql", () => {
     expect(sql).toContain("jsonb_set");
     expect(sql).toContain("create index if not exists framekit_documents_customer_region_idx");
     expect(sql).toContain("create unique index if not exists framekit_documents_customer_region_uniq");
+    expect(sql).toContain("data ->> 'region' <> ''");
     expect(sql).toContain("tenant_id = 'tenant_1'");
   });
 
@@ -64,6 +65,10 @@ async function migrationPlanFixture(): Promise<MigrationPlan> {
     id: "migration-1",
     tenantId: "tenant_1",
     appName: "CRM",
+    fromSchemaChecksum: "schema-before",
+    toSchemaChecksum: "schema-after",
+    fromUniqueConstraints: [],
+    toUniqueConstraints: [{ doctype: "customer", field: "region" }],
     createdAt: "2026-07-06T00:00:00.000Z",
     changes: [
       {

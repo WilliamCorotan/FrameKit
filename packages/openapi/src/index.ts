@@ -234,7 +234,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
     [`${basePath}/migrations/apply`]: {
       post: {
         operationId: "applyMigration",
-        summary: "Record an applied migration plan",
+        summary: "Execute and record a migration plan atomically",
         tags: ["System"],
         requestBody: jsonBody({
           type: "object",
