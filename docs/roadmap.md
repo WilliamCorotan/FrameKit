@@ -1,6 +1,6 @@
 # Framekit Roadmap
 
-> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-21, Framekit is assessed at 55% implementation toward a production-ready 1.0 and remains an advanced alpha.
+> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-21, Framekit is assessed at 83% implementation toward a production-ready 1.0 and is a beta.
 
 ## Implemented
 
@@ -61,11 +61,12 @@ Status: implemented
 
 ### Phase 5 - Developer Experience And Release Hardening
 
-Status: partially implemented
+Status: implemented for the beta
 
 - Generate typed SDK models from app metadata; generated endpoint parity remains incomplete.
 - Add a `create-app` server template for Nitro, Docker/env, and a starter DocType. The scaffold intentionally excludes Desk; a future packaged Desk template requires its own stable asset and upgrade contract.
 - Add CI workflow, deployment presets docs, and package publishing metadata.
+- Publish lifecycle, compatibility, observability, security, contribution, and support contracts; enforce coverage and supply-chain gates in CI.
 
 ## Historical Next Candidates
 

@@ -10,6 +10,39 @@ const tenant: TenantContext = {
 };
 
 describe("runtime document service", () => {
+  it("starts resources in order and closes them once in reverse order", async () => {
+    const events: string[] = [];
+    const first = { start: () => { events.push("first:start"); }, close: () => { events.push("first:close"); } };
+    const second = { start: () => { events.push("second:start"); }, dispose: () => { events.push("second:dispose"); } };
+    const runtime = createRuntime(defineApp({ name: "Lifecycle", modules: [] }), { resources: [first, second] });
+
+    await runtime.start();
+    await runtime.start();
+    expect(runtime.lifecycleStatus()).toEqual({ state: "started", ready: true });
+    await runtime.close();
+    await runtime.dispose();
+
+    expect(events).toEqual(["first:start", "second:start", "second:dispose", "first:close"]);
+    expect(runtime.lifecycleStatus()).toEqual({ state: "closed", ready: false });
+  });
+  it("closes a partially started resource and aggregates rollback failures", async () => {
+    const events: string[] = [];
+    const runtime = createRuntime(defineApp({ name: "Failed lifecycle", modules: [] }), { resources: [
+      { start: () => { events.push("first:start"); }, close: () => { events.push("first:close"); } },
+      {
+        start: () => { events.push("second:start"); throw new Error("startup failed after acquisition"); },
+        close: () => { events.push("second:close"); throw new Error("cleanup failed"); }
+      }
+    ] });
+
+    const error = await runtime.start().catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map((failure) => (failure as Error).message)).toEqual([
+      "startup failed after acquisition", "cleanup failed"
+    ]);
+    expect(events).toEqual(["first:start", "second:start", "second:close", "first:close"]);
+    expect(runtime.lifecycleStatus()).toEqual({ state: "closed", ready: false });
+  });
   it("creates and lists documents", async () => {
     const app = defineApp({
       name: "CRM",

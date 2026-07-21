@@ -272,7 +272,7 @@ docs/              Architecture, deployment, and roadmap docs
 
 ## Deployment
 
-The intended production target is a Nitro Node server with Postgres and Redis. The current release is an advanced alpha and must not be treated as production-ready until the P0 security items in the [maturity roadmap](docs/maturity-roadmap.md) are closed.
+The intended production target is a Nitro Node server with Postgres and Redis. The current release is a beta: production-depth gates are present, while the remaining 1.0 metadata semantics are tracked in the [maturity roadmap](docs/maturity-roadmap.md).
 
 ```bash
 docker compose up --build
@@ -292,6 +292,8 @@ Nitro can also emit provider-specific outputs through `NITRO_PRESET`. Keep long-
 
 See [docs/deployment.md](docs/deployment.md).
 See [docs/security.md](docs/security.md) before exposing a deployment to untrusted traffic.
+See [docs/observability.md](docs/observability.md) for lifecycle, health, telemetry, and redaction contracts.
+See [docs/compatibility.md](docs/compatibility.md) for supported runtimes, services, and browsers.
 
 ## Environment
 
@@ -345,9 +347,10 @@ pnpm audit:all
 Current verification status:
 
 - Full audit passes: lint, typecheck, tests, and build.
-- Test suite passes locally: 9 files and 54 tests; 2 service-backed files and 2 tests skip without service environment variables.
+- Unit/in-process suite passes locally: 11 files and 115 tests; 2 service-backed files and 13 tests skip without service environment variables.
+- Coverage gates enforce at least 60% statements/functions/lines and 50% branches across public package source.
 - Production build passes for packages, Desk, and CRM example.
-- Split CI passes fast, service integration, bounded built-smoke, and browser jobs.
+- Split CI covers package-local tests, coverage, Node 22/24 exports, Postgres 16/17, Redis 7/8, built smoke, standalone consumption, browsers, CodeQL, dependency audit, and SBOM generation.
 - In-process Nitro smoke covers auth lifecycle, provider login, OpenAPI, diagnostics, document CRUD, uniqueness, filters, cursor/projection, auth admin, password reset/change, customization, migrations, outbox, realtime history, and security/operations headers.
 
 ## Architecture
@@ -369,7 +372,7 @@ Postgres query pushdown and stable opaque cursor semantics are documented in [do
 
 ## Roadmap Status
 
-Framekit is currently assessed as an advanced alpha: 55% implemented toward a production-ready 1.0, with broad MVP functionality but open production-default, consistency, scale, and release-depth work. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
+Framekit is currently assessed as a beta: 83% implemented toward a production-ready 1.0. The bounded metadata/lifecycle contract is implemented; explicitly deferred metadata primitives remain tracked in issues #39 through #42. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
 
 ## License
 

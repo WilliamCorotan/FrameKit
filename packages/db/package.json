@@ -17,6 +17,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "test": "vitest run --root ../.. packages/db/src/index.test.ts",
     "test:integration": "vitest run --root ../.. packages/db/src/index.integration.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepack": "pnpm build"

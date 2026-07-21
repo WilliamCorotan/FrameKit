@@ -273,13 +273,19 @@ export type PostgresRealtimePublisherOptions = PostgresRepositoryOptions & {
 };
 
 export class PostgresDocumentRepository implements DocumentRepository {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
   private readonly onQuery?: PostgresRepositoryOptions["onQuery"];
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
     this.onQuery = options.onQuery;
   }
+
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createDocumentTableSql()));
@@ -434,6 +440,10 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
     this.faultInjector = options.faultInjector;
   }
 
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
+
   async migrate(): Promise<void> {
     await this.sql.unsafe(createMutationTablesSql());
   }
@@ -544,11 +554,17 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
 }
 
 export class PostgresUserStore implements UserStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
   }
+
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createUserTableSql()));
@@ -618,11 +634,17 @@ export class PostgresUserStore implements UserStore {
 }
 
 export class PostgresRoleStore implements RoleStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
   }
+
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createRoleTableSql()));
@@ -663,11 +685,17 @@ export class PostgresRoleStore implements RoleStore {
 }
 
 export class PostgresApiTokenStore implements ApiTokenStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
   }
+
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createApiTokenTableSql()));
@@ -713,11 +741,17 @@ export class PostgresApiTokenStore implements ApiTokenStore {
 }
 
 export class PostgresSessionRevocationStore implements SessionRevocationStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
   }
+
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createSessionRevocationTableSql()));
@@ -753,8 +787,12 @@ export class PostgresSessionRevocationStore implements SessionRevocationStore {
 }
 
 export class PostgresAuthIdentityLinkStore implements AuthIdentityLinkStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
-  constructor(options: PostgresRepositoryOptions) { this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 })); }
+  constructor(options: PostgresRepositoryOptions) { this.sql = postgres(options.connectionString, { max: options.max ?? 5 }); this.db = drizzle(this.sql); }
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
   async migrate(): Promise<void> { await this.db.execute(drizzleSql.raw(createAuthIdentityLifecycleTablesSql())); }
   async find(tenantId: string, providerId: string, subject: string): Promise<AuthIdentityLink | undefined> {
     const rows = await this.db.select().from(framekitAuthIdentityLinks).where(and(
@@ -777,6 +815,9 @@ export class PostgresAuthIdentityLinkStore implements AuthIdentityLinkStore {
 export class PostgresAuthLifecycleTokenStore implements AuthLifecycleTokenStore {
   private readonly sql: Sql;
   constructor(options: PostgresRepositoryOptions) { this.sql = postgres(options.connectionString, { max: options.max ?? 5 }); }
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
   async migrate(): Promise<void> { await this.sql.unsafe(createAuthIdentityLifecycleTablesSql()); }
   async create(token: AuthLifecycleToken): Promise<AuthLifecycleToken> {
     await this.sql`insert into framekit_auth_lifecycle_tokens
@@ -795,6 +836,9 @@ export class PostgresAuthLifecycleTokenStore implements AuthLifecycleTokenStore 
 export class PostgresOidcAuthorizationStateStore implements OidcAuthorizationStateStore {
   private readonly sql: Sql;
   constructor(options: PostgresRepositoryOptions) { this.sql = postgres(options.connectionString, { max: options.max ?? 5 }); }
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
   async migrate(): Promise<void> { await this.sql.unsafe(createAuthIdentityLifecycleTablesSql()); }
   async create(state: OidcAuthorizationState): Promise<OidcAuthorizationState> {
     await this.sql`insert into framekit_oidc_authorization_states
@@ -811,8 +855,12 @@ export class PostgresOidcAuthorizationStateStore implements OidcAuthorizationSta
 }
 
 export class PostgresAuthAuditStore implements AuthAuditSink {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
-  constructor(options: PostgresRepositoryOptions) { this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 })); }
+  constructor(options: PostgresRepositoryOptions) { this.sql = postgres(options.connectionString, { max: options.max ?? 5 }); this.db = drizzle(this.sql); }
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
   async migrate(): Promise<void> { await this.db.execute(drizzleSql.raw(createAuthIdentityLifecycleTablesSql())); }
   async record(event: AuthAuditEvent): Promise<void> {
     await this.db.insert(framekitAuthAuditEvents).values({ ...event, actorUserId: event.actorUserId ?? null, targetUserId: event.targetUserId ?? null,
@@ -827,11 +875,17 @@ export class PostgresAuthAuditStore implements AuthAuditSink {
 }
 
 export class PostgresAuditStore implements AuditStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
   }
+
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createAuditTableSql()));
@@ -876,6 +930,9 @@ export class PostgresOutboxStore implements OutboxStore {
     this.db = drizzle(this.sql);
   }
 
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
+  async dispose(): Promise<void> { await this.close(); }
+
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createOutboxTableSql()));
   }
@@ -889,7 +946,7 @@ export class PostgresOutboxStore implements OutboxStore {
   }
 
   async close(): Promise<void> {
-    await this.sql.end({ timeout: 1 });
+    await this.sql.end({ timeout: 5 });
   }
 
   async record(event: OutboxEvent): Promise<void> {
@@ -1043,6 +1100,13 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
     this.faultInjector = options.faultInjector;
   }
 
+  async start(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    await this.sql`select 1`;
+    await this.ensureListener();
+    signal?.throwIfAborted();
+  }
+
   async migrate(): Promise<void> {
     await this.sql.unsafe(createRealtimeTableSql());
   }
@@ -1091,7 +1155,7 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
     return rows.map(realtimeSqlRowToEvent);
   }
 
-  async subscribe(channel: string, listener: (event: RuntimeRealtimeEvent) => void): Promise<() => void> {
+  async subscribe(channel: string, listener: (event: RuntimeRealtimeEvent) => void, options: { signal?: AbortSignal } = {}): Promise<() => void> {
     if (this.closed) throw new FramekitError("REALTIME_CLOSED", "Realtime publisher is closed", 503);
     const listeners = this.listeners.get(channel) ?? new Set<(event: RuntimeRealtimeEvent) => void>();
     listeners.add(listener);
@@ -1112,6 +1176,8 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
         this.channelReady.set(channel, ready);
       }
       await ready;
+      if (options.signal?.aborted) unsubscribe();
+      else options.signal?.addEventListener("abort", unsubscribe, { once: true });
       return unsubscribe;
     } catch (error) {
       unsubscribe();
@@ -1140,6 +1206,8 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
     this.deliveredCursors.clear();
     this.channelReady.clear();
   }
+
+  async dispose(): Promise<void> { await this.close(); }
 
   private async ensureListener(): Promise<void> {
     if (this.listener || this.closed) return;
@@ -1207,11 +1275,17 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
 }
 
 export class PostgresCustomizationStore implements CustomizationStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
   }
+
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createCustomFieldTableSql()));
@@ -1280,6 +1354,10 @@ export class PostgresNamingSeriesStore implements NamingSeriesStore {
     this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
   }
 
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
+
   async migrate(): Promise<void> {
     await this.sql.unsafe(createNamingSeriesTableSql());
   }
@@ -1315,6 +1393,10 @@ export class PostgresMigrationStore implements MigrationStore {
     this.db = drizzle(this.sql);
     this.faultInjector = options.faultInjector;
   }
+
+  async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
+  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(`${createMigrationTableSql()}\n${createMutationTablesSql()}`));

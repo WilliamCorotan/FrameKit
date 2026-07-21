@@ -7,9 +7,11 @@ export type JobPayload = Record<string, unknown>;
 export type QueueHealth = { ok: boolean; details?: Record<string, unknown> };
 
 export type QueuePort = {
+  start?(signal?: AbortSignal): Promise<void> | void;
   enqueue(name: string, payload: JobPayload, options?: QueueOptions): Promise<void>;
   health(): Promise<QueueHealth>;
   close(): Promise<void>;
+  dispose?(): Promise<void> | void;
 };
 
 export type QueueOptions = {
@@ -29,6 +31,11 @@ export class InMemoryQueue implements QueuePort {
     this.jobs.push({ name, payload, options });
   }
 
+  async start(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    if (this.closed) throw new Error("Queue is closed");
+  }
+
   async health(): Promise<QueueHealth> {
     return { ok: !this.closed, details: { kind: "memory", queued: this.jobs.length } };
   }
@@ -36,16 +43,27 @@ export class InMemoryQueue implements QueuePort {
   async close(): Promise<void> {
     this.closed = true;
   }
+
+  async dispose(): Promise<void> { await this.close(); }
 }
 
 export class BullMqQueue implements QueuePort {
   private readonly queue: Queue;
+  private closed = false;
 
   constructor(name: string, connectionUrl: string) {
     this.queue = new Queue(name, { connection: { url: connectionUrl } });
   }
 
+  async start(signal?: AbortSignal): Promise<void> {
+    if (this.closed) throw new Error("Queue is closed");
+    signal?.throwIfAborted();
+    await this.queue.waitUntilReady();
+    signal?.throwIfAborted();
+  }
+
   async enqueue(name: string, payload: JobPayload, options: QueueOptions = {}): Promise<void> {
+    if (this.closed) throw new Error("Queue is closed");
     await this.queue.add(name, payload, {
       delay: options.delayMs,
       attempts: options.attempts,
@@ -64,14 +82,19 @@ export class BullMqQueue implements QueuePort {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     await this.queue.close();
   }
+
+  async dispose(): Promise<void> { await this.close(); }
 }
 
 export type WorkerHandler = (name: string, payload: JobPayload, context: { id: string; attemptsMade: number }) => Promise<unknown> | unknown;
 
 export class BullMqWorker {
   private readonly worker: Worker;
+  private closed = false;
 
   constructor(name: string, connectionUrl: string, handler: WorkerHandler, options: { concurrency?: number } = {}) {
     this.worker = new Worker(
@@ -79,6 +102,13 @@ export class BullMqWorker {
       async (job: Job) => handler(job.name, job.data as JobPayload, { id: String(job.id), attemptsMade: job.attemptsMade }),
       { connection: { url: connectionUrl }, ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }) }
     );
+  }
+
+  async start(signal?: AbortSignal): Promise<void> {
+    if (this.closed) throw new Error("Worker is closed");
+    signal?.throwIfAborted();
+    await this.worker.waitUntilReady();
+    signal?.throwIfAborted();
   }
 
   async health(): Promise<QueueHealth> {
@@ -91,11 +121,15 @@ export class BullMqWorker {
   }
 
   async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
     await this.worker.close();
   }
+
+  async dispose(): Promise<void> { await this.close(); }
 }
 
-export type OutboxDispatchHandler = (event: OutboxEvent, context: { idempotencyKey: string }) => Promise<void> | void;
+export type OutboxDispatchHandler = (event: OutboxEvent, context: { idempotencyKey: string; signal?: AbortSignal }) => Promise<void> | void;
 
 export type OutboxDispatchResult = {
   inspected: number;
@@ -111,6 +145,7 @@ export type OutboxDispatchOptions = {
   maxAttempts?: number;
   baseBackoffMs?: number;
   now?: string;
+  signal?: AbortSignal;
 };
 
 export type ScheduledJob = {
@@ -147,27 +182,49 @@ export class ScheduledJobRunner {
   private timer?: ReturnType<typeof setInterval>;
   private readonly lastRuns = new Map<string, string>();
   private active?: Promise<void>;
+  private readonly activeRuns = new Set<Promise<string[]>>();
   private readonly runningJobs = new Set<string>();
+  private closed = false;
+  private closing?: Promise<void>;
+  private abortSignal?: AbortSignal;
+  private abortListener?: () => void;
 
   constructor(private readonly registry: ScheduledJobRegistry, private readonly intervalMs = 1_000) {}
 
   async runDue(now = new Date()): Promise<string[]> {
+    if (this.closed) throw new Error("Scheduled job runner is closed");
+    const run = this.runDueBatch(now);
+    this.activeRuns.add(run);
+    try { return await run; } finally { this.activeRuns.delete(run); }
+  }
+
+  private async runDueBatch(now: Date): Promise<string[]> {
     const minute = now.toISOString().slice(0, 16);
     const due = this.registry.entries().filter((job) => job.schedule && cronMatches(job.schedule, now) && this.lastRuns.get(job.name) !== minute && !this.runningJobs.has(job.name));
+    const ran: string[] = [];
     for (const job of due) {
+      if (this.closed) break;
       this.runningJobs.add(job.name);
       try {
         await job.handler();
         this.lastRuns.set(job.name, minute);
+        ran.push(job.name);
       } finally {
         this.runningJobs.delete(job.name);
       }
     }
-    return due.map((job) => job.name);
+    return ran;
   }
 
-  start(): void {
+  start(signal?: AbortSignal): void {
+    if (this.closed) throw new Error("Scheduled job runner is closed");
+    signal?.throwIfAborted();
     if (this.timer) return;
+    if (signal) {
+      this.abortSignal = signal;
+      this.abortListener = () => { void this.close().catch(() => undefined); };
+      signal.addEventListener("abort", this.abortListener, { once: true });
+    }
     this.timer = setInterval(() => {
       if (this.active) return;
       this.active = this.runDue().then(() => undefined);
@@ -180,10 +237,22 @@ export class ScheduledJobRunner {
   }
 
   async close(): Promise<void> {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
-    await this.active;
+    if (this.closing) return this.closing;
+    if (this.closed) return;
+    this.closed = true;
+    if (this.abortSignal && this.abortListener) this.abortSignal.removeEventListener("abort", this.abortListener);
+    this.abortSignal = undefined;
+    this.abortListener = undefined;
+    const operation = (async () => {
+      if (this.timer) clearInterval(this.timer);
+      this.timer = undefined;
+      await Promise.all([...(this.active ? [this.active] : []), ...this.activeRuns]);
+    })();
+    this.closing = operation;
+    try { await operation; } finally { if (this.closing === operation) this.closing = undefined; }
   }
+
+  async dispose(): Promise<void> { await this.close(); }
 }
 
 export async function dispatchOutboxEvents(
@@ -192,6 +261,7 @@ export async function dispatchOutboxEvents(
   handler: OutboxDispatchHandler,
   options: OutboxDispatchOptions = {}
 ): Promise<OutboxDispatchResult> {
+  options.signal?.throwIfAborted();
   const ownerId = options.ownerId ?? `worker-${crypto.randomUUID()}`;
   const maxAttempts = options.maxAttempts ?? 5;
   const events = await runtime.claimOutboxEvents(tenant, {
@@ -204,11 +274,14 @@ export async function dispatchOutboxEvents(
   const result: OutboxDispatchResult = { inspected: events.length, dispatched: 0, failed: 0, skipped: 0 };
 
   for (const event of events) {
+    options.signal?.throwIfAborted();
     try {
-      await handler(event, { idempotencyKey: event.id });
+      await handler(event, { idempotencyKey: event.id, signal: options.signal });
+      options.signal?.throwIfAborted();
       await runtime.acknowledgeOutboxEvent(tenant, event.id, ownerId);
       result.dispatched += 1;
     } catch (error) {
+      options.signal?.throwIfAborted();
       const backoffMs = (options.baseBackoffMs ?? 1_000) * 2 ** Math.max(0, event.attempts - 1);
       await runtime.rejectOutboxEvent(tenant, event.id, ownerId, errorMessage(error), { backoffMs, maxAttempts, now: options.now });
       result.failed += 1;
@@ -231,6 +304,11 @@ export class OutboxDispatcher {
   private active?: Promise<OutboxDispatchResult>;
   private lastResult?: OutboxDispatchResult;
   private lastError?: string;
+  private controller?: AbortController;
+  private closed = false;
+  private closing?: Promise<void>;
+  private abortSignal?: AbortSignal;
+  private abortListener?: () => void;
 
   constructor(
     private readonly runtime: FramekitRuntime,
@@ -240,8 +318,16 @@ export class OutboxDispatcher {
   ) {}
 
   async runOnce(): Promise<OutboxDispatchResult> {
+    if (this.closed) throw new Error("Outbox dispatcher is closed");
     if (this.active) return this.active;
-    const active = dispatchOutboxEvents(this.runtime, this.tenant, this.handler, this.options);
+    this.controller ??= new AbortController();
+    const signal = this.options.signal
+      ? AbortSignal.any([this.controller.signal, this.options.signal])
+      : this.controller.signal;
+    const active = dispatchOutboxEvents(this.runtime, this.tenant, this.handler, {
+      ...this.options,
+      signal
+    });
     this.active = active;
     try {
       this.lastResult = await active;
@@ -255,8 +341,16 @@ export class OutboxDispatcher {
     }
   }
 
-  start(): void {
+  start(signal?: AbortSignal): void {
+    if (this.closed) throw new Error("Outbox dispatcher is closed");
+    signal?.throwIfAborted();
     if (this.timer) return;
+    this.controller ??= new AbortController();
+    if (signal) {
+      this.abortSignal = signal;
+      this.abortListener = () => { void this.close().catch(() => undefined); };
+      signal.addEventListener("abort", this.abortListener, { once: true });
+    }
     this.timer = setInterval(() => void this.runOnce().catch(() => undefined), this.options.intervalMs ?? 1_000);
   }
 
@@ -265,10 +359,24 @@ export class OutboxDispatcher {
   }
 
   async close(): Promise<void> {
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
-    await this.active;
+    if (this.closing) return this.closing;
+    if (this.closed) return;
+    this.closed = true;
+    if (this.abortSignal && this.abortListener) this.abortSignal.removeEventListener("abort", this.abortListener);
+    this.abortSignal = undefined;
+    this.abortListener = undefined;
+    const operation = (async () => {
+      this.controller?.abort();
+      if (this.timer) clearInterval(this.timer);
+      this.timer = undefined;
+      await this.active;
+      this.controller = undefined;
+    })();
+    this.closing = operation;
+    try { await operation; } finally { if (this.closing === operation) this.closing = undefined; }
   }
+
+  async dispose(): Promise<void> { await this.close(); }
 }
 
 function cronMatches(expression: string, date: Date): boolean {

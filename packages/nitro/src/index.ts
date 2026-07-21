@@ -10,8 +10,10 @@ export type NitroAdapterOptions = {
   auth?: PasswordAuthService;
   logger?: NitroRequestLogger;
   metrics?: NitroMetricsSink;
+  tracer?: NitroTraceSink;
   rateLimit?: NitroRateLimitOptions | NitroRateLimiter | false;
   healthChecks?: Record<string, NitroHealthCheck>;
+  healthCheckTimeoutMs?: number;
   authCookie?: NitroAuthCookieOptions | false;
   cors?: NitroCorsOptions | false;
   security?: NitroHttpSecurityOptions;
@@ -72,6 +74,16 @@ export type NitroMetricsSink = {
   observeRequest(event: NitroRequestTelemetry): void | Promise<void>;
 };
 
+export type NitroTraceSpan = {
+  setAttribute?(name: string, value: string | number | boolean): void;
+  recordException?(error: unknown): void;
+  end(): void;
+};
+
+export type NitroTraceSink = {
+  startSpan(name: string, attributes: Record<string, string | number | boolean>): NitroTraceSpan;
+};
+
 export type NitroRateLimitOptions = {
   windowMs: number;
   max: number;
@@ -87,7 +99,37 @@ export type NitroHealthCheckResult = {
   details?: unknown;
 };
 
-export type NitroHealthCheck = () => NitroHealthCheckResult | Promise<NitroHealthCheckResult>;
+export type NitroHealthCheck = (signal: AbortSignal) => NitroHealthCheckResult | Promise<NitroHealthCheckResult>;
+
+export type OpenTelemetryCompatibleLogger = { emit(record: { severityText: string; body: string; attributes: Record<string, unknown> }): void };
+export type OpenTelemetryCompatibleTracer = { startSpan(name: string, options: { attributes: Record<string, string | number | boolean> }): NitroTraceSpan };
+export type OpenTelemetryCompatibleMeter = {
+  createHistogram(name: string): { record(value: number, attributes?: Record<string, string | number | boolean>): void };
+  createCounter(name: string): { add(value: number, attributes?: Record<string, string | number | boolean>): void };
+};
+
+export function createOpenTelemetryAdapters(options: {
+  logger?: OpenTelemetryCompatibleLogger;
+  tracer?: OpenTelemetryCompatibleTracer;
+  meter?: OpenTelemetryCompatibleMeter;
+}): Pick<NitroAdapterOptions, "logger" | "metrics" | "tracer"> {
+  const duration = options.meter?.createHistogram("http.server.request.duration");
+  const requests = options.meter?.createCounter("http.server.request.count");
+  return {
+    logger: options.logger ? {
+      info: (event) => options.logger!.emit({ severityText: "INFO", body: "HTTP request", attributes: redactTelemetry(event) as Record<string, unknown> }),
+      error: (event) => options.logger!.emit({ severityText: "ERROR", body: "HTTP request failed", attributes: redactTelemetry(event) as Record<string, unknown> })
+    } : undefined,
+    metrics: options.meter ? {
+      observeRequest: (event) => {
+        const attributes = { "http.request.method": event.method, "http.route": event.path, "http.response.status_code": event.statusCode };
+        duration!.record(event.durationMs, attributes);
+        requests!.add(1, attributes);
+      }
+    } : undefined,
+    tracer: options.tracer ? { startSpan: (name, attributes) => options.tracer!.startSpan(name, { attributes }) } : undefined
+  };
+}
 
 export function assertSecureProductionCredentials(options: NitroProductionCredentials): void {
   const environment = options.environment ?? nodeEnvironment();
@@ -126,6 +168,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
     const requestId = event.req.headers.get("x-request-id") ?? crypto.randomUUID();
     const path = event.url.pathname;
     const method = event.req.method ?? "GET";
+    const span = options.tracer?.startSpan("http.request", { "http.request.method": method, "url.path": path, "http.request_id": requestId });
     let statusCode = 200;
     let thrown: unknown;
     try {
@@ -157,11 +200,11 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         throw new FramekitError("RATE_LIMITED", "Too many requests.", 429);
       }
 
-      if (method === "GET" && path === "/health") {
+      if (method === "GET" && (path === "/health" || path === "/health/live")) {
         return { ok: true, app: runtime.app.name, version: runtime.app.version };
       }
-      if (method === "GET" && path === "/health/dependencies") {
-        const health = await runHealthChecks(options.healthChecks ?? {});
+      if (method === "GET" && (path === "/health/dependencies" || path === "/health/ready")) {
+        const health = await runHealthChecks(options.healthChecks ?? {}, options.healthCheckTimeoutMs ?? 2_000);
         if (!health.ok) {
           statusCode = 503;
           setResponseStatus(event, 503);
@@ -613,9 +656,12 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         statusCode,
         durationMs: Math.round((performance.now() - startedAt) * 100) / 100
       };
+      span?.setAttribute?.("http.response.status_code", statusCode);
+      if (thrown) span?.recordException?.(redactTelemetryError(thrown));
+      span?.end();
       await options.metrics?.observeRequest(telemetry);
       if (thrown && options.logger?.error) {
-        await options.logger.error({ ...telemetry, error: thrown });
+        await options.logger.error({ ...telemetry, error: redactTelemetryError(thrown) });
       } else {
         await options.logger?.info(telemetry);
       }
@@ -1055,12 +1101,30 @@ function mutationOptions(request: Request): { expectedRevision?: number; idempot
   };
 }
 
-async function runHealthChecks(checks: Record<string, NitroHealthCheck>) {
+async function runHealthChecks(checks: Record<string, NitroHealthCheck>, timeoutMs: number) {
+  const boundedTimeoutMs = Math.max(1, Math.min(timeoutMs, 30_000));
   const entries = await Promise.all(Object.entries(checks).map(async ([name, check]) => {
+    const controller = new AbortController();
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return [name, await check()] as const;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error("HEALTH_CHECK_TIMEOUT"));
+          controller.abort(new Error(`Health check exceeded ${boundedTimeoutMs}ms.`));
+        }, boundedTimeoutMs);
+      });
+      return [name, await Promise.race([Promise.resolve(check(controller.signal)), timeout])] as const;
     } catch (error) {
-      return [name, { ok: false, details: error instanceof Error ? error.message : String(error) }] as const;
+      return [name, {
+        ok: false,
+        details: timedOut
+          ? { code: "HEALTH_CHECK_TIMEOUT", timeoutMs: boundedTimeoutMs }
+          : redactTelemetryError(error)
+      }] as const;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }));
   const dependencies = Object.fromEntries(entries);
@@ -1068,6 +1132,37 @@ async function runHealthChecks(checks: Record<string, NitroHealthCheck>) {
     ok: Object.values(dependencies).every((result) => result.ok),
     dependencies
   };
+}
+
+const SENSITIVE_TELEMETRY_KEY = /authorization|cookie|password|secret|token|api[-_]?key/i;
+const BEARER_VALUE = /\bBearer\s+[^\s,;]+/gi;
+const JWT_VALUE = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
+
+function redactTelemetryError(error: unknown): unknown {
+  if (error instanceof FramekitError) {
+    return { name: error.name, code: error.code, message: redactTelemetryString(error.message) };
+  }
+  if (error instanceof Error) {
+    return { name: error.name, message: redactTelemetryString(error.message) };
+  }
+  return redactTelemetry(error);
+}
+
+function redactTelemetry(value: unknown, key?: string, seen = new WeakSet<object>()): unknown {
+  if (key && SENSITIVE_TELEMETRY_KEY.test(key)) return "[REDACTED]";
+  if (typeof value === "string") return redactTelemetryString(value);
+  if (!value || typeof value !== "object") return value;
+  if (seen.has(value)) return "[CIRCULAR]";
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((entry) => redactTelemetry(entry, undefined, seen));
+  return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [
+    entryKey,
+    redactTelemetry(entryValue, entryKey, seen)
+  ]));
+}
+
+function redactTelemetryString(value: string): string {
+  return value.replace(BEARER_VALUE, "Bearer [REDACTED]").replace(JWT_VALUE, "[REDACTED]");
 }
 
 function parseFilters(value: unknown): Record<string, FilterValue> | undefined {
@@ -1201,7 +1296,7 @@ function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, s
             return;
           }
           requestPump();
-        });
+        }, { signal });
         unsubscribe = subscribed;
         if (closed || signal.aborted) {
           subscribed();

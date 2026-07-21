@@ -7,8 +7,11 @@ export type RealtimeEvent<TPayload = Record<string, unknown>> = {
 };
 
 export type EventBus = {
+  start?(signal?: AbortSignal): Promise<void> | void;
   publish<TPayload extends Record<string, unknown>>(event: RealtimeEvent<TPayload>): Promise<void>;
-  subscribe(channel: string, listener: (event: RealtimeEvent) => void): () => void;
+  subscribe(channel: string, listener: (event: RealtimeEvent) => void, options?: { signal?: AbortSignal }): () => void;
+  close?(): Promise<void> | void;
+  dispose?(): Promise<void> | void;
 };
 
 export class InMemoryEventBus implements EventBus {
@@ -36,12 +39,20 @@ export class InMemoryEventBus implements EventBus {
       : events.slice(-(options.limit ?? 100)).reverse();
   }
 
-  subscribe(channel: string, listener: (event: RealtimeEvent) => void): () => void {
+  subscribe(channel: string, listener: (event: RealtimeEvent) => void, options: { signal?: AbortSignal } = {}): () => void {
     if (this.closed) throw new Error("Realtime event bus is closed");
     const listeners = this.listeners.get(channel) ?? new Set<(event: RealtimeEvent) => void>();
     listeners.add(listener);
     this.listeners.set(channel, listeners);
-    return () => listeners.delete(listener);
+    const unsubscribe = () => { listeners.delete(listener); };
+    if (options.signal?.aborted) unsubscribe();
+    else options.signal?.addEventListener("abort", unsubscribe, { once: true });
+    return unsubscribe;
+  }
+
+  async start(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    if (this.closed) throw new Error("Realtime event bus is closed");
   }
 
   async health() {
@@ -52,6 +63,8 @@ export class InMemoryEventBus implements EventBus {
     this.closed = true;
     this.listeners.clear();
   }
+
+  async dispose(): Promise<void> { await this.close(); }
 
   describe() {
     return {

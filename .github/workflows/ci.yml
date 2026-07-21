@@ -19,14 +19,22 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
-      - run: pnpm test
+      - run: pnpm -r --if-present test
+      - run: pnpm test:coverage
 
   service-integration:
+    strategy:
+      matrix:
+        include:
+          - postgres: 16
+            redis: 7
+          - postgres: 17
+            redis: 8
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_USER: framekit
           POSTGRES_PASSWORD: framekit
@@ -39,7 +47,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
       redis:
-        image: redis:7
+        image: redis:${{ matrix.redis }}
         ports:
           - 6379:6379
         options: >-

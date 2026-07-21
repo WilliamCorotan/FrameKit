@@ -2,7 +2,7 @@
 
 Last reevaluated: 2026-07-21
 
-Framekit is an advanced-alpha, metadata-driven TypeScript business application framework. The framework skeleton is broad and credible: metadata, runtime services, Nitro APIs, authentication, Postgres adapters, migrations, jobs, realtime, OpenAPI, SDK, CLI, Desk, deployment, and release artifacts are all present. Authenticated request identity and the built-server CI lifecycle were hardened during this reevaluation. It is not release-candidate ready because production HTTP/auth defaults still need hardening and durable mutations are not atomic.
+Framekit is a beta, metadata-driven TypeScript business application framework. Its production path now covers secure HTTP/auth defaults, atomic durable mutations, pushed-down queries, executable migrations, durable jobs and realtime, standalone package verification, full-stack browser checks, bounded business-document lifecycle semantics, resource lifecycle, observability adapters, compatibility testing, and supply-chain automation. Deferred metadata primitives are tracked separately in #39 through #42.
 
 ## Scoring Model
 
@@ -18,39 +18,40 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 
 ## Overall Assessment
 
-- Component-average implementation: **55%**.
-- Functional breadth: approximately **60%**.
-- Production readiness: approximately **43%**.
-- Current stage: **advanced alpha**.
-- Remaining P0 release blocker: safe HTTP, cookie, secret, and bootstrap defaults.
+- Component-average implementation: **83%**.
+- Functional breadth: approximately **89%**.
+- Production readiness: approximately **79%**.
+- Current stage: **beta**.
+- Remaining 1.0 decisions: the explicitly deferred metadata primitives in #39 through #42.
 
 ## Modern Framework Component Matrix
 
 | Component | Implementation | In place | Missing or incomplete |
 | --- | ---: | --- | --- |
 | Core metadata and domain model | 76% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics, ownership/row permissions, localization, typed settings |
-| Runtime and command lifecycle | 78% | CRUD, ordered validation/hooks, transitions, draft-submit-cancel lifecycle, post-submit immutability, atomic mutation unit of work, optimistic concurrency, idempotency, audit/outbox, naming, realtime, and diagnostics | Bulk/cross-document commands and complete start/stop/dispose lifecycle |
-| Data, query, and persistence | 50% | In-memory and Postgres adapters for documents and framework records; filters, sorting, projection, cursors, links, and uniqueness checks | Query pushdown, stable opaque cursors, adapter-enforced uniqueness, locking/revisions, atomic document/outbox persistence, load/performance evidence |
-| HTTP API and OpenAPI | 64% | Broad Nitro route surface, authenticated-by-default protected routes, operation permissions, OpenAPI 3.1, framework errors, request IDs, rate-limit and telemetry ports | Hardened CORS, version/compatibility policy, idempotency, pagination envelopes |
+| Runtime and command lifecycle | 92% | CRUD, ordered validation/hooks, draft-submit-cancel lifecycle, post-submit immutability, atomic durable commands, revisions, idempotency, audit/outbox/realtime, diagnostics, and ordered start/close/dispose | Bulk/cross-document commands and deeper cancellation propagation |
+| Data, query, and persistence | 84% | In-memory and Postgres adapters, pushed-down filters/sorts/projections, opaque cursors, durable uniqueness, revisions, locking, and atomic document/outbox persistence | Load/performance evidence, sharding/partition guidance, broader physical schema modeling |
+| HTTP API and OpenAPI | 82% | Secure routing defaults, broad Nitro/OpenAPI surface, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
 | Authentication and IAM | 78% | Password sessions, cookies, refresh/logout/revocation, lockout, API tokens, roles, durable audit and identity links, OIDC discovery/JWKS authorization-code/PKCE, single-use invitations and recovery, forged-header and cross-tenant protection | Native WebAuthn/TOTP enrollment and step-up assurance policy; provider-enforced MFA is the current production scope |
 | Schema evolution | 85% | Executable HTTP/CLI contract, schema fingerprints, full DocType diffs, checksums, destructive and irreversible guards, advisory locking, drift/replay policy, atomic Postgres apply/rollback, and legacy uniqueness backfill | Operator-authored conversion hooks, online/zero-downtime strategies, physical-schema inspection beyond managed indexes, and approval/audit workflows |
-| Jobs, events, and realtime | 45% | Queue port, BullMQ adapter, retry helper, scheduled registry, outbox dispatcher, SSE, in-memory history | Worker/scheduler lifecycle, atomic outbox leasing, deduplication, durable multi-instance fanout and replay, graceful shutdown |
-| Desk and admin UI | 55% | Metadata lists/forms, workflow controls, auth administration, customization, audit/outbox/diagnostics screens, responsive smoke | Real-backend E2E, delete/pagination/filter UX, field errors, accessibility audit, keyboard coverage, multi-browser verification |
-| SDK, CLI, and developer experience | 55% | Broad HTTP client, generated model types, app/module/DocType scaffolding, migration commands | Generated endpoint parity, typed/retriable client errors, safe scaffold overwrite policy, standalone templates, upgrade/config workflows |
-| Operations, security, and release | 38% | Health checks, logger/metrics hooks, rate limiting, deployment docs, dist outputs, publish metadata, RC notes, bounded CI jobs | Secure defaults, resource lifecycle, production observability adapters, secret/config validation, publish workflow, SBOM/security scanning |
-| Testing and CI | 68% | 54 unit/in-process tests, service-backed suites, terminating built-server smoke with cleanup regression tests, split bounded CI jobs, five mocked browser journeys in CI | Full-stack Desk test, broader tenant/security tests, fault/concurrency tests, coverage thresholds, working package-local test scripts |
-| Documentation and adoption | 45% | README, architecture, deployment, release policy, two roadmaps, CRM example | Standalone install guide, security model, compatibility/support matrix, contribution/security policies, API reference, verified external-consumer tutorial |
+| Jobs, events, and realtime | 85% | BullMQ queues/workers, atomic outbox leases, retry/backoff/dead-letter behavior, idempotency keys, scheduling, Postgres fanout/replay, SSE, lifecycle and cancellation | Operational load evidence, poison-message tooling, richer scheduler persistence |
+| Desk and admin UI | 82% | Metadata lists/forms, workflows, auth administration, customization, operations screens, real-stack Chromium/Firefox journeys, accessibility checks | Richer field errors, keyboard depth, visual regression policy |
+| SDK, CLI, and developer experience | 75% | Broad HTTP parity, generated model types, scaffolding, migration commands, packed standalone consumer proof | Typed/retriable errors, upgrade/config workflows, packaged Desk template |
+| Operations, security, and release | 82% | Secure defaults, lifecycle, bounded readiness, OpenTelemetry-compatible adapters/redaction, tested compatibility, provenance publication, dependency audit, CodeQL, Dependabot, and SBOM artifacts | Alert/runbook examples, SLO guidance, sustained fault/load evidence |
+| Testing and CI | 88% | Unit, service, concurrency/fault, built smoke, standalone package, full-stack browser, package-local, compatibility matrix, and enforced coverage gates | Sustained load/soak testing, more failure injection, visual regression |
+| Documentation and adoption | 72% | README, architecture, deployment, security, identity, consistency, querying, migrations, observability, compatibility, contribution, disclosure, support, release, and roadmaps | Generated API reference site, versioned upgrade guides, external tutorial feedback |
 
 ## Priority 0 - Release Blockers
 
 No release candidate should be cut until all P0 items are closed and their acceptance criteria are verified.
 
-1. [#17 Harden HTTP, cookie, secret, and bootstrap security defaults](https://github.com/WilliamCorotan/FrameKit/issues/17)
+No open P0 issues.
 
 Completed during this reevaluation:
 
 - [#16 Enforce authenticated request identity and operations authorization](https://github.com/WilliamCorotan/FrameKit/issues/16)
 - [#18 Make the built-server smoke release gate terminate reliably](https://github.com/WilliamCorotan/FrameKit/issues/18)
+- [#17 Harden HTTP, cookie, secret, and bootstrap security defaults](https://github.com/WilliamCorotan/FrameKit/issues/17)
 
 Exit criteria:
 
@@ -61,13 +62,7 @@ Exit criteria:
 
 ## Priority 1 - Release-Candidate Depth
 
-1. [#19 Add atomic mutations, optimistic concurrency, and durable uniqueness](https://github.com/WilliamCorotan/FrameKit/issues/19)
-2. [#20 Push query operations and stable cursor pagination into Postgres](https://github.com/WilliamCorotan/FrameKit/issues/20)
-3. [#21 Harden executable migrations, drift detection, and route semantics](https://github.com/WilliamCorotan/FrameKit/issues/21)
-4. [#22 Provide durable job execution, outbox claiming, and realtime replay](https://github.com/WilliamCorotan/FrameKit/issues/22)
-5. [#23 Add real full-stack Desk CI, accessibility, and browser coverage](https://github.com/WilliamCorotan/FrameKit/issues/23)
-6. [#24 Prove standalone packages, scaffolding, and automated publication](https://github.com/WilliamCorotan/FrameKit/issues/24)
-7. [#25 Complete production identity lifecycle and OIDC flow](https://github.com/WilliamCorotan/FrameKit/issues/25)
+Issues #19 through #25 are implemented and closed.
 
 Exit criteria:
 
@@ -80,7 +75,7 @@ Exit criteria:
 ## Priority 2 - Production Maturity
 
 1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26) — bounded 1.0 contract implemented; deferred primitives are tracked by [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), [#41](https://github.com/WilliamCorotan/FrameKit/issues/41), and [#42](https://github.com/WilliamCorotan/FrameKit/issues/42).
-2. [#27 Add production lifecycle, observability, compatibility, and supply-chain gates](https://github.com/WilliamCorotan/FrameKit/issues/27)
+2. [#27 Add production lifecycle, observability, compatibility, and supply-chain gates](https://github.com/WilliamCorotan/FrameKit/issues/27) — implemented by this change; closes when merged.
 
 Exit criteria:
 
@@ -91,24 +86,22 @@ Exit criteria:
 
 ## Highest-Risk Technical Findings
 
-1. Wildcard CORS, cookie/CSRF policy, default secrets, and bootstrap credentials still need production-safe behavior.
-2. Document persistence happens before hook, audit, outbox, and realtime work completes, so an error can be returned after partial durable success.
-3. Postgres document lists materialize the tenant/DocType result set before applying filters, sort, projection, and pagination.
-4. Unique checks are list-then-write and updates have no expected revision, so concurrent requests can duplicate or overwrite data.
-5. Runtime migration apply and CLI executable migration behavior are not one consistent contract; removal, drift, locking, and replay policies remain incomplete.
-6. Outbox and realtime durability are implemented; remaining operational maturity depends on broader observability and compatibility work.
-7. Package-local test scripts fail to discover tests because their package working directory conflicts with the root Vitest include pattern.
+1. The metadata model still lacks the selected child-record, attachment, ownership, computed-field, localization, and decimal semantics required for 1.0.
+2. Compatibility gates prove supported combinations functionally, but sustained load, soak, and infrastructure fault testing remain limited.
+3. Nitro and H3 remain pre-release dependencies; upgrades require explicit compatibility evidence.
+4. OpenTelemetry adapters are exporter-neutral and tested for redaction, but production sampling, alerting, and SLOs remain operator responsibilities.
+5. Community support is best-effort; there is no commercial incident-response commitment.
 
 ## Verification Snapshot
 
 Reevaluation checks on 2026-07-21:
 
-- `pnpm audit:all`: lint/typecheck passed, 54 tests passed and 2 service tests skipped without service environment variables, and all packages plus the CRM and Desk built.
+- `pnpm audit:all`: lint/typecheck, 115 unit/in-process tests, enforced coverage thresholds, and all package, CRM, and Desk builds pass.
 - `pnpm test:desk:browser`: 5 Chromium journeys passed against mocked API routes.
 - `pnpm smoke:crm:built`: assertions and bounded cleanup regression tests pass and terminate; #18 is closed.
-- Default-branch CI is split into bounded fast, service, built-smoke, and browser jobs and is green after #16 and #18.
+- CI defines bounded package-local/coverage, Node 22/24, Postgres 16/17, Redis 7/8, built-smoke, standalone, browser, CodeQL, dependency audit, Dependabot, and SBOM gates.
 - Forged-header, cross-tenant, operation-permission, realtime-history, and SSE authorization checks pass; #16 is closed.
-- Package-local core, runtime, and OpenAPI test commands: failed with no tests discovered; tracked by #27.
+- All ten public packages expose working package-local test commands; coverage is 67.86% statements, 61.70% branches, 66.18% functions, and 69.67% lines at this reevaluation.
 - GitHub issues #2 through #7 are closed and their implemented work is present; older pending references were stale.
 
 ## Score Update Policy

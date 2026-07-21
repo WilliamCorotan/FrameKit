@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
 import { createRuntime } from "@framekit/runtime";
-import { dispatchOutboxEvents, OutboxDispatcher, retryFailedOutboxEvents, ScheduledJobRegistry, ScheduledJobRunner } from "./index.js";
+import { dispatchOutboxEvents, InMemoryQueue, OutboxDispatcher, retryFailedOutboxEvents, ScheduledJobRegistry, ScheduledJobRunner } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -162,6 +162,9 @@ describe("dispatchOutboxEvents", () => {
     expect(runs).toBe(1);
     runner.start();
     await runner.close();
+    await runner.dispose();
+    expect(() => runner.start()).toThrow("closed");
+    await expect(runner.runDue()).rejects.toThrow("closed");
   });
 
   it("sweeps already-exhausted failed events into dead-letter state", async () => {
@@ -177,6 +180,124 @@ describe("dispatchOutboxEvents", () => {
     await expect(runtime.outboxEvents(tenant)).resolves.toEqual([
       expect.objectContaining({ id: event!.id, status: "dead_letter", attempts: 2, error: "second failure" })
     ]);
+  });
+
+  it("propagates worker cancellation and supports disposable queues", async () => {
+    const runtime = createJobsRuntime("Cancellation");
+    await runtime.create(tenant, "customer", { name: "Abort Co" });
+    const controller = new AbortController();
+    let observedSignal: AbortSignal | undefined;
+    await dispatchOutboxEvents(runtime, tenant, async (_event, context) => {
+      observedSignal = context.signal;
+    }, { signal: controller.signal });
+    expect(observedSignal).toBe(controller.signal);
+
+    const dispatcher = new OutboxDispatcher(runtime, tenant, async () => undefined, { intervalMs: 5 });
+    dispatcher.start(controller.signal);
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    controller.abort();
+    await dispatcher.dispose();
+    await dispatcher.close();
+    expect(await dispatcher.health()).toMatchObject({ details: { running: false } });
+    expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+    expect(() => dispatcher.start()).toThrow("closed");
+    await expect(dispatcher.runOnce()).rejects.toThrow("closed");
+
+    const queue = new InMemoryQueue();
+    await queue.start();
+    await queue.dispose();
+    await expect(queue.enqueue("closed", {})).rejects.toThrow("closed");
+  });
+
+  it("contains shutdown failures triggered by abort signals", async () => {
+    vi.useFakeTimers();
+    const registry = new ScheduledJobRegistry();
+    let rejectJob!: (reason: unknown) => void;
+    registry.register({ name: "failing", schedule: "* * * * *", handler: () => new Promise((_resolve, reject) => { rejectJob = reject; }) });
+    const runner = new ScheduledJobRunner(registry, 5);
+    const controller = new AbortController();
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    runner.start(controller.signal);
+    await vi.advanceTimersByTimeAsync(5);
+    controller.abort();
+    rejectJob(new Error("active job failed during shutdown"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+    expect(() => runner.start()).toThrow("closed");
+    vi.useRealTimers();
+  });
+
+  it("does not start later scheduled jobs after shutdown begins", async () => {
+    const registry = new ScheduledJobRegistry();
+    const events: string[] = [];
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    registry.register({ name: "first", schedule: "* * * * *", handler: async () => {
+      events.push("first:start");
+      await gate;
+      events.push("first:end");
+    } });
+    registry.register({ name: "second", schedule: "* * * * *", handler: () => { events.push("second:start"); } });
+    const runner = new ScheduledJobRunner(registry);
+    const run = runner.runDue(new Date("2026-07-21T00:00:00.000Z"));
+    await Promise.resolve();
+    const closing = runner.close();
+    releaseFirst();
+
+    await expect(run).resolves.toEqual(["first"]);
+    await expect(closing).resolves.toBeUndefined();
+    expect(events).toEqual(["first:start", "first:end"]);
+  });
+
+  it("aborts an in-flight outbox batch before another event starts", async () => {
+    const runtime = createJobsRuntime("Outbox shutdown");
+    await runtime.create(tenant, "customer", { name: "First" });
+    await runtime.create(tenant, "customer", { name: "Second" });
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let handled = 0;
+    const dispatcher = new OutboxDispatcher(runtime, tenant, async () => {
+      handled += 1;
+      if (handled === 1) { markStarted(); await gate; }
+    });
+    const run = dispatcher.runOnce();
+    await started;
+    const closing = dispatcher.close();
+    releaseFirst();
+
+    await expect(run).rejects.toBeDefined();
+    await expect(closing).rejects.toBeDefined();
+    expect(handled).toBe(1);
+  });
+
+  it("does not claim outbox events for pre-aborted dispatches", async () => {
+    const runtime = createJobsRuntime("Pre-aborted outbox");
+    await runtime.create(tenant, "customer", { name: "Pending" });
+    const controller = new AbortController();
+    controller.abort("cancel before claim");
+    const handler = vi.fn();
+
+    await expect(dispatchOutboxEvents(runtime, tenant, handler, { signal: controller.signal })).rejects.toBeDefined();
+    expect(handler).not.toHaveBeenCalled();
+    expect(await runtime.outboxEvents(tenant)).toEqual([expect.objectContaining({ status: "pending", attempts: 0 })]);
+
+    const dispatcher = new OutboxDispatcher(runtime, tenant, handler, { signal: controller.signal });
+    await expect(dispatcher.runOnce()).rejects.toBeDefined();
+    expect(handler).not.toHaveBeenCalled();
+    expect(await runtime.outboxEvents(tenant)).toEqual([expect.objectContaining({ status: "pending", attempts: 0 })]);
+    await dispatcher.close();
+  });
+
+  it("does not start a scheduled runner from a pre-aborted signal", async () => {
+    const runner = new ScheduledJobRunner(new ScheduledJobRegistry(), 5);
+    const controller = new AbortController();
+    controller.abort("cancel before start");
+    expect(() => runner.start(controller.signal)).toThrow();
+    expect(await runner.health()).toMatchObject({ details: { running: false } });
+    runner.start();
+    await runner.close();
   });
 });
 
