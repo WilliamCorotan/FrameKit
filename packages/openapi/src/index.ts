@@ -14,6 +14,7 @@ type JsonSchema = {
   additionalProperties?: boolean | JsonSchema;
   items?: JsonSchema;
   description?: string;
+  minimum?: number;
 };
 
 type Operation = {
@@ -51,10 +52,11 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
     },
     FramekitDiagnostics: {
       type: "object",
-      required: ["app", "repository", "modules", "doctypes"],
+      required: ["app", "repository", "mutations", "modules", "doctypes"],
       properties: {
         app: { type: "object", additionalProperties: true },
         repository: { type: "object", additionalProperties: true },
+        mutations: { type: "object", additionalProperties: true },
         modules: { type: "array", items: { type: "object", additionalProperties: true } },
         doctypes: { type: "array", items: { type: "object", additionalProperties: true } },
         warnings: { type: "array", items: { type: "string" } }
@@ -611,6 +613,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: `create${pascal(doctype.name)}`,
         summary: `Create a ${doctype.label} document`,
         tags: [doctype.label],
+        parameters: [idempotencyKeyParam()],
         requestBody: jsonBody(ref(inputName), true),
         responses: createdResponse(ref(recordName))
       }
@@ -627,7 +630,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: `update${pascal(doctype.name)}`,
         summary: `Update a ${doctype.label} document`,
         tags: [doctype.label],
-        parameters: [pathParam("id")],
+        parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
         requestBody: jsonBody(ref(patchName), true),
         responses: okResponse(ref(recordName))
       },
@@ -635,7 +638,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         operationId: `delete${pascal(doctype.name)}`,
         summary: `Delete a ${doctype.label} document`,
         tags: [doctype.label],
-        parameters: [pathParam("id")],
+        parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
         responses: {
           "204": { description: "Deleted" },
           ...errorResponses()
@@ -648,7 +651,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
           operationId: `transition${pascal(doctype.name)}`,
           summary: `Run a ${doctype.label} workflow transition`,
           tags: [doctype.label],
-          parameters: [pathParam("id")],
+          parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
           requestBody: jsonBody({
             type: "object",
             required: ["action"],
@@ -765,11 +768,12 @@ function roleWriteSchema(creating: boolean): JsonSchema {
 function documentRecordSchema(dataSchema: JsonSchema): JsonSchema {
   return {
     type: "object",
-    required: ["id", "doctype", "tenantId", "data", "createdAt", "updatedAt"],
+    required: ["id", "doctype", "tenantId", "revision", "data", "createdAt", "updatedAt"],
     properties: {
       id: { type: "string" },
       doctype: { type: "string" },
       tenantId: { type: "string" },
+      revision: { type: "integer" },
       data: dataSchema,
       state: { type: "string" },
       createdAt: { type: "string", format: "date-time" },
@@ -824,6 +828,14 @@ function queryParam(name: string, type: string) {
 
 function headerParam(name: string) {
   return { name, in: "header", required: false, schema: { type: "string" } };
+}
+
+function expectedRevisionParam() {
+  return { name: "If-Match", in: "header", required: false, schema: { type: "integer", minimum: 1 } };
+}
+
+function idempotencyKeyParam() {
+  return { name: "Idempotency-Key", in: "header", required: false, schema: { type: "string" } };
 }
 
 function schemaName(doctype: DocTypeDefinition, suffix: string): string {

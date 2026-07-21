@@ -126,6 +126,7 @@ export type DocumentRecord<TData extends DocumentData = DocumentData> = {
   id: string;
   doctype: string;
   tenantId: string;
+  revision: number;
   data: TData;
   state?: string;
   createdAt: string;

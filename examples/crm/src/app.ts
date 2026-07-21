@@ -7,6 +7,7 @@ import {
   PostgresCustomizationStore,
   PostgresDocumentRepository,
   PostgresMigrationStore,
+  PostgresMutationUnitOfWork,
   PostgresNamingSeriesStore,
   PostgresOutboxStore,
   PostgresRoleStore,
@@ -118,6 +119,7 @@ const outbox = await createOutboxStore();
 const customization = await createCustomizationStore();
 const namingSeries = await createNamingSeriesStore();
 const migrations = await createMigrationStore();
+const mutations = await createMutationUnitOfWork();
 const userStore = await createUserStore();
 const roleStore = await createRoleStore();
 const apiTokenStore = await createApiTokenStore();
@@ -130,6 +132,7 @@ export const runtime = createRuntime(app, {
   ...(customization ? { customization } : {}),
   ...(namingSeries ? { namingSeries } : {}),
   ...(migrations ? { migrations } : {}),
+  ...(mutations ? { mutations } : {}),
   realtime: eventBus
 });
 export const auth = new PasswordAuthService({
@@ -242,6 +245,13 @@ async function createMigrationStore() {
   });
   await migrations.migrate();
   return migrations;
+}
+
+async function createMutationUnitOfWork() {
+  if (!process.env.DATABASE_URL) return undefined;
+  const mutations = new PostgresMutationUnitOfWork({ connectionString: process.env.DATABASE_URL });
+  await mutations.migrate();
+  return mutations;
 }
 
 async function createUserStore() {

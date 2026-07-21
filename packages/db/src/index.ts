@@ -17,6 +17,8 @@ import {
   type MigrationRecord,
   type MigrationRollback,
   type MigrationStore,
+  type MutationCommand,
+  type MutationUnitOfWork,
   type NamingSeriesStore,
   type OutboxEvent,
   type OutboxStore,
@@ -31,6 +33,7 @@ export const framekitDocuments = pgTable(
     tenantId: text("tenant_id").notNull(),
     doctype: text("doctype").notNull(),
     id: text("id").notNull(),
+    revision: integer("revision").notNull().default(1),
     state: text("state"),
     data: jsonb("data").notNull().$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
@@ -123,6 +126,33 @@ export const framekitOutboxEvents = pgTable("framekit_outbox_events", {
   error: text("error")
 });
 
+export const framekitDocumentUniqueValues = pgTable(
+  "framekit_document_unique_values",
+  {
+    tenantId: text("tenant_id").notNull(),
+    doctype: text("doctype").notNull(),
+    field: text("field").notNull(),
+    value: text("value").notNull(),
+    documentId: text("document_id").notNull()
+  },
+  (table) => [
+    uniqueIndex("framekit_document_unique_value").on(table.tenantId, table.doctype, table.field, table.value),
+    uniqueIndex("framekit_document_unique_field").on(table.tenantId, table.doctype, table.documentId, table.field)
+  ]
+);
+
+export const framekitIdempotencyKeys = pgTable(
+  "framekit_idempotency_keys",
+  {
+    tenantId: text("tenant_id").notNull(),
+    key: text("key").notNull(),
+    fingerprint: text("fingerprint").notNull(),
+    result: jsonb("result").$type<DocumentRecord | null>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull()
+  },
+  (table) => [uniqueIndex("framekit_idempotency_identity").on(table.tenantId, table.key)]
+);
+
 export const framekitCustomFields = pgTable("framekit_custom_fields", {
   tenantId: text("tenant_id").notNull(),
   id: text("id").notNull(),
@@ -172,6 +202,12 @@ export type PostgresRepositoryOptions = {
   max?: number;
 };
 
+export type PostgresMutationStage = "document" | "hooks" | "audit" | "outbox" | "idempotency";
+
+export type PostgresMutationUnitOfWorkOptions = PostgresRepositoryOptions & {
+  faultInjector?: (stage: PostgresMutationStage, command: MutationCommand) => void | Promise<void>;
+};
+
 export class PostgresDocumentRepository implements DocumentRepository {
   private readonly db: PostgresJsDatabase;
 
@@ -213,6 +249,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
       tenantId: record.tenantId,
       doctype: record.doctype,
       id: record.id,
+      revision: record.revision,
       state: record.state,
       data: record.data,
       createdAt: new Date(record.createdAt),
@@ -221,26 +258,161 @@ export class PostgresDocumentRepository implements DocumentRepository {
     return record;
   }
 
-  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord> {
+  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number } = {}): Promise<DocumentRecord> {
+    const conditions = [eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, record.id)];
+    if (options.expectedRevision !== undefined) conditions.push(eq(framekitDocuments.revision, options.expectedRevision));
     const rows = await this.db
       .update(framekitDocuments)
       .set({
+        revision: record.revision,
         state: record.state,
         data: record.data,
         updatedAt: new Date(record.updatedAt)
       })
-      .where(and(eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, record.id)))
+      .where(and(...conditions))
       .returning();
     if (!rows[0]) {
+      const current = await this.get(tenant, doctype, record.id);
+      if (current && options.expectedRevision !== undefined) {
+        throw postgresRevisionConflict(doctype.name, record.id, options.expectedRevision, current.revision);
+      }
       throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${record.id}" does not exist`, 404);
     }
     return rowToRecord(rows[0]);
   }
 
-  async delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<void> {
-    await this.db
+  async delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { expectedRevision?: number } = {}): Promise<void> {
+    const conditions = [eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id)];
+    if (options.expectedRevision !== undefined) conditions.push(eq(framekitDocuments.revision, options.expectedRevision));
+    const rows = await this.db
       .delete(framekitDocuments)
-      .where(and(eq(framekitDocuments.tenantId, tenant.tenantId), eq(framekitDocuments.doctype, doctype.name), eq(framekitDocuments.id, id)));
+      .where(and(...conditions))
+      .returning({ revision: framekitDocuments.revision });
+    if (!rows[0]) {
+      const current = await this.get(tenant, doctype, id);
+      if (current && options.expectedRevision !== undefined) {
+        throw postgresRevisionConflict(doctype.name, id, options.expectedRevision, current.revision);
+      }
+      throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
+    }
+  }
+}
+
+export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
+  private readonly sql: Sql;
+  private readonly faultInjector?: PostgresMutationUnitOfWorkOptions["faultInjector"];
+
+  constructor(options: PostgresMutationUnitOfWorkOptions) {
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.faultInjector = options.faultInjector;
+  }
+
+  async migrate(): Promise<void> {
+    await this.sql.unsafe(createMutationTablesSql());
+  }
+
+  describe(): RepositoryDiagnostics {
+    return {
+      kind: "postgres",
+      durable: true,
+      features: ["atomic-mutations", "optimistic-concurrency", "durable-uniqueness", "idempotency"]
+    };
+  }
+
+  async replay(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<{ found: boolean; result?: DocumentRecord }> {
+    const rows = await this.sql<{ fingerprint: string; result: DocumentRecord | null }[]>`
+      select fingerprint, result
+      from framekit_idempotency_keys
+      where tenant_id = ${tenant.tenantId} and key = ${idempotencyKey}
+      limit 1
+    `;
+    if (!rows[0]) return { found: false };
+    assertIdempotencyFingerprint(idempotencyKey, fingerprint, rows[0].fingerprint);
+    return rows[0].result ? { found: true, result: rows[0].result } : { found: true };
+  }
+
+  async execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }> {
+    try {
+      return await this.sql.begin(async (tx) => {
+        if (command.idempotencyKey) {
+          await tx`select pg_advisory_xact_lock(hashtextextended(${`${command.tenant.tenantId}:${command.idempotencyKey}`}, 0))`;
+          const replay = await tx<{ fingerprint: string; result: DocumentRecord | null }[]>`
+            select fingerprint, result
+            from framekit_idempotency_keys
+            where tenant_id = ${command.tenant.tenantId} and key = ${command.idempotencyKey}
+            limit 1
+          `;
+          if (replay[0]) {
+            assertIdempotencyFingerprint(command.idempotencyKey, command.idempotencyFingerprint, replay[0].fingerprint);
+            return { document: replay[0].result ?? undefined, replayed: true };
+          }
+        }
+
+        let result: DocumentRecord | undefined;
+        if (command.operation === "create") {
+          await tx`
+            insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+            values (
+              ${command.document.tenantId}, ${command.document.doctype}, ${command.document.id}, ${command.document.revision},
+              ${command.document.state ?? null}, ${tx.json(command.document.data as postgres.JSONValue)}, ${command.document.createdAt}, ${command.document.updatedAt}
+            )
+          `;
+          result = command.document;
+          await replaceUniqueValues(tx, command);
+        } else if (command.operation === "update") {
+          const rows = await tx<{ revision: number }[]>`
+            update framekit_documents
+            set revision = ${command.document.revision}, state = ${command.document.state ?? null},
+                data = ${tx.json(command.document.data as postgres.JSONValue)}, updated_at = ${command.document.updatedAt}
+            where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
+              and id = ${command.document.id} and revision = ${command.expectedRevision!}
+            returning revision
+          `;
+          if (!rows[0]) await throwMutationWriteFailure(tx, command);
+          result = command.document;
+          await replaceUniqueValues(tx, command);
+        } else {
+          const rows = await tx<{ revision: number }[]>`
+            delete from framekit_documents
+            where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
+              and id = ${command.document.id} and revision = ${command.expectedRevision!}
+            returning revision
+          `;
+          if (!rows[0]) await throwMutationWriteFailure(tx, command);
+          await tx`
+            delete from framekit_document_unique_values
+            where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name} and document_id = ${command.document.id}
+          `;
+        }
+
+        await this.faultInjector?.("document", command);
+        await command.afterWrite();
+        await this.faultInjector?.("hooks", command);
+        await tx`
+          insert into framekit_audit_events (tenant_id, id, user_id, action, doctype, document_id, created_at)
+          values (${command.audit.tenantId}, ${command.audit.id}, ${command.audit.userId}, ${command.audit.action},
+                  ${command.audit.doctype}, ${command.audit.documentId}, ${command.audit.createdAt})
+        `;
+        await this.faultInjector?.("audit", command);
+        await tx`
+          insert into framekit_outbox_events (tenant_id, id, type, topic, payload, status, attempts, created_at, processed_at, error)
+          values (${command.outbox.tenantId}, ${command.outbox.id}, ${command.outbox.type}, ${command.outbox.topic},
+                  ${tx.json(command.outbox.payload as postgres.JSONValue)}, ${command.outbox.status}, ${command.outbox.attempts}, ${command.outbox.createdAt}, null, null)
+        `;
+        await this.faultInjector?.("outbox", command);
+        if (command.idempotencyKey) {
+          await tx`
+            insert into framekit_idempotency_keys (tenant_id, key, fingerprint, result, created_at)
+            values (${command.tenant.tenantId}, ${command.idempotencyKey}, ${command.idempotencyFingerprint},
+                    ${result ? tx.json(result as unknown as postgres.JSONValue) : null}, now())
+          `;
+        }
+        await this.faultInjector?.("idempotency", command);
+        return { document: result, replayed: false };
+      });
+    } catch (error) {
+      throw mapMutationError(error, command);
+    }
   }
 }
 
@@ -744,13 +916,38 @@ create table if not exists framekit_documents (
   tenant_id text not null,
   doctype text not null,
   id text not null,
+  revision integer not null default 1,
   state text,
   data jsonb not null,
   created_at timestamptz not null,
   updated_at timestamptz not null,
   constraint framekit_documents_identity unique (tenant_id, doctype, id)
 );
+alter table framekit_documents add column if not exists revision integer not null default 1;
 create index if not exists framekit_documents_lookup on framekit_documents (tenant_id, doctype, updated_at desc);
+`;
+}
+
+export function createMutationTablesSql(): string {
+  return `
+alter table framekit_documents add column if not exists revision integer not null default 1;
+create table if not exists framekit_document_unique_values (
+  tenant_id text not null,
+  doctype text not null,
+  field text not null,
+  value text not null,
+  document_id text not null,
+  constraint framekit_document_unique_value unique (tenant_id, doctype, field, value),
+  constraint framekit_document_unique_field unique (tenant_id, doctype, document_id, field)
+);
+create table if not exists framekit_idempotency_keys (
+  tenant_id text not null,
+  key text not null,
+  fingerprint text not null,
+  result jsonb,
+  created_at timestamptz not null,
+  constraint framekit_idempotency_identity unique (tenant_id, key)
+);
 `;
 }
 
@@ -1022,11 +1219,72 @@ function sqlLiteralJson(value: unknown): string {
   return sqlLiteral(JSON.stringify(value));
 }
 
+async function replaceUniqueValues(sql: postgres.TransactionSql, command: MutationCommand): Promise<void> {
+  await sql`
+    delete from framekit_document_unique_values
+    where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name} and document_id = ${command.document.id}
+  `;
+  for (const field of command.doctype.fields.filter((candidate) => candidate.unique)) {
+    const value = command.document.data[field.name];
+    if (value === undefined || value === null || value === "") continue;
+    await sql`
+      insert into framekit_document_unique_values (tenant_id, doctype, field, value, document_id)
+      values (${command.tenant.tenantId}, ${command.doctype.name}, ${field.name}, ${canonicalUniqueValue(value)}, ${command.document.id})
+    `;
+  }
+}
+
+async function throwMutationWriteFailure(sql: postgres.TransactionSql, command: MutationCommand): Promise<never> {
+  const rows = await sql<{ revision: number }[]>`
+    select revision from framekit_documents
+    where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name} and id = ${command.document.id}
+    limit 1
+  `;
+  if (!rows[0]) {
+    throw new FramekitError("DOCUMENT_NOT_FOUND", `${command.doctype.name} "${command.document.id}" does not exist`, 404);
+  }
+  throw postgresRevisionConflict(command.doctype.name, command.document.id, command.expectedRevision!, rows[0].revision);
+}
+
+function canonicalUniqueValue(value: unknown): string {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function postgresRevisionConflict(doctype: string, id: string, expectedRevision: number, actualRevision: number): FramekitError {
+  return new FramekitError("REVISION_CONFLICT", `${doctype} "${id}" changed since it was read`, 409, {
+    doctype,
+    id,
+    expectedRevision,
+    actualRevision
+  });
+}
+
+function assertIdempotencyFingerprint(key: string, expected: string, actual: string): void {
+  if (expected !== actual) {
+    throw new FramekitError("IDEMPOTENCY_KEY_REUSED", `Idempotency key "${key}" was already used for another command`, 409, { key });
+  }
+}
+
+function mapMutationError(error: unknown, command: MutationCommand): unknown {
+  if (error instanceof FramekitError) return error;
+  const postgresError = error as { code?: string; constraint_name?: string };
+  if (postgresError.code === "23505") {
+    if (postgresError.constraint_name === "framekit_document_unique_value") {
+      return new FramekitError("UNIQUE_CONSTRAINT_FAILED", `${command.doctype.name} contains a duplicate unique value`, 409, {
+        doctype: command.doctype.name
+      });
+    }
+    return new FramekitError("DOCUMENT_EXISTS", `${command.doctype.name} "${command.document.id}" already exists`, 409);
+  }
+  return error;
+}
+
 function rowToRecord(row: typeof framekitDocuments.$inferSelect): DocumentRecord {
   return {
     tenantId: row.tenantId,
     doctype: row.doctype,
     id: row.id,
+    revision: row.revision,
     state: row.state ?? undefined,
     data: row.data,
     createdAt: row.createdAt.toISOString(),

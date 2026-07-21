@@ -221,7 +221,23 @@ describe("runtime document service", () => {
 
     await expect(runtime.create(tenant, "customer", { name: "Duplicate", email: "owner@example.com" })).rejects.toMatchObject({ code: "UNIQUE_CONSTRAINT_FAILED" });
     await expect(runtime.update(tenant, "customer", second.id, { email: "owner@example.com" })).rejects.toMatchObject({ code: "UNIQUE_CONSTRAINT_FAILED" });
-    await expect(runtime.update(tenant, "customer", first.id, { name: "First renamed" })).resolves.toMatchObject({ id: first.id, data: { email: "owner@example.com" } });
+    const updated = await runtime.update(tenant, "customer", first.id, { name: "First renamed" }, { expectedRevision: 1 });
+    expect(updated).toMatchObject({ id: first.id, revision: 2, data: { email: "owner@example.com" } });
+    await expect(runtime.update(tenant, "customer", first.id, { name: "Stale" }, { expectedRevision: 1 })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+
+    const concurrent = await Promise.allSettled([
+      runtime.create(tenant, "customer", { name: "Concurrent A", email: "race@example.com" }),
+      runtime.create(tenant, "customer", { name: "Concurrent B", email: "race@example.com" })
+    ]);
+    expect(concurrent.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(concurrent.filter((result) => result.status === "rejected")).toHaveLength(1);
+
+    const [retried, replay] = await Promise.all([
+      runtime.create(tenant, "customer", { name: "Retried", email: "retry@example.com" }, { idempotencyKey: "memory-create-1" }),
+      runtime.create(tenant, "customer", { name: "Retried", email: "retry@example.com" }, { idempotencyKey: "memory-create-1" })
+    ]);
+    expect(replay).toEqual(retried);
+    await expect(runtime.list(tenant, "customer", { filters: { email: "retry@example.com" } })).resolves.toHaveLength(1);
   });
 
   it("runs workflow transitions", async () => {

@@ -8,6 +8,8 @@ import {
   PostgresCustomizationStore,
   PostgresDocumentRepository,
   PostgresMigrationStore,
+  PostgresMutationUnitOfWork,
+  type PostgresMutationStage,
   PostgresNamingSeriesStore,
   PostgresOutboxStore,
   PostgresRoleStore,
@@ -60,6 +62,7 @@ const app = defineApp({
 
 describe.skipIf(!connectionString)("Postgres durable stores", () => {
   const sql = postgres(connectionString!, { max: 1 });
+  let injectedStage: PostgresMutationStage | undefined;
   const stores = {
     repository: new PostgresDocumentRepository({ connectionString: connectionString! }),
     audit: new PostgresAuditStore({ connectionString: connectionString! }),
@@ -67,6 +70,12 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     customization: new PostgresCustomizationStore({ connectionString: connectionString! }),
     namingSeries: new PostgresNamingSeriesStore({ connectionString: connectionString! }),
     migrations: new PostgresMigrationStore({ connectionString: connectionString! }),
+    mutations: new PostgresMutationUnitOfWork({
+      connectionString: connectionString!,
+      faultInjector: (stage) => {
+        if (stage === injectedStage) throw new Error(`injected ${stage} failure`);
+      }
+    }),
     userStore: new PostgresUserStore({ connectionString: connectionString! }),
     roleStore: new PostgresRoleStore({ connectionString: connectionString! }),
     apiTokenStore: new PostgresApiTokenStore({ connectionString: connectionString! }),
@@ -92,7 +101,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       customization: stores.customization,
       namingSeries: stores.namingSeries,
       migrations: stores.migrations,
-      idGenerator: createIdGenerator(),
+      mutations: stores.mutations,
+      idGenerator: createIdGenerator("main"),
       now: () => new Date("2026-07-06T00:00:00.000Z")
     });
 
@@ -183,6 +193,141 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await stores.sessionRevocations.revoke("pg-integration-session", new Date(Date.now() - 60_000).toISOString());
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(false);
   });
+
+  it("enforces concurrent uniqueness and optimistic revisions", async () => {
+    const runtime = createRuntime(app, {
+      repository: stores.repository,
+      audit: stores.audit,
+      outbox: stores.outbox,
+      mutations: stores.mutations,
+      idGenerator: createIdGenerator("concurrency")
+    });
+
+    const duplicates = await Promise.allSettled([
+      runtime.create(tenant, "customer", { name: "Concurrent One", external_id: "RACE-001" }),
+      runtime.create(tenant, "customer", { name: "Concurrent Two", external_id: "RACE-001" })
+    ]);
+    expect(duplicates.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(duplicates.filter((result) => result.status === "rejected")).toEqual([
+      expect.objectContaining({ reason: expect.objectContaining({ code: "UNIQUE_CONSTRAINT_FAILED" }) })
+    ]);
+
+    const created = await runtime.create(tenant, "customer", { name: "Revision Target", external_id: "REV-001" });
+    expect(created.revision).toBe(1);
+    const updates = await Promise.allSettled([
+      runtime.update(tenant, "customer", created.id, { status: "paused" }, { expectedRevision: 1 }),
+      runtime.update(tenant, "customer", created.id, { status: "active" }, { expectedRevision: 1 })
+    ]);
+    expect(updates.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(updates.filter((result) => result.status === "rejected")).toEqual([
+      expect.objectContaining({ reason: expect.objectContaining({ code: "REVISION_CONFLICT" }) })
+    ]);
+    await expect(runtime.get(tenant, "customer", created.id)).resolves.toMatchObject({ revision: 2 });
+    await expect(runtime.delete(tenant, "customer", created.id, { expectedRevision: 1 })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+  });
+
+  it("rolls back document, audit, and outbox writes when a post-write stage fails", async () => {
+    const failingApp = defineApp({
+      name: "Postgres Fault Injection",
+      modules: [defineModule({
+        id: "faults",
+        name: "Faults",
+        doctypes: [customerDocType],
+        hooks: { afterInsert: { customer: [() => { throw new Error("injected after-write failure"); }] } }
+      })]
+    });
+    const runtime = createRuntime(failingApp, {
+      repository: stores.repository,
+      audit: stores.audit,
+      outbox: stores.outbox,
+      mutations: stores.mutations,
+      idGenerator: createIdGenerator("fault")
+    });
+
+    await expect(runtime.create(tenant, "customer", { name: "Atomic Failure", external_id: "FAULT-001" })).rejects.toThrow("injected after-write failure");
+    await expect(runtime.get(tenant, "customer", "atomic-failure")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    await expect(stores.audit.list(tenant)).resolves.not.toEqual(expect.arrayContaining([expect.objectContaining({ documentId: "atomic-failure" })]));
+    await expect(stores.outbox.list(tenant)).resolves.not.toEqual(expect.arrayContaining([expect.objectContaining({ payload: expect.objectContaining({ id: "atomic-failure" }) })]));
+  });
+
+  it("rolls back the entire transaction when every durable mutation stage is faulted", async () => {
+    const runtime = createRuntime(app, {
+      repository: stores.repository,
+      audit: stores.audit,
+      outbox: stores.outbox,
+      mutations: stores.mutations,
+      idGenerator: createIdGenerator("stages")
+    });
+
+    try {
+      for (const stage of ["document", "hooks", "audit", "outbox", "idempotency"] satisfies PostgresMutationStage[]) {
+        injectedStage = stage;
+        const id = `fault-${stage}`;
+        await expect(runtime.create(tenant, "customer", {
+          name: id,
+          external_id: `STAGE-${stage}`
+        }, { idempotencyKey: `fault-${stage}` })).rejects.toThrow(`injected ${stage} failure`);
+        await expect(runtime.get(tenant, "customer", id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+        expect((await stores.audit.list(tenant)).filter((event) => event.documentId === id)).toHaveLength(0);
+        expect((await stores.outbox.list(tenant)).filter((event) => event.payload.id === id)).toHaveLength(0);
+      }
+    } finally {
+      injectedStage = undefined;
+    }
+
+    const target = await runtime.create(tenant, "customer", { name: "Mutation Rollback", external_id: "ROLLBACK-001" });
+    try {
+      injectedStage = "outbox";
+      await expect(runtime.update(tenant, "customer", target.id, { status: "paused" }, { expectedRevision: 1 })).rejects.toThrow("injected outbox failure");
+      await expect(runtime.get(tenant, "customer", target.id)).resolves.toMatchObject({ revision: 1, data: { status: "active" } });
+      injectedStage = "audit";
+      await expect(runtime.delete(tenant, "customer", target.id, { expectedRevision: 1 })).rejects.toThrow("injected audit failure");
+      await expect(runtime.get(tenant, "customer", target.id)).resolves.toMatchObject({ revision: 1 });
+    } finally {
+      injectedStage = undefined;
+    }
+  });
+
+  it("replays idempotent commands without duplicating durable effects", async () => {
+    const runtime = createRuntime(app, {
+      repository: stores.repository,
+      audit: stores.audit,
+      outbox: stores.outbox,
+      mutations: stores.mutations,
+      idGenerator: createIdGenerator("retry")
+    });
+    const [first, replay] = await Promise.all([
+      runtime.create(tenant, "customer", { name: "Retry Customer", external_id: "RETRY-001" }, { idempotencyKey: "create-retry-1" }),
+      runtime.create(tenant, "customer", { name: "Retry Customer", external_id: "RETRY-001" }, { idempotencyKey: "create-retry-1" })
+    ]);
+    expect(replay).toEqual(first);
+    await expect(runtime.list(tenant, "customer", { filters: { external_id: "RETRY-001" } })).resolves.toHaveLength(1);
+    await expect(stores.audit.list(tenant)).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ documentId: first.id })]));
+    const matchingAudit = (await stores.audit.list(tenant)).filter((event) => event.documentId === first.id);
+    expect(matchingAudit).toHaveLength(1);
+
+    const updated = await runtime.update(tenant, "customer", first.id, { status: "paused" }, { expectedRevision: 1, idempotencyKey: "update-retry-1" });
+    const updateReplay = await runtime.update(tenant, "customer", first.id, { status: "paused" }, { expectedRevision: 1, idempotencyKey: "update-retry-1" });
+    expect(updateReplay).toEqual(updated);
+    await expect(runtime.update(tenant, "customer", first.id, { status: "active" }, { expectedRevision: 1, idempotencyKey: "update-retry-1" })).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+  });
+
+  it("commits the durable outbox before publishing realtime", async () => {
+    const runtime = createRuntime(app, {
+      repository: stores.repository,
+      audit: stores.audit,
+      outbox: stores.outbox,
+      mutations: stores.mutations,
+      realtime: { publish: () => { throw new Error("realtime unavailable"); } },
+      idGenerator: createIdGenerator("realtime")
+    });
+
+    await expect(runtime.create(tenant, "customer", { name: "Publish Failure", external_id: "REALTIME-001" })).rejects.toThrow("realtime unavailable");
+    await expect(runtime.get(tenant, "customer", "publish-failure")).resolves.toMatchObject({ revision: 1 });
+    await expect(stores.outbox.list(tenant, { status: "pending" })).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "customer.created", payload: expect.objectContaining({ id: "publish-failure", revision: 1 }) })
+    ]));
+  });
 });
 
 type StoreSet = {
@@ -192,6 +337,7 @@ type StoreSet = {
   customization: PostgresCustomizationStore;
   namingSeries: PostgresNamingSeriesStore;
   migrations: PostgresMigrationStore;
+  mutations: PostgresMutationUnitOfWork;
   userStore: PostgresUserStore;
   roleStore: PostgresRoleStore;
   apiTokenStore: PostgresApiTokenStore;
@@ -205,6 +351,7 @@ async function migrateAll(stores: StoreSet) {
   await stores.customization.migrate();
   await stores.namingSeries.migrate();
   await stores.migrations.migrate();
+  await stores.mutations.migrate();
   await stores.userStore.migrate();
   await stores.roleStore.migrate();
   await stores.apiTokenStore.migrate();
@@ -230,13 +377,15 @@ async function cleanup(sql: postgres.Sql) {
   await sql`delete from framekit_views where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_naming_series where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_migrations where tenant_id = ${tenant.tenantId}`;
+  await sql`delete from framekit_document_unique_values where tenant_id = ${tenant.tenantId}`;
+  await sql`delete from framekit_idempotency_keys where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_users where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_roles where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_api_tokens where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_session_revocations where session_id = 'pg-integration-session'`;
 }
 
-function createIdGenerator() {
+function createIdGenerator(namespace = "default") {
   let counter = 0;
-  return () => `pg-integration-${++counter}`;
+  return () => `pg-integration-${namespace}-${++counter}`;
 }

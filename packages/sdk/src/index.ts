@@ -69,6 +69,11 @@ export type ListDocumentsOptions = {
   };
 };
 
+export type MutationRequestOptions = {
+  expectedRevision?: number;
+  idempotencyKey?: string;
+};
+
 export class FramekitClient {
   private readonly baseUrl: string;
   private readonly tenant: Partial<TenantContext>;
@@ -284,23 +289,27 @@ export class FramekitClient {
     return this.request(`/api/doctypes/${doctype}/${id}`);
   }
 
-  create<TData extends DocumentData = DocumentData>(doctype: string, data: TData): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}`, { method: "POST", body: data });
+  create<TData extends DocumentData = DocumentData>(doctype: string, data: TData, options: Omit<MutationRequestOptions, "expectedRevision"> = {}): Promise<DocumentRecord<TData>> {
+    return this.request(`/api/doctypes/${doctype}`, { method: "POST", body: data, headers: mutationHeaders(options) });
   }
 
-  update<TData extends DocumentData = DocumentData>(doctype: string, id: string, data: Partial<TData>): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}/${id}`, { method: "PATCH", body: data });
+  update<TData extends DocumentData = DocumentData>(doctype: string, id: string, data: Partial<TData>, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
+    return this.request(`/api/doctypes/${doctype}/${id}`, { method: "PATCH", body: data, headers: mutationHeaders(options) });
   }
 
-  transition<TData extends DocumentData = DocumentData>(doctype: string, id: string, action: string): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}/${id}/transition`, { method: "POST", body: { action } });
+  delete(doctype: string, id: string, options: MutationRequestOptions = {}): Promise<void> {
+    return this.request(`/api/doctypes/${doctype}/${id}`, { method: "DELETE", headers: mutationHeaders(options) });
   }
 
-  private request<T>(path: string, options: { method?: string; body?: unknown; skipAuth?: boolean } = {}): Promise<T> {
+  transition<TData extends DocumentData = DocumentData>(doctype: string, id: string, action: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
+    return this.request(`/api/doctypes/${doctype}/${id}/transition`, { method: "POST", body: { action }, headers: mutationHeaders(options) });
+  }
+
+  private request<T>(path: string, options: { method?: string; body?: unknown; skipAuth?: boolean; headers?: Record<string, string> } = {}): Promise<T> {
     return ofetch<T>(this.baseUrl + path, {
       method: options.method,
       body: options.body as Record<string, unknown> | undefined,
-      headers: this.headers(options.skipAuth),
+      headers: { ...this.headers(options.skipAuth), ...options.headers },
       credentials: this.credentials
     });
   }
@@ -371,6 +380,13 @@ function listQuery(options: ListDocumentsOptions): string {
   }
   const query = params.toString();
   return query ? `?${query}` : "";
+}
+
+function mutationHeaders(options: MutationRequestOptions): Record<string, string> {
+  return {
+    ...(options.expectedRevision === undefined ? {} : { "if-match": String(options.expectedRevision) }),
+    ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {})
+  };
 }
 
 function tsType(field: FieldDefinition): string {
