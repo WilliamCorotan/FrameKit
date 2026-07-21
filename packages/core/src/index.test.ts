@@ -122,4 +122,18 @@ describe("core metadata", () => {
     expect(rowPolicyScope({ ...alice, roles: ["manager"] }, note, "read")).toBe("all");
     expect(rowPolicyScope({ ...alice, permissions: ["note.manage"] }, note, "write")).toBe("all");
   });
+
+  it("validates command metadata and cross-module identities", () => {
+    const record = defineDocType({ name: "record", label: "Record", fields: [] });
+    const command = { id: "bulk-update", label: "Bulk update", permission: "records.bulk", doctypes: [record.name], operations: ["update" as const] };
+    expect(defineApp({ name: "Commands", modules: [defineModule({ id: "records", name: "Records", doctypes: [record], commands: [command] })] })
+      .modules[0]?.commands[0]).toMatchObject({ ...command, mode: "atomic", maxOperations: 100 });
+    expect(() => defineApp({ name: "Unknown target", modules: [defineModule({
+      id: "records", name: "Records", doctypes: [record], commands: [{ ...command, doctypes: ["missing"] }]
+    })] })).toThrow(/targets unknown DocType "missing"/);
+    expect(() => defineApp({ name: "Duplicate commands", modules: [
+      defineModule({ id: "left", name: "Left", doctypes: [record], commands: [command] }),
+      defineModule({ id: "right", name: "Right", commands: [{ ...command, doctypes: [record.name] }] })
+    ] })).toThrow(/Duplicate command id/);
+  });
 });

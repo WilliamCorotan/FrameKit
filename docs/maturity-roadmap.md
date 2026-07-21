@@ -28,10 +28,10 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 
 | Component | Implementation | In place | Missing or incomplete |
 | --- | ---: | --- | --- |
-| Core metadata and domain model | 82% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, immutable ownership, composable row policies, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics, localization, typed settings |
-| Runtime and command lifecycle | 92% | CRUD, ordered validation/hooks, draft-submit-cancel lifecycle, post-submit immutability, atomic durable commands, revisions, idempotency, audit/outbox/realtime, diagnostics, and ordered start/close/dispose | Bulk/cross-document commands and deeper cancellation propagation |
+| Core metadata and domain model | 84% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, immutable ownership, composable row policies, typed command metadata, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics, localization, typed settings |
+| Runtime and command lifecycle | 97% | CRUD, ordered validation/hooks, document lifecycle, ownership transfer, permission and row-policy gates, atomic bulk commands, explicit saga compensation, revisions, idempotency, audit/outbox/realtime, diagnostics, and ordered start/close/dispose | Durable long-running saga coordinator and deeper cancellation propagation |
 | Data, query, and persistence | 84% | In-memory and Postgres adapters, pushed-down filters/sorts/projections, opaque cursors, durable uniqueness, revisions, locking, and atomic document/outbox persistence | Load/performance evidence, sharding/partition guidance, broader physical schema modeling |
-| HTTP API and OpenAPI | 82% | Secure routing defaults, broad Nitro/OpenAPI surface, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
+| HTTP API and OpenAPI | 85% | Secure routing defaults, broad Nitro/OpenAPI surface including typed command execution, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
 | Authentication and IAM | 78% | Password sessions, cookies, refresh/logout/revocation, lockout, API tokens, roles, durable audit and identity links, OIDC discovery/JWKS authorization-code/PKCE, single-use invitations and recovery, forged-header and cross-tenant protection | Native WebAuthn/TOTP enrollment and step-up assurance policy; provider-enforced MFA is the current production scope |
 | Schema evolution | 94% | Executable HTTP/CLI contract, schema fingerprints, full DocType diffs, checksums, destructive and irreversible guards, atomic apply/rollback, versioned deterministic conversion hooks, durable approval evidence, resumable chunk checkpoints, bounded tenant/app locking, drift/replay guards, and legacy uniqueness backfill | Physical-schema inspection beyond managed indexes, automated dual-read/write rollout coordination, and production-scale migration performance evidence |
 | Jobs, events, and realtime | 85% | BullMQ queues/workers, atomic outbox leases, retry/backoff/dead-letter behavior, idempotency keys, scheduling, Postgres fanout/replay, SSE, lifecycle and cancellation | Operational load evidence, poison-message tooling, richer scheduler persistence |
@@ -77,6 +77,7 @@ Exit criteria:
 1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26) — bounded 1.0 contract and [#41 ownership/row policies](https://github.com/WilliamCorotan/FrameKit/issues/41) implemented; deferred primitives are tracked by [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), and [#42](https://github.com/WilliamCorotan/FrameKit/issues/42).
 2. [#27 Add production lifecycle, observability, compatibility, and supply-chain gates](https://github.com/WilliamCorotan/FrameKit/issues/27) — implemented by this change; closes when merged.
 3. [#46 Add approved, resumable online schema conversions](https://github.com/WilliamCorotan/FrameKit/issues/46)
+4. [#45 Add bulk and cross-document command orchestration](https://github.com/WilliamCorotan/FrameKit/issues/45)
 
 Exit criteria:
 
@@ -87,10 +88,11 @@ Exit criteria:
 
 ## Highest-Risk Technical Findings
 
-1. The metadata model still lacks the selected child-record, attachment, ownership, computed-field, localization, and decimal semantics required for 1.0.
+1. The metadata model still lacks the selected child-record, attachment, computed-field, localization, and decimal semantics required for 1.0.
 2. Compatibility gates prove supported combinations functionally, but sustained load, soak, and infrastructure fault testing remain limited.
 3. Nitro and H3 remain pre-release dependencies; upgrades require explicit compatibility evidence.
 4. OpenTelemetry adapters are exporter-neutral and tested for redaction, but production sampling, alerting, and SLOs remain operator responsibilities.
+5. Sagas compensate local steps but do not yet have a durable long-running coordinator for crash recovery across external systems.
 5. Community support is best-effort; there is no commercial incident-response commitment.
 6. Online conversion state is durable and resumable; physical-schema drift outside managed indexes and automated compatibility-window coordination remain incomplete.
 

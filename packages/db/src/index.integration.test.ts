@@ -958,6 +958,52 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(runtime.update(tenant, "customer", first.id, { status: "active" }, { expectedRevision: 1, idempotencyKey: "update-retry-1" })).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
   });
 
+  it("executes cross-DocType command batches atomically with replay and stale-revision rollback", async () => {
+    const commandTenant = { ...tenant, tenantId: "pg_command_batch_tenant" };
+    const commandApp = defineApp({ name: "Postgres Commands", modules: [defineModule({
+      id: "commands", name: "Commands", doctypes: [customerDocType, dealDocType], commands: [{
+        id: "customer-deal", label: "Customer and deal", permission: "commands.manage", mode: "atomic",
+        doctypes: [customerDocType.name, dealDocType.name], operations: ["create", "update", "delete"], maxOperations: 10
+      }]
+    })] });
+    const runtime = createRuntime(commandApp, {
+      repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
+      idGenerator: createIdGenerator("command")
+    });
+    try {
+      const request = { operations: [
+        { operation: "create" as const, doctype: customerDocType.name, id: "command-customer", data: { name: "Command Customer", external_id: "COMMAND-001" } },
+        { operation: "create" as const, doctype: dealDocType.name, id: "command-deal", data: { title: "Command Deal" } }
+      ], idempotencyKey: "customer-deal-1" };
+      const applied = await runtime.executeDocumentCommand(commandTenant, "customer-deal", request);
+      expect(applied).toMatchObject({ replayed: false, documents: [{ id: "command-customer" }, { id: "command-deal" }] });
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", request)).resolves.toMatchObject({ replayed: true });
+      expect((await stores.audit.list(commandTenant)).filter((event) => ["command-customer", "command-deal"].includes(event.documentId))).toHaveLength(2);
+
+      injectedStage = "outbox";
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [
+        { operation: "create", doctype: customerDocType.name, id: "fault-customer", data: { name: "Fault", external_id: "COMMAND-FAULT" } },
+        { operation: "create", doctype: dealDocType.name, id: "fault-deal", data: { title: "Fault" } }
+      ] })).rejects.toThrow("injected outbox failure");
+      injectedStage = undefined;
+      await expect(runtime.get(commandTenant, customerDocType.name, "fault-customer")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+      await expect(runtime.get(commandTenant, dealDocType.name, "fault-deal")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [
+        { operation: "update", doctype: customerDocType.name, id: "command-customer", expectedRevision: 1, data: { status: "paused" } },
+        { operation: "update", doctype: dealDocType.name, id: "command-deal", expectedRevision: 99, data: { title: "Stale" } }
+      ] })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+      await expect(runtime.get(commandTenant, customerDocType.name, "command-customer")).resolves.toMatchObject({ revision: 1, data: { status: "active" } });
+    } finally {
+      injectedStage = undefined;
+      await sql`delete from framekit_document_unique_values where tenant_id = ${commandTenant.tenantId}`;
+      await sql`delete from framekit_idempotency_keys where tenant_id = ${commandTenant.tenantId}`;
+      await sql`delete from framekit_audit_events where tenant_id = ${commandTenant.tenantId}`;
+      await sql`delete from framekit_outbox_events where tenant_id = ${commandTenant.tenantId}`;
+      await sql`delete from framekit_documents where tenant_id = ${commandTenant.tenantId}`;
+    }
+  });
+
   it("commits the durable outbox before publishing realtime", async () => {
     const runtime = createRuntime(app, {
       repository: stores.repository,

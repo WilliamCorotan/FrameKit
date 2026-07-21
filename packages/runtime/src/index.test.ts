@@ -10,6 +10,79 @@ const tenant: TenantContext = {
 };
 
 describe("runtime document service", () => {
+  it("executes authorized atomic commands with rollback, replay, revision, row-policy, and saga compensation semantics", async () => {
+    const commandTenant = { ...tenant, permissions: ["crm.records", "crm.commands.manage"] };
+    const record = defineDocType({
+      name: "command_record",
+      label: "Command Record",
+      fields: [{ name: "code", label: "Code", type: "text", required: true, unique: true }],
+      permissions: ["create", "read", "update", "delete"].map((action) => ({ action: action as "create", permissions: ["crm.records"] }))
+    });
+    const note = defineDocType({
+      name: "command_note",
+      label: "Command Note",
+      fields: [{ name: "title", label: "Title", type: "text", required: true }],
+      permissions: ["create", "read", "update", "delete"].map((action) => ({ action: action as "create", permissions: ["crm.records"] }))
+    });
+    const commandApp = defineApp({ name: "Commands", modules: [defineModule({
+      id: "crm", name: "CRM", doctypes: [record, note], commands: [
+        { id: "atomic-records", label: "Atomic records", permission: "crm.commands.manage", mode: "atomic", doctypes: [record.name, note.name], operations: ["create", "update", "delete"], maxOperations: 10 },
+        { id: "saga-records", label: "Saga records", permission: "crm.commands.manage", mode: "saga", doctypes: [record.name], operations: ["create", "delete"], maxOperations: 10 }
+      ]
+    })] });
+    const runtime = createRuntime(commandApp);
+
+    await expect(runtime.executeDocumentCommand(tenant, "atomic-records", { operations: [
+      { operation: "create", doctype: record.name, id: "forbidden", data: { code: "NO" } }
+    ] })).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    const request = { operations: [
+      { operation: "create" as const, doctype: record.name, id: "record-a", data: { code: "A" } },
+      { operation: "create" as const, doctype: note.name, id: "note-a", data: { title: "A note" } }
+    ], idempotencyKey: "atomic-success" };
+    const applied = await runtime.executeDocumentCommand(commandTenant, "atomic-records", request);
+    expect(applied).toMatchObject({ mode: "atomic", replayed: false, documents: [{ id: "record-a" }, { id: "note-a" }] });
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", request)).resolves.toMatchObject({ replayed: true });
+    await expect(runtime.auditTrail(commandTenant)).resolves.toHaveLength(2);
+    await expect(runtime.outboxEvents(commandTenant)).resolves.toHaveLength(2);
+
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [
+      { operation: "create", doctype: record.name, id: "duplicate-a", data: { code: "DUP" } },
+      { operation: "create", doctype: record.name, id: "duplicate-b", data: { code: "DUP" } }
+    ] })).rejects.toMatchObject({ code: "UNIQUE_CONSTRAINT_FAILED" });
+    await expect(runtime.get(commandTenant, record.name, "duplicate-a")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [
+      { operation: "update", doctype: record.name, id: "record-a", expectedRevision: 1, data: { code: "A2" } },
+      { operation: "update", doctype: note.name, id: "note-a", expectedRevision: 99, data: { title: "stale" } }
+    ] })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+    await expect(runtime.get(commandTenant, record.name, "record-a")).resolves.toMatchObject({ revision: 1, data: { code: "A" } });
+
+    const denied = createRuntime(commandApp, { commandRowPolicy: ({ operation }) => operation.operation !== "update" });
+    await denied.executeDocumentCommand(commandTenant, "atomic-records", { operations: [{ operation: "create", doctype: record.name, id: "record-a", data: { code: "A" } }] });
+    await expect(denied.executeDocumentCommand(commandTenant, "atomic-records", { operations: [
+      { operation: "update", doctype: record.name, id: "record-a", expectedRevision: 1, data: { code: "blocked" } }
+    ] })).rejects.toMatchObject({ code: "FORBIDDEN" });
+
+    const sagaRequest = { operations: [{
+      operation: "create" as const, doctype: record.name, id: "saga-success", data: { code: "SAGA-SUCCESS" },
+      compensation: { operation: "delete" as const, doctype: record.name, id: "saga-success", expectedRevision: 1 }
+    }], idempotencyKey: "saga-success-1" };
+    await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", sagaRequest)).resolves.toMatchObject({ replayed: false });
+    await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", sagaRequest)).resolves.toMatchObject({ replayed: true, documents: [{ id: "saga-success" }] });
+
+    await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", { operations: [
+      {
+        operation: "create", doctype: record.name, id: "saga-a", data: { code: "SAGA" },
+        compensation: { operation: "delete", doctype: record.name, id: "saga-a", expectedRevision: 1 }
+      },
+      {
+        operation: "create", doctype: record.name, id: "saga-b", data: { code: "SAGA" },
+        compensation: { operation: "delete", doctype: record.name, id: "saga-b", expectedRevision: 1 }
+      }
+    ] })).rejects.toMatchObject({ code: "COMMAND_SAGA_FAILED", details: { compensationFailures: [] } });
+    await expect(runtime.get(commandTenant, record.name, "saga-a")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+  });
   it("starts resources in order and closes them once in reverse order", async () => {
     const events: string[] = [];
     const first = { start: () => { events.push("first:start"); }, close: () => { events.push("first:close"); } };

@@ -89,11 +89,46 @@ export type MutationCommand = {
   afterWrite(persisted?: DocumentRecord): Promise<void>;
 };
 
+export type MutationBatchResult = {
+  documents: Array<DocumentRecord | undefined>;
+  replayed: boolean;
+};
+
 export type MutationUnitOfWork = LifecycleResource & {
   execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }>;
+  executeBatch?(commands: MutationCommand[], options: { tenant: TenantContext; idempotencyKey?: string; idempotencyFingerprint: string }): Promise<MutationBatchResult>;
+  replayBatch?(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<MutationBatchResult | undefined>;
   replay?(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<{ found: boolean; result?: DocumentRecord }>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
+
+export type DocumentCommandOperation = {
+  operation: "create" | "update" | "delete";
+  doctype: string;
+  id?: string;
+  data?: DocumentData;
+  expectedRevision?: number;
+  compensation?: Omit<DocumentCommandOperation, "compensation">;
+};
+
+export type DocumentCommandRequest = {
+  operations: DocumentCommandOperation[];
+  idempotencyKey?: string;
+};
+
+export type DocumentCommandResult = {
+  command: string;
+  mode: "atomic" | "saga";
+  replayed: boolean;
+  documents: Array<DocumentRecord | undefined>;
+};
+
+export type CommandRowPolicy = (input: {
+  tenant: TenantContext;
+  command: string;
+  operation: DocumentCommandOperation;
+  document?: DocumentRecord;
+}) => boolean | Promise<boolean>;
 
 export type RepositoryDiagnostics = {
   kind: string;
@@ -296,6 +331,7 @@ export type RuntimeOptions = {
   migrations?: MigrationStore;
   realtime?: RealtimePublisher;
   mutations?: MutationUnitOfWork;
+  commandRowPolicy?: CommandRowPolicy;
   resources?: LifecycleResource[];
   idGenerator?: () => string;
   now?: () => Date;
@@ -311,6 +347,7 @@ export class FramekitRuntime {
   private readonly migrations: MigrationStore;
   private readonly realtime: RealtimePublisher;
   private readonly mutations?: MutationUnitOfWork;
+  private readonly commandRowPolicy?: CommandRowPolicy;
   private readonly idGenerator: () => string;
   private readonly now: () => Date;
   private readonly resources: LifecycleResource[];
@@ -335,6 +372,7 @@ export class FramekitRuntime {
         ? new InMemoryMutationUnitOfWork(repository, audit, outbox)
         : undefined
     );
+    this.commandRowPolicy = options.commandRowPolicy;
     this.idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
     this.now = options.now ?? (() => new Date());
     this.resources = uniqueLifecycleResources([
@@ -913,6 +951,195 @@ export class FramekitRuntime {
     return ownerTransferReceipt(saved);
   }
 
+  async executeDocumentCommand(tenant: TenantContext, commandId: string, request: DocumentCommandRequest): Promise<DocumentCommandResult> {
+    const definition = this.app.modules.flatMap((module) => module.commands).find((command) => command.id === commandId);
+    if (!definition) throw new FramekitError("COMMAND_NOT_FOUND", `Unknown document command "${commandId}".`, 404);
+    if (!tenant.permissions.includes("*") && !tenant.permissions.includes(definition.permission)) {
+      throw new FramekitError("FORBIDDEN", `Missing permission "${definition.permission}" for command "${commandId}".`, 403);
+    }
+    if (!Array.isArray(request.operations) || request.operations.length < 1 || request.operations.length > definition.maxOperations) {
+      throw new FramekitError("INVALID_COMMAND", `Command "${commandId}" requires between 1 and ${definition.maxOperations} operations.`, 422);
+    }
+    const targets = new Set<string>();
+    for (const operation of request.operations) {
+      if (!operation || typeof operation !== "object" ||
+          !["create", "update", "delete"].includes(operation.operation) ||
+          typeof operation.doctype !== "string" || (operation.id !== undefined && (typeof operation.id !== "string" || !operation.id))) {
+        throw new FramekitError("INVALID_COMMAND_OPERATION", `Command "${commandId}" contains malformed operation metadata.`, 422);
+      }
+      if (!definition.doctypes.includes(operation.doctype) || !definition.operations.includes(operation.operation)) {
+        throw new FramekitError("INVALID_COMMAND_OPERATION", `Command "${commandId}" does not allow ${operation.operation} on ${operation.doctype}.`, 422);
+      }
+      if ((operation.operation === "update" || operation.operation === "delete") && (!operation.id || operation.expectedRevision === undefined)) {
+        throw new FramekitError("EXPECTED_REVISION_REQUIRED", `${operation.operation} operations require id and expectedRevision.`, 422);
+      }
+      const target = operation.id ? `${operation.doctype}:${operation.id}` : undefined;
+      if (target && targets.has(target)) throw new FramekitError("DUPLICATE_COMMAND_TARGET", `Command targets ${target} more than once.`, 422);
+      if (target) targets.add(target);
+      if (definition.mode === "saga" && !operation.compensation) {
+        throw new FramekitError("COMPENSATION_REQUIRED", `Saga operation ${operation.doctype}:${operation.id ?? "new"} requires compensation metadata.`, 422);
+      }
+      if (operation.compensation && (
+        !definition.doctypes.includes(operation.compensation.doctype) ||
+        !definition.operations.includes(operation.compensation.operation) ||
+        ((operation.compensation.operation === "update" || operation.compensation.operation === "delete") &&
+          (!operation.compensation.id || operation.compensation.expectedRevision === undefined))
+      )) {
+        throw new FramekitError("INVALID_COMMAND_COMPENSATION", `Command "${commandId}" contains a disallowed or incomplete compensation.`, 422);
+      }
+    }
+    const fingerprint = mutationFingerprint(`command:${commandId}`, commandId, request.operations);
+    if (definition.mode === "atomic") {
+      if (!this.mutations?.executeBatch) {
+        throw new FramekitError("COMMAND_ATOMICITY_UNAVAILABLE", `Command "${commandId}" requires a batch-capable mutation unit of work.`, 501);
+      }
+      if (request.idempotencyKey && this.mutations.replayBatch) {
+        const replay = await this.mutations.replayBatch(tenant, request.idempotencyKey, fingerprint);
+        if (replay) return { command: commandId, mode: "atomic", replayed: true, documents: replay.documents };
+      }
+      const commands: MutationCommand[] = [];
+      for (const operation of request.operations) commands.push(await this.prepareDocumentCommandMutation(tenant, commandId, operation));
+      const execution = await this.mutations.executeBatch(commands, {
+        tenant,
+        idempotencyKey: request.idempotencyKey,
+        idempotencyFingerprint: fingerprint
+      });
+      if (!execution.replayed) {
+        for (const [index, command] of commands.entries()) {
+          await this.publishDocumentEvent(tenant, command.operation === "create" ? "created" : command.operation === "update" ? "updated" : "deleted", execution.documents[index] ?? command.document);
+        }
+      }
+      return { command: commandId, mode: "atomic", replayed: execution.replayed, documents: execution.documents };
+    }
+
+    if (!this.mutations) {
+      throw new FramekitError("COMMAND_EXECUTION_UNAVAILABLE", `Saga command "${commandId}" requires a mutation unit of work for each local step.`, 501);
+    }
+
+    const completed: Array<{ operation: DocumentCommandOperation; document?: DocumentRecord }> = [];
+    let allReplayed = Boolean(request.idempotencyKey);
+    try {
+      for (const [index, operation] of request.operations.entries()) {
+        const stepKey = request.idempotencyKey ? `${request.idempotencyKey}:step:${index}` : undefined;
+        const stepFingerprint = mutationFingerprint(`command:${commandId}:${operation.operation}`, operation.doctype, operation);
+        if (stepKey && this.mutations.replay) {
+          const doctype = await this.getEffectiveDocType(tenant, operation.doctype);
+          assertPermission(tenant, doctype, operation.operation);
+          const replay = await this.mutations.replay(tenant, stepKey, stepFingerprint);
+          if (replay.found) {
+            if (!(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document: replay.result }) ?? true)) {
+              throw new FramekitError("FORBIDDEN", `Row policy denied replay of command "${commandId}".`, 403);
+            }
+            completed.push({ operation, document: replay.result });
+            continue;
+          }
+        }
+        allReplayed = false;
+        const command = await this.prepareDocumentCommandMutation(tenant, commandId, operation, stepKey);
+        const execution = await this.mutations!.execute(command);
+        completed.push({ operation, document: execution.document });
+        if (!execution.replayed) await this.publishDocumentEvent(tenant, command.operation === "create" ? "created" : command.operation === "update" ? "updated" : "deleted", execution.document ?? command.document);
+      }
+      return { command: commandId, mode: "saga", replayed: allReplayed, documents: completed.map((item) => item.document) };
+    } catch (cause) {
+      if (cause instanceof FramekitError && cause.code === "IDEMPOTENCY_KEY_REUSED") throw cause;
+      const compensationFailures: Array<{ index: number; message: string }> = [];
+      for (const [reverseIndex, item] of completed.slice().reverse().entries()) {
+        const originalIndex = completed.length - reverseIndex - 1;
+        try {
+          const compensation = await this.prepareDocumentCommandMutation(
+            tenant,
+            commandId,
+            item.operation.compensation!,
+            request.idempotencyKey ? `${request.idempotencyKey}:compensation:${originalIndex}` : undefined
+          );
+          const execution = await this.mutations!.execute(compensation);
+          if (!execution.replayed) await this.publishDocumentEvent(tenant, `compensated.${compensation.operation}`, execution.document ?? compensation.document);
+        } catch (error) {
+          compensationFailures.push({ index: originalIndex, message: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      throw new FramekitError("COMMAND_SAGA_FAILED", `Command "${commandId}" failed and compensation was attempted.`, 409, {
+        cause: cause instanceof Error ? cause.message : String(cause),
+        compensationFailures
+      });
+    }
+  }
+
+  private async prepareDocumentCommandMutation(
+    tenant: TenantContext,
+    commandId: string,
+    operation: DocumentCommandOperation,
+    idempotencyKey?: string
+  ): Promise<MutationCommand> {
+    const doctype = await this.getEffectiveDocType(tenant, operation.doctype);
+    assertPermission(tenant, doctype, operation.operation);
+    let document: DocumentRecord;
+    let expectedRevision: number | undefined;
+    let auditAction: string;
+    let outboxAction: string;
+    let afterWrite: () => Promise<void>;
+    if (operation.operation === "create") {
+      const candidate = { ...(operation.data ?? {}) };
+      await this.runHooks("beforeValidate", tenant, doctype, undefined, candidate);
+      if (doctype.workflow) {
+        const suppliedState = candidate[doctype.workflow.field];
+        if (suppliedState !== undefined && suppliedState !== doctype.workflow.initialState) throw new FramekitError("INVALID_INITIAL_STATE", `New ${doctype.name} documents must start in "${doctype.workflow.initialState}"`, 422);
+        candidate[doctype.workflow.field] = doctype.workflow.initialState;
+      }
+      const data = this.prepareInput(doctype, candidate, true);
+      await this.assertLinksExist(tenant, doctype, data);
+      await this.assertUniqueFields(tenant, doctype, data);
+      const timestamp = this.now().toISOString();
+      document = {
+        id: operation.id ?? await this.createDocumentId(tenant, doctype, data), doctype: doctype.name, tenantId: tenant.tenantId,
+        revision: 1, documentStatus: "draft", data, state: doctype.workflow?.initialState, createdAt: timestamp, updatedAt: timestamp
+      };
+      await this.runHooks("beforeInsert", tenant, doctype, document, data);
+      auditAction = "command:create";
+      outboxAction = "command.created";
+      afterWrite = () => this.runHooks("afterInsert", tenant, doctype, document, data);
+    } else {
+      const existing = await this.get(tenant, doctype.name, operation.id!);
+      if (!(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document: existing }) ?? true)) {
+        throw new FramekitError("FORBIDDEN", `Row policy denied command "${commandId}" for ${doctype.name} "${existing.id}".`, 403);
+      }
+      expectedRevision = operation.expectedRevision;
+      if (operation.operation === "delete") {
+        assertDraftDocument(existing, "delete");
+        document = existing;
+        await this.runHooks("beforeDelete", tenant, doctype, document, document.data);
+        auditAction = "command:delete";
+        outboxAction = "command.deleted";
+        afterWrite = () => this.runHooks("afterDelete", tenant, doctype, document, document.data);
+      } else {
+        assertDraftDocument(existing, "update");
+        const candidate = { ...existing.data, ...(operation.data ?? {}) };
+        await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
+        const data = this.prepareInput(doctype, candidate, false, existing.data);
+        await this.assertLinksExist(tenant, doctype, data);
+        await this.assertUniqueFields(tenant, doctype, data, existing.id);
+        document = { ...existing, revision: existing.revision + 1, data, updatedAt: this.now().toISOString() };
+        await this.runHooks("beforeUpdate", tenant, doctype, document, data);
+        auditAction = "command:update";
+        outboxAction = "command.updated";
+        afterWrite = () => this.runHooks("afterUpdate", tenant, doctype, document, data);
+      }
+    }
+    if (!(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document }) ?? true)) {
+      throw new FramekitError("FORBIDDEN", `Row policy denied command "${commandId}" for ${doctype.name} "${document.id}".`, 403);
+    }
+    return {
+      operation: operation.operation, tenant, doctype, document, expectedRevision, idempotencyKey,
+      idempotencyFingerprint: mutationFingerprint(`command:${commandId}:${operation.operation}`, doctype.name, operation),
+      sideEffects: {
+        audit: this.createAuditEvent(tenant, auditAction, document),
+        outbox: this.createOutboxEvent(tenant, outboxAction, document)
+      },
+      afterWrite
+    };
+  }
+
   private async changeDocumentStatus(
     tenant: TenantContext,
     doctypeName: string,
@@ -1244,6 +1471,15 @@ export class InMemoryDocumentRepository implements DocumentRepository {
     for (const [key, record] of snapshot) this.records.set(key, cloneRecord(record));
   }
 
+  checkpoint(): Map<string, DocumentRecord> {
+    return new Map([...this.records].map(([key, record]) => [key, cloneRecord(record)]));
+  }
+
+  rollback(checkpoint: Map<string, DocumentRecord>): void {
+    this.records.clear();
+    for (const [key, record] of checkpoint) this.records.set(key, cloneRecord(record));
+  }
+
   describe(): RepositoryDiagnostics {
     return {
       kind: "memory",
@@ -1504,6 +1740,7 @@ function cloneOutboxEvent(event: OutboxEvent): OutboxEvent {
 
 export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
   private readonly idempotency = new Map<string, { fingerprint: string; result?: DocumentRecord }>();
+  private readonly batchIdempotency = new Map<string, { fingerprint: string; documents: Array<DocumentRecord | undefined> }>();
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(
@@ -1521,10 +1758,21 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
   }
 
   async replay(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<{ found: boolean; result?: DocumentRecord }> {
+    const batch = this.batchIdempotency.get(`${tenant.tenantId}:${idempotencyKey}`);
+    if (batch) assertMemoryIdempotencyFingerprint(idempotencyKey, fingerprint, batch.fingerprint);
     const replay = this.idempotency.get(`${tenant.tenantId}:${idempotencyKey}`);
     if (!replay) return { found: false };
     assertMemoryIdempotencyFingerprint(idempotencyKey, fingerprint, replay.fingerprint);
     return replay.result ? { found: true, result: cloneRecord(replay.result) } : { found: true };
+  }
+
+  async replayBatch(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<MutationBatchResult | undefined> {
+    const single = this.idempotency.get(`${tenant.tenantId}:${idempotencyKey}`);
+    if (single) assertMemoryIdempotencyFingerprint(idempotencyKey, fingerprint, single.fingerprint);
+    const replay = this.batchIdempotency.get(`${tenant.tenantId}:${idempotencyKey}`);
+    if (!replay) return undefined;
+    assertMemoryIdempotencyFingerprint(idempotencyKey, fingerprint, replay.fingerprint);
+    return { documents: replay.documents.map((document) => document ? cloneRecord(document) : undefined), replayed: true };
   }
 
   async execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }> {
@@ -1540,8 +1788,48 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
     }
   }
 
+  async executeBatch(commands: MutationCommand[], options: { tenant: TenantContext; idempotencyKey?: string; idempotencyFingerprint: string }): Promise<MutationBatchResult> {
+    const key = options.idempotencyKey ? `${options.tenant.tenantId}:${options.idempotencyKey}` : undefined;
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous.catch(() => undefined);
+    try {
+      if (key) {
+        const singleReplay = this.idempotency.get(key);
+        if (singleReplay) assertMemoryIdempotencyFingerprint(options.idempotencyKey!, options.idempotencyFingerprint, singleReplay.fingerprint);
+        const replay = this.batchIdempotency.get(key);
+        if (replay) {
+          assertMemoryIdempotencyFingerprint(options.idempotencyKey!, options.idempotencyFingerprint, replay.fingerprint);
+          return { documents: replay.documents.map((document) => document ? cloneRecord(document) : undefined), replayed: true };
+        }
+      }
+      const repositoryCheckpoint = this.repository.checkpoint();
+      const auditCheckpoint = this.audit.checkpoint();
+      const outboxCheckpoint = this.outbox.checkpoint();
+      try {
+        const documents: Array<DocumentRecord | undefined> = [];
+        for (const command of commands) documents.push((await this.executeUnlocked(command)).document);
+        if (key) this.batchIdempotency.set(key, {
+          fingerprint: options.idempotencyFingerprint,
+          documents: documents.map((document) => document ? cloneRecord(document) : undefined)
+        });
+        return { documents, replayed: false };
+      } catch (error) {
+        this.repository.rollback(repositoryCheckpoint);
+        this.audit.rollback(auditCheckpoint);
+        this.outbox.rollback(outboxCheckpoint);
+        throw error;
+      }
+    } finally {
+      release();
+    }
+  }
+
   private async executeUnlocked(command: MutationCommand, idempotencyKey?: string): Promise<{ document?: DocumentRecord; replayed: boolean }> {
     if (idempotencyKey) {
+      const batchReplay = this.batchIdempotency.get(idempotencyKey);
+      if (batchReplay) assertMemoryIdempotencyFingerprint(command.idempotencyKey!, command.idempotencyFingerprint, batchReplay.fingerprint);
       const replay = this.idempotency.get(idempotencyKey);
       if (replay) {
         assertMemoryIdempotencyFingerprint(command.idempotencyKey!, command.idempotencyFingerprint, replay.fingerprint);

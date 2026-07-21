@@ -30,6 +30,7 @@ import {
   type OnlineMigrationOptions,
   type OnlineMigrationRun,
   type MutationCommand,
+  type MutationBatchResult,
   type MutationUnitOfWork,
   type NamingSeriesStore,
   type OutboxEvent,
@@ -508,6 +509,16 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
     return rows[0].result ? { found: true, result: rows[0].result } : { found: true };
   }
 
+  async replayBatch(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<MutationBatchResult | undefined> {
+    const rows = await this.sql<{ fingerprint: string; result: Array<DocumentRecord | null> | null }[]>`
+      select fingerprint, result from framekit_idempotency_keys
+      where tenant_id = ${tenant.tenantId} and key = ${idempotencyKey} limit 1
+    `;
+    if (!rows[0]) return undefined;
+    assertIdempotencyFingerprint(idempotencyKey, fingerprint, rows[0].fingerprint);
+    return { documents: (rows[0].result ?? []).map((document) => document ?? undefined), replayed: true };
+  }
+
   async execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }> {
     if (command.operation === "create" && ((command.doctype.ownership && command.document.ownerId !== command.tenant.userId) || (!command.doctype.ownership && command.document.ownerId !== undefined))) {
       throw new FramekitError("INVALID_OWNER", "Document owner must be assigned by enabled ownership metadata", 403);
@@ -610,6 +621,91 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
       });
     } catch (error) {
       throw mapMutationError(error, command);
+    }
+  }
+
+  async executeBatch(
+    commands: MutationCommand[],
+    options: { tenant: TenantContext; idempotencyKey?: string; idempotencyFingerprint: string }
+  ): Promise<MutationBatchResult> {
+    if (commands.length === 0 || commands.some((command) => command.tenant.tenantId !== options.tenant.tenantId)) {
+      throw new FramekitError("INVALID_COMMAND", "Atomic command batches must contain operations for exactly one tenant.", 422);
+    }
+    let activeCommand = commands[0]!;
+    try {
+      return await this.sql.begin(async (tx) => {
+        if (options.idempotencyKey) {
+          await tx`select pg_advisory_xact_lock(hashtextextended(${`${options.tenant.tenantId}:${options.idempotencyKey}`}, 0))`;
+          const replay = await tx<{ fingerprint: string; result: Array<DocumentRecord | null> | null }[]>`
+            select fingerprint, result from framekit_idempotency_keys
+            where tenant_id = ${options.tenant.tenantId} and key = ${options.idempotencyKey} limit 1
+          `;
+          if (replay[0]) {
+            assertIdempotencyFingerprint(options.idempotencyKey, options.idempotencyFingerprint, replay[0].fingerprint);
+            return { documents: (replay[0].result ?? []).map((document) => document ?? undefined), replayed: true };
+          }
+        }
+        const documents: Array<DocumentRecord | undefined> = [];
+        for (const command of commands) {
+          activeCommand = command;
+          let result: DocumentRecord | undefined;
+          if (command.operation === "create") {
+            await tx`
+              insert into framekit_documents (tenant_id, doctype, id, revision, document_status, state, data, created_at, updated_at)
+              values (${command.document.tenantId}, ${command.document.doctype}, ${command.document.id}, ${command.document.revision},
+                      ${command.document.documentStatus}, ${command.document.state ?? null}, ${tx.json(command.document.data as postgres.JSONValue)},
+                      ${command.document.createdAt}, ${command.document.updatedAt})
+            `;
+            result = command.document;
+            await replaceUniqueValues(tx, command);
+          } else if (command.operation === "update") {
+            const rows = await tx<{ revision: number }[]>`
+              update framekit_documents set revision = ${command.document.revision}, document_status = ${command.document.documentStatus},
+                state = ${command.document.state ?? null}, data = ${tx.json(command.document.data as postgres.JSONValue)}, updated_at = ${command.document.updatedAt}
+              where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
+                and id = ${command.document.id} and revision = ${command.expectedRevision!} returning revision
+            `;
+            if (!rows[0]) await throwMutationWriteFailure(tx, command);
+            result = command.document;
+            await replaceUniqueValues(tx, command);
+          } else {
+            const rows = await tx<{ revision: number }[]>`
+              delete from framekit_documents where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
+                and id = ${command.document.id} and revision = ${command.expectedRevision!} returning revision
+            `;
+            if (!rows[0]) await throwMutationWriteFailure(tx, command);
+            await tx`delete from framekit_document_unique_values where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name} and document_id = ${command.document.id}`;
+          }
+          await this.faultInjector?.("document", command);
+          await command.afterWrite(result);
+          await this.faultInjector?.("hooks", command);
+          const sideEffects = typeof command.sideEffects === "function" ? command.sideEffects(result!) : command.sideEffects;
+          await tx`
+            insert into framekit_audit_events (tenant_id, id, user_id, action, doctype, document_id, created_at)
+            values (${sideEffects.audit.tenantId}, ${sideEffects.audit.id}, ${sideEffects.audit.userId}, ${sideEffects.audit.action},
+                    ${sideEffects.audit.doctype}, ${sideEffects.audit.documentId}, ${sideEffects.audit.createdAt})
+          `;
+          await this.faultInjector?.("audit", command);
+          await tx`
+            insert into framekit_outbox_events (tenant_id, id, type, topic, payload, status, attempts, created_at, processed_at, error)
+            values (${sideEffects.outbox.tenantId}, ${sideEffects.outbox.id}, ${sideEffects.outbox.type}, ${sideEffects.outbox.topic},
+                    ${tx.json(sideEffects.outbox.payload as postgres.JSONValue)}, ${sideEffects.outbox.status}, ${sideEffects.outbox.attempts}, ${sideEffects.outbox.createdAt}, null, null)
+          `;
+          await this.faultInjector?.("outbox", command);
+          documents.push(result);
+        }
+        if (options.idempotencyKey) {
+          await tx`
+            insert into framekit_idempotency_keys (tenant_id, key, fingerprint, result, created_at)
+            values (${options.tenant.tenantId}, ${options.idempotencyKey}, ${options.idempotencyFingerprint},
+                    ${tx.json(documents.map((document) => document ?? null) as unknown as postgres.JSONValue)}, now())
+          `;
+        }
+        await this.faultInjector?.("idempotency", activeCommand);
+        return { documents, replayed: false };
+      });
+    } catch (error) {
+      throw mapMutationError(error, activeCommand);
     }
   }
 }

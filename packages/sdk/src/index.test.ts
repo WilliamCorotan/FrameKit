@@ -15,6 +15,19 @@ afterEach(() => {
 });
 
 describe("generateSdkTypes", () => {
+  it("sends typed document commands with an idempotency key", async () => {
+    vi.mocked(ofetch).mockResolvedValue({} as never);
+    const client = createClient({ baseUrl: "https://app.example", token: "session" });
+    await client.executeDocumentCommand("close period", [{
+      operation: "update", doctype: "invoice", id: "invoice-1", expectedRevision: 2, data: { status: "closed" }
+    }], { idempotencyKey: "close-period-1" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledWith("https://app.example/api/commands/close%20period", expect.objectContaining({
+      method: "POST",
+      body: { operations: [{ operation: "update", doctype: "invoice", id: "invoice-1", expectedRevision: 2, data: { status: "closed" } }] },
+      headers: expect.objectContaining({ authorization: "Bearer session", "idempotency-key": "close-period-1" })
+    }));
+  });
+
   it("keeps the explicit HTTP endpoint matrix in parity with every public client method", () => {
     const methods = Object.getOwnPropertyNames(FramekitClient.prototype)
       .filter((name) => !["constructor", "execute", "headers", "request"].includes(name))

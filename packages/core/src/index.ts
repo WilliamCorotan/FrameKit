@@ -202,6 +202,18 @@ export const NavigationItemSchema = z.object({
 
 export type NavigationItem = z.infer<typeof NavigationItemSchema>;
 
+export const CommandDefinitionSchema = z.object({
+  id: z.string().min(1).regex(/^[a-z][a-z0-9_-]*$/),
+  label: z.string().min(1),
+  permission: z.string().min(1),
+  mode: z.enum(["atomic", "saga"]).default("atomic"),
+  doctypes: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).min(1),
+  operations: z.array(z.enum(["create", "update", "delete"])).min(1).default(["create", "update"]),
+  maxOperations: z.number().int().min(1).max(1000).default(100)
+});
+
+export type CommandDefinition = z.infer<typeof CommandDefinitionSchema>;
+
 export const ModuleSchema: z.ZodType<ModuleDefinition> = z.object({
   id: z.string().min(1).regex(/^[a-z][a-z0-9_-]*$/),
   name: z.string().min(1),
@@ -211,6 +223,7 @@ export const ModuleSchema: z.ZodType<ModuleDefinition> = z.object({
   doctypes: z.array(DocTypeSchema).default([]),
   permissions: z.array(z.string()).default([]),
   navigation: z.array(NavigationItemSchema).default([]),
+  commands: z.array(CommandDefinitionSchema).default([]),
   hooks: ModuleHooksSchema.optional(),
   jobs: z.array(z.string()).default([]),
   settings: z.array(z.string()).default([])
@@ -225,6 +238,7 @@ export type ModuleDefinition = {
   doctypes: DocTypeDefinition[];
   permissions: string[];
   navigation: NavigationItem[];
+  commands: CommandDefinition[];
   hooks?: ModuleHooks;
   jobs: string[];
   settings: string[];
@@ -255,13 +269,19 @@ export function defineDocType(definition: z.input<typeof DocTypeSchema>): DocTyp
   return parsed;
 }
 
-export function defineModule(definition: Omit<Partial<ModuleDefinition>, "doctypes"> & Pick<ModuleDefinition, "id" | "name"> & { doctypes?: z.input<typeof DocTypeSchema>[] }): ModuleDefinition {
+export function defineModule(
+  definition: Omit<Partial<ModuleDefinition>, "doctypes" | "commands"> & Pick<ModuleDefinition, "id" | "name"> & {
+    doctypes?: z.input<typeof DocTypeSchema>[];
+    commands?: z.input<typeof CommandDefinitionSchema>[];
+  }
+): ModuleDefinition {
   const doctypes = (definition.doctypes ?? []).map((doctype) => defineDocType(doctype));
   return ModuleSchema.parse({
     version: "0.1.0",
     dependencies: [],
     permissions: [],
     navigation: [],
+    commands: [],
     jobs: [],
     settings: [],
     ...definition,
@@ -457,6 +477,7 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
 
 function assertAppReferences(app: AppDefinition): void {
   const doctypes = new Map(app.modules.flatMap((module) => module.doctypes).map((doctype) => [doctype.name, doctype]));
+  const appCommandIds = new Set<string>();
   for (const doctype of doctypes.values()) {
     for (const field of doctype.fields) {
       if (field.type === "link" && !doctypes.has(field.linkTo!)) {
@@ -465,6 +486,18 @@ function assertAppReferences(app: AppDefinition): void {
     }
   }
   for (const module of app.modules) {
+    const commandIds = new Set<string>();
+    for (const command of module.commands) {
+      if (commandIds.has(command.id)) throw new Error(`Duplicate command id "${command.id}" in module "${module.id}"`);
+      commandIds.add(command.id);
+      if (appCommandIds.has(command.id)) throw new Error(`Duplicate command id "${command.id}" across modules`);
+      appCommandIds.add(command.id);
+      for (const doctype of command.doctypes) {
+        if (!doctypes.has(doctype)) throw new Error(`Command "${command.id}" in module "${module.id}" targets unknown DocType "${doctype}"`);
+      }
+      if (new Set(command.doctypes).size !== command.doctypes.length) throw new Error(`Command "${command.id}" repeats a DocType`);
+      if (new Set(command.operations).size !== command.operations.length) throw new Error(`Command "${command.id}" repeats an operation`);
+    }
     for (const [hookName, hooks] of Object.entries(module.hooks ?? {})) {
       for (const doctype of Object.keys(hooks ?? {})) {
         if (!doctypes.has(doctype)) throw new Error(`Hook "${hookName}" in module "${module.id}" targets unknown DocType "${doctype}"`);

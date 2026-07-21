@@ -6,6 +6,30 @@ import { createRuntime, migrationChecksum, type RealtimePublisher, type RuntimeR
 import { assertSecureProductionCredentials, createNitroHandler, createOpenTelemetryAdapters } from "./index.js";
 
 describe("createNitroHandler", () => {
+  it("exposes authorized atomic document commands without persistence details", async () => {
+    const item = defineDocType({
+      name: "command_item", label: "Command Item", fields: [{ name: "name", label: "Name", type: "text", required: true }],
+      permissions: [{ action: "create", permissions: ["items.write"] }, { action: "read", permissions: ["items.read"] }]
+    });
+    const runtime = createRuntime(defineApp({ name: "Commands", modules: [defineModule({
+      id: "commands", name: "Commands", doctypes: [item], commands: [{
+        id: "create-items", label: "Create items", permission: "items.bulk", mode: "atomic",
+        doctypes: [item.name], operations: ["create"], maxOperations: 5
+      }]
+    })] }));
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { development: { allowHeaderIdentity: true } }));
+    const fetch = toWebHandler(h3);
+    const operations = [{ operation: "create", doctype: item.name, id: "item-1", data: { name: "First" } }];
+
+    await expect(json(fetch, "/api/commands/create-items", {
+      method: "POST", headers: { "x-permissions": "items.write" }, body: { operations }
+    })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(json(fetch, "/api/commands/create-items", {
+      method: "POST", headers: { "x-permissions": "items.write,items.bulk", "idempotency-key": "create-items-1" }, body: { operations }
+    })).resolves.toMatchObject({ command: "create-items", mode: "atomic", replayed: false, documents: [{ id: "item-1" }] });
+  });
+
   it("exposes submit and cancel document lifecycle commands", async () => {
     const invoice = defineDocType({
       name: "invoice",
