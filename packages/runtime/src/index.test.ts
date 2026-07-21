@@ -543,6 +543,8 @@ describe("runtime document service", () => {
     const applied = await runtime.applyMigration(tenant, plan);
     await expect(runtime.applyMigration(tenant, plan)).resolves.toEqual(applied);
     await expect(runtime.applyMigration({ ...tenant, tenantId: "other" }, plan)).rejects.toMatchObject({ code: "MIGRATION_TENANT_MISMATCH" });
+    const wrongApp = { ...plan, appName: "Another App" };
+    await expect(runtime.applyMigration(tenant, { ...wrongApp, checksum: await migrationChecksum(wrongApp) })).rejects.toMatchObject({ code: "MIGRATION_APP_MISMATCH" });
 
     const conflicting = { ...plan, toSchemaChecksum: "different-target" };
     const validConflict = { ...conflicting, checksum: await migrationChecksum(conflicting) };

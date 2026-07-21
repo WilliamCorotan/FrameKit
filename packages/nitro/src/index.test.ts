@@ -742,7 +742,7 @@ describe("createNitroHandler", () => {
     const outbox = await json<Array<{ type: string }>>(fetch, "/api/outbox", { headers });
     expect(outbox.some((event) => event.type === "customer.created")).toBe(true);
 
-    const migration = await json<{ changes: Array<{ field: string }> }>(fetch, "/api/migrations/plan", {
+    const migration = await json<{ id: string; checksum: string; changes: Array<{ field: string }> }>(fetch, "/api/migrations/plan", {
       method: "POST",
       headers,
       body: {
@@ -769,6 +769,15 @@ describe("createNitroHandler", () => {
       }
     });
     expect(migration.changes).toMatchObject([{ field: "tier" }]);
+    const appliedMigration = await json<{ id: string; checksum: string }>(fetch, "/api/migrations/apply", {
+      method: "POST",
+      headers,
+      body: { plan: migration }
+    });
+    expect(appliedMigration).toMatchObject({ id: migration.id, checksum: migration.checksum });
+    await expect(json<Array<{ id: string }>>(fetch, "/api/migrations", { headers })).resolves.toEqual([
+      expect.objectContaining({ id: migration.id })
+    ]);
 
     const realtime = await json<Array<{ type: string }>>(fetch, "/api/realtime/events", { headers });
     expect(realtime.some((event) => event.type === "customer.created")).toBe(true);

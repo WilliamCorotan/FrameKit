@@ -33,6 +33,7 @@ Operational expectations:
 
 - Back up the database before applying destructive migration plans.
 - Keep `framekit_migrations.checksum` values intact; apply rejects tampered plans.
+- Establish the hardened migration baseline and legacy uniqueness reservations using the [executable migration upgrade procedure](migrations.md) before enabling the new write path.
 - Use database-level monitoring for connection saturation and slow queries.
 - Prefer one database role for application runtime and a separate elevated role for manual maintenance.
 

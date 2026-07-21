@@ -221,6 +221,12 @@ export type PostgresMutationUnitOfWorkOptions = PostgresRepositoryOptions & {
   faultInjector?: (stage: PostgresMutationStage, command: MutationCommand) => void | Promise<void>;
 };
 
+export type PostgresMigrationStage = "statement" | "backfill" | "record";
+
+export type PostgresMigrationStoreOptions = PostgresRepositoryOptions & {
+  faultInjector?: (stage: PostgresMigrationStage, plan: MigrationPlan, statementIndex?: number) => void | Promise<void>;
+};
+
 export class PostgresDocumentRepository implements DocumentRepository {
   private readonly db: PostgresJsDatabase;
   private readonly onQuery?: PostgresRepositoryOptions["onQuery"];
@@ -909,10 +915,12 @@ export class PostgresNamingSeriesStore implements NamingSeriesStore {
 export class PostgresMigrationStore implements MigrationStore {
   private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
+  private readonly faultInjector?: PostgresMigrationStoreOptions["faultInjector"];
 
-  constructor(options: PostgresRepositoryOptions) {
+  constructor(options: PostgresMigrationStoreOptions) {
     this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
     this.db = drizzle(this.sql);
+    this.faultInjector = options.faultInjector;
   }
 
   async migrate(): Promise<void> {
@@ -958,7 +966,7 @@ export class PostgresMigrationStore implements MigrationStore {
     const appliedAt = options.appliedAt ?? new Date().toISOString();
     const record: MigrationRecord = { ...plan, appliedAt };
     return this.sql.begin(async (sql) => {
-      await sql`select pg_advisory_xact_lock(hashtextextended(${`framekit:migration:${tenant.tenantId}:${plan.appName}`}, 0))`;
+      await sql`select pg_advisory_xact_lock(hashtextextended(${`framekit:migration:${tenant.tenantId}`}, 0))`;
       const existing = await sql<MigrationSqlRow[]>`
         select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
                to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
@@ -978,10 +986,13 @@ export class PostgresMigrationStore implements MigrationStore {
       `;
       assertMigrationDrift(latestRows[0] ? migrationSqlRowToRecord(latestRows[0]) : undefined, plan);
       await assertLegacyUniqueValues(sql, tenant.tenantId, plan.toUniqueConstraints);
-      for (const statement of statements) {
+      for (const [statementIndex, statement] of statements.entries()) {
         await sql.unsafe(statement);
+        await this.faultInjector?.("statement", plan, statementIndex);
       }
       await resynchronizeUniqueValues(sql, tenant.tenantId, plan.fromUniqueConstraints, plan.toUniqueConstraints);
+      await this.faultInjector?.("backfill", plan);
+      await this.faultInjector?.("record", plan);
       await sql`
         insert into framekit_migrations (
           tenant_id, id, app_name, from_schema_checksum, to_schema_checksum, from_unique_constraints,
@@ -1289,15 +1300,15 @@ type MigrationSqlRow = {
   toUniqueConstraints: MigrationRecord["toUniqueConstraints"];
   changes: MigrationRecord["changes"];
   checksum: string;
-  createdAt: Date;
-  appliedAt: Date;
+  createdAt: Date | string;
+  appliedAt: Date | string;
 };
 
 function migrationSqlRowToRecord(row: MigrationSqlRow): MigrationRecord {
   return {
     ...row,
-    createdAt: row.createdAt.toISOString(),
-    appliedAt: row.appliedAt.toISOString()
+    createdAt: typeof row.createdAt === "string" ? new Date(row.createdAt).toISOString() : row.createdAt.toISOString(),
+    appliedAt: typeof row.appliedAt === "string" ? new Date(row.appliedAt).toISOString() : row.appliedAt.toISOString()
   };
 }
 
@@ -1375,7 +1386,7 @@ function rollbackFromChange(change: MigrationChange): MigrationRollback {
     case "add_field":
       return { kind: "remove_field", doctype: change.doctype, field: change.field, destructive: true, from: change.to };
     case "remove_field":
-      return { kind: "add_field", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing field ${change.doctype}.${change.field} cannot restore deleted values automatically.`, 409);
     case "change_field_type":
       return { kind: "change_field_type", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
     case "add_index":

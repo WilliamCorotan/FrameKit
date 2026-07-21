@@ -1314,7 +1314,7 @@ function assertMemoryIdempotencyFingerprint(key: string, expected: string, actua
 }
 
 function migrationChange(change: Omit<MigrationChange, "rollback">): MigrationChange {
-  if (change.kind === "remove_doctype") return { ...change };
+  if (change.kind === "remove_doctype" || change.kind === "remove_field") return { ...change };
   return { ...change, rollback: rollbackFor(change) };
 }
 
@@ -1327,7 +1327,7 @@ function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollba
     case "add_field":
       return { kind: "remove_field", doctype: change.doctype, field: change.field, destructive: true, from: change.to };
     case "remove_field":
-      return { kind: "add_field", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
+      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing field ${change.doctype}.${change.field} cannot restore deleted values automatically.`, 409);
     case "change_field_type":
       return { kind: "change_field_type", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
     case "add_index":
@@ -1358,6 +1358,21 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
   if (!plan.id || !plan.tenantId || !plan.appName || !plan.fromSchemaChecksum || !plan.toSchemaChecksum ||
       !Array.isArray(plan.fromUniqueConstraints) || !Array.isArray(plan.toUniqueConstraints) || !Array.isArray(plan.changes)) {
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration plan identity, schema checksums, uniqueness metadata, and changes are required.", 422);
+  }
+  const identifier = /^[a-z][a-z0-9_]*$/;
+  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint"]);
+  const constraints = [...plan.fromUniqueConstraints, ...plan.toUniqueConstraints];
+  if (constraints.some((constraint) => !constraint || !identifier.test(constraint.doctype) || !identifier.test(constraint.field))) {
+    throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration uniqueness metadata contains an invalid DocType or field identifier.", 422);
+  }
+  for (const change of plan.changes) {
+    if (!change || !changeKinds.has(change.kind) || !identifier.test(change.doctype) || typeof change.field !== "string") {
+      throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration changes contain an invalid DocType or field identifier.", 422);
+    }
+    const fields = change.field === "*" ? ["*"] : change.field.split(",");
+    if (fields.some((field) => field !== "*" && !identifier.test(field))) {
+      throw new FramekitError("INVALID_MIGRATION_PLAN", `Migration change ${change.kind} contains an invalid field identifier.`, 422);
+    }
   }
   const expectedChecksum = await migrationChecksum(plan);
   if (plan.checksum !== expectedChecksum) {
@@ -1441,6 +1456,10 @@ function assertMigrationMetadata(app: AppDefinition): void {
         throw new FramekitError("INVALID_MIGRATION_METADATA", `Link field ${doctype.name}.${field.name} references unknown DocType "${field.linkTo ?? ""}".`, 422);
       }
     }
+    const unsupportedUnique = doctype.fields.find((field) => field.unique && field.type === "json");
+    if (unsupportedUnique) {
+      throw new FramekitError("INVALID_MIGRATION_METADATA", `JSON field ${doctype.name}.${unsupportedUnique.name} cannot use a normalized unique constraint.`, 422);
+    }
   }
 }
 
@@ -1458,7 +1477,9 @@ export function assertMigrationDrift(latest: MigrationRecord | undefined, plan: 
   if (latest.appName !== plan.appName) {
     throw new FramekitError("MIGRATION_APP_MISMATCH", `Latest migration belongs to app "${latest.appName}".`, 409);
   }
-  if (latest.toSchemaChecksum !== plan.fromSchemaChecksum) {
+  // Records created before schema fingerprints were introduced have an empty target.
+  // The first hardened apply establishes the chain after all other validation succeeds.
+  if (latest.toSchemaChecksum && latest.toSchemaChecksum !== plan.fromSchemaChecksum) {
     throw new FramekitError("MIGRATION_SCHEMA_DRIFT", "Migration baseline does not match the latest applied schema.", 409, {
       expected: latest.toSchemaChecksum,
       actual: plan.fromSchemaChecksum
