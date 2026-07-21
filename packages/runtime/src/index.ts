@@ -49,8 +49,32 @@ export type DocumentRepository = {
   list(tenant: TenantContext, doctype: DocTypeDefinition, options?: ListOptions): Promise<DocumentRecord[]>;
   get(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<DocumentRecord | undefined>;
   create(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord>;
-  update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord>;
-  delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<void>;
+  update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options?: { expectedRevision?: number }): Promise<DocumentRecord>;
+  delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options?: { expectedRevision?: number }): Promise<void>;
+  describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
+};
+
+export type MutationOptions = {
+  expectedRevision?: number;
+  idempotencyKey?: string;
+};
+
+export type MutationCommand = {
+  operation: "create" | "update" | "delete";
+  tenant: TenantContext;
+  doctype: DocTypeDefinition;
+  document: DocumentRecord;
+  expectedRevision?: number;
+  idempotencyKey?: string;
+  idempotencyFingerprint: string;
+  audit: AuditEvent;
+  outbox: OutboxEvent;
+  afterWrite(): Promise<void>;
+};
+
+export type MutationUnitOfWork = {
+  execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }>;
+  replay?(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<{ found: boolean; result?: DocumentRecord }>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
@@ -170,6 +194,7 @@ export type RuntimeOptions = {
   namingSeries?: NamingSeriesStore;
   migrations?: MigrationStore;
   realtime?: RealtimePublisher;
+  mutations?: MutationUnitOfWork;
   idGenerator?: () => string;
   now?: () => Date;
 };
@@ -183,18 +208,27 @@ export class FramekitRuntime {
   private readonly namingSeries: NamingSeriesStore;
   private readonly migrations: MigrationStore;
   private readonly realtime: RealtimePublisher;
+  private readonly mutations?: MutationUnitOfWork;
   private readonly idGenerator: () => string;
   private readonly now: () => Date;
 
   constructor(app: AppDefinition, options: RuntimeOptions = {}) {
     this.app = defineApp(app);
-    this.repository = options.repository ?? new InMemoryDocumentRepository();
-    this.audit = options.audit ?? new InMemoryAuditStore();
-    this.outbox = options.outbox ?? new InMemoryOutboxStore();
+    const repository = options.repository ?? new InMemoryDocumentRepository();
+    const audit = options.audit ?? new InMemoryAuditStore();
+    const outbox = options.outbox ?? new InMemoryOutboxStore();
+    this.repository = repository;
+    this.audit = audit;
+    this.outbox = outbox;
     this.customization = options.customization ?? new InMemoryCustomizationStore();
     this.namingSeries = options.namingSeries ?? new InMemoryNamingSeriesStore();
     this.migrations = options.migrations ?? new InMemoryMigrationStore();
     this.realtime = options.realtime ?? new NoopRealtimePublisher();
+    this.mutations = options.mutations ?? (
+      repository instanceof InMemoryDocumentRepository && audit instanceof InMemoryAuditStore && outbox instanceof InMemoryOutboxStore
+        ? new InMemoryMutationUnitOfWork(repository, audit, outbox)
+        : undefined
+    );
     this.idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
     this.now = options.now ?? (() => new Date());
   }
@@ -216,6 +250,7 @@ export class FramekitRuntime {
     const namingSeries = this.namingSeries.describe ? await this.namingSeries.describe() : { kind: "unknown", durable: false, features: [] };
     const migrations = this.migrations.describe ? await this.migrations.describe() : { kind: "unknown", durable: false, features: [] };
     const realtime = this.realtime.describe ? await this.realtime.describe() : { kind: "unknown", durable: false, features: [] };
+    const mutations = this.mutations?.describe ? await this.mutations.describe() : { kind: "none", durable: false, features: [] };
     const doctypes = this.app.modules.flatMap((module) => module.doctypes);
     return {
       app: {
@@ -229,6 +264,7 @@ export class FramekitRuntime {
       namingSeries,
       migrations,
       realtime,
+      mutations,
       modules: this.app.modules.map((module) => ({
         id: module.id,
         name: module.name,
@@ -243,7 +279,7 @@ export class FramekitRuntime {
         permissions: doctype.permissions.length,
         workflow: Boolean(doctype.workflow)
       })),
-      warnings: createRuntimeWarnings(repository, audit, outbox, customization, namingSeries, doctypes)
+      warnings: createRuntimeWarnings(repository, audit, outbox, customization, namingSeries, mutations, doctypes)
     };
   }
 
@@ -425,9 +461,12 @@ export class FramekitRuntime {
     return document;
   }
 
-  async create(tenant: TenantContext, doctypeName: string, input: DocumentData): Promise<DocumentRecord> {
+  async create(tenant: TenantContext, doctypeName: string, input: DocumentData, options: Omit<MutationOptions, "expectedRevision"> = {}): Promise<DocumentRecord> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "create");
+    const fingerprint = mutationFingerprint("create", doctype.name, input);
+    const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
+    if (replay) return replay;
     const data = this.prepareInput(doctype, input, true);
     await this.runHooks("beforeValidate", tenant, doctype, undefined, data);
     await this.assertLinksExist(tenant, doctype, data);
@@ -438,52 +477,106 @@ export class FramekitRuntime {
       id: await this.createDocumentId(tenant, doctype, data),
       doctype: doctype.name,
       tenantId: tenant.tenantId,
+      revision: 1,
       data,
       state,
       createdAt: timestamp,
       updatedAt: timestamp
     };
     await this.runHooks("beforeInsert", tenant, doctype, document, data);
-    const created = await this.repository.create(tenant, doctype, document);
-    await this.runHooks("afterInsert", tenant, doctype, created, data);
-    await this.recordAudit(tenant, "create", created);
-    await this.recordOutbox(tenant, "created", created);
-    await this.publishDocumentEvent(tenant, "created", created);
+    const audit = this.createAuditEvent(tenant, "create", document);
+    const outbox = this.createOutboxEvent(tenant, "created", document);
+    const execution = this.mutations
+      ? await this.mutations.execute({
+          operation: "create",
+          tenant,
+          doctype,
+          document,
+          idempotencyKey: options.idempotencyKey,
+          idempotencyFingerprint: fingerprint,
+          audit,
+          outbox,
+          afterWrite: () => this.runHooks("afterInsert", tenant, doctype, document, data)
+        })
+      : { document: await this.createWithoutUnitOfWork(tenant, doctype, document, data, audit, outbox), replayed: false };
+    const created = execution.document!;
+    if (!execution.replayed) await this.publishDocumentEvent(tenant, "created", created);
     return created;
   }
 
-  async update(tenant: TenantContext, doctypeName: string, id: string, input: DocumentData): Promise<DocumentRecord> {
+  async update(tenant: TenantContext, doctypeName: string, id: string, input: DocumentData, options: MutationOptions = {}): Promise<DocumentRecord> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "update");
+    requireExpectedRevisionForRetry(options);
+    const fingerprint = mutationFingerprint("update", doctype.name, { id, input, expectedRevision: options.expectedRevision });
+    const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
+    if (replay) return replay;
     const existing = await this.get(tenant, doctypeName, id);
     const data = this.prepareInput(doctype, { ...existing.data, ...input }, false);
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data, id);
-    const updated: DocumentRecord = { ...existing, data, updatedAt: this.now().toISOString() };
+    const expectedRevision = options.expectedRevision ?? existing.revision;
+    const updated: DocumentRecord = { ...existing, revision: existing.revision + 1, data, updatedAt: this.now().toISOString() };
     await this.runHooks("beforeUpdate", tenant, doctype, updated, data);
-    const saved = await this.repository.update(tenant, doctype, updated);
-    await this.runHooks("afterUpdate", tenant, doctype, saved, data);
-    await this.recordAudit(tenant, "update", saved);
-    await this.recordOutbox(tenant, "updated", saved);
-    await this.publishDocumentEvent(tenant, "updated", saved);
+    const audit = this.createAuditEvent(tenant, "update", updated);
+    const outbox = this.createOutboxEvent(tenant, "updated", updated);
+    const execution = this.mutations
+      ? await this.mutations.execute({
+          operation: "update",
+          tenant,
+          doctype,
+          document: updated,
+          expectedRevision,
+          idempotencyKey: options.idempotencyKey,
+          idempotencyFingerprint: fingerprint,
+          audit,
+          outbox,
+          afterWrite: () => this.runHooks("afterUpdate", tenant, doctype, updated, data)
+        })
+      : { document: await this.updateWithoutUnitOfWork(tenant, doctype, updated, data, expectedRevision, audit, outbox), replayed: false };
+    const saved = execution.document!;
+    if (!execution.replayed) await this.publishDocumentEvent(tenant, "updated", saved);
     return saved;
   }
 
-  async delete(tenant: TenantContext, doctypeName: string, id: string): Promise<void> {
+  async delete(tenant: TenantContext, doctypeName: string, id: string, options: MutationOptions = {}): Promise<void> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "delete");
+    requireExpectedRevisionForRetry(options);
+    const fingerprint = mutationFingerprint("delete", doctype.name, { id, expectedRevision: options.expectedRevision });
+    if ((await this.replayMutation(tenant, options.idempotencyKey, fingerprint)) !== undefined) return;
     const existing = await this.get(tenant, doctypeName, id);
+    const expectedRevision = options.expectedRevision ?? existing.revision;
     await this.runHooks("beforeDelete", tenant, doctype, existing, existing.data);
-    await this.repository.delete(tenant, doctype, id);
-    await this.runHooks("afterDelete", tenant, doctype, existing, existing.data);
-    await this.recordAudit(tenant, "delete", existing);
-    await this.recordOutbox(tenant, "deleted", existing);
+    const audit = this.createAuditEvent(tenant, "delete", existing);
+    const outbox = this.createOutboxEvent(tenant, "deleted", existing);
+    if (this.mutations) {
+      const execution = await this.mutations.execute({
+        operation: "delete",
+        tenant,
+        doctype,
+        document: existing,
+        expectedRevision,
+        idempotencyKey: options.idempotencyKey,
+        idempotencyFingerprint: fingerprint,
+        audit,
+        outbox,
+        afterWrite: () => this.runHooks("afterDelete", tenant, doctype, existing, existing.data)
+      });
+      if (execution.replayed) return;
+    } else {
+      await this.deleteWithoutUnitOfWork(tenant, doctype, existing, expectedRevision, audit, outbox);
+    }
     await this.publishDocumentEvent(tenant, "deleted", existing);
   }
 
-  async transition(tenant: TenantContext, doctypeName: string, id: string, action: string): Promise<DocumentRecord> {
+  async transition(tenant: TenantContext, doctypeName: string, id: string, action: string, options: MutationOptions = {}): Promise<DocumentRecord> {
     const doctype = await this.getEffectiveDocType(tenant, doctypeName);
     assertPermission(tenant, doctype, "transition");
+    requireExpectedRevisionForRetry(options);
+    const fingerprint = mutationFingerprint("transition", doctype.name, { id, action, expectedRevision: options.expectedRevision });
+    const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
+    if (replay) return replay;
     const workflow = doctype.workflow;
     if (!workflow) {
       throw new FramekitError("WORKFLOW_NOT_DEFINED", `${doctype.name} does not define a workflow`, 400);
@@ -500,16 +593,31 @@ export class FramekitRuntime {
     const data = { ...existing.data, [workflow.field]: transition.to };
     const updated: DocumentRecord = {
       ...existing,
+      revision: existing.revision + 1,
       data,
       state: transition.to,
       updatedAt: this.now().toISOString()
     };
+    const expectedRevision = options.expectedRevision ?? existing.revision;
     await this.runHooks("beforeTransition", tenant, doctype, updated, data);
-    const saved = await this.repository.update(tenant, doctype, updated);
-    await this.runHooks("afterTransition", tenant, doctype, saved, data);
-    await this.recordAudit(tenant, `transition:${action}`, saved);
-    await this.recordOutbox(tenant, `transition.${action}`, saved);
-    await this.publishDocumentEvent(tenant, `transition.${action}`, saved);
+    const audit = this.createAuditEvent(tenant, `transition:${action}`, updated);
+    const outbox = this.createOutboxEvent(tenant, `transition.${action}`, updated);
+    const execution = this.mutations
+      ? await this.mutations.execute({
+          operation: "update",
+          tenant,
+          doctype,
+          document: updated,
+          expectedRevision,
+          idempotencyKey: options.idempotencyKey,
+          idempotencyFingerprint: fingerprint,
+          audit,
+          outbox,
+          afterWrite: () => this.runHooks("afterTransition", tenant, doctype, updated, data)
+        })
+      : { document: await this.updateWithoutUnitOfWork(tenant, doctype, updated, data, expectedRevision, audit, outbox, "afterTransition"), replayed: false };
+    const saved = execution.document!;
+    if (!execution.replayed) await this.publishDocumentEvent(tenant, `transition.${action}`, saved);
     return saved;
   }
 
@@ -643,8 +751,8 @@ export class FramekitRuntime {
     }
   }
 
-  private async recordAudit(tenant: TenantContext, action: string, document: DocumentRecord): Promise<void> {
-    await this.audit.record({
+  private createAuditEvent(tenant: TenantContext, action: string, document: DocumentRecord): AuditEvent {
+    return {
       id: this.idGenerator(),
       tenantId: tenant.tenantId,
       userId: tenant.userId,
@@ -652,12 +760,12 @@ export class FramekitRuntime {
       doctype: document.doctype,
       documentId: document.id,
       createdAt: this.now().toISOString()
-    });
+    };
   }
 
-  private async recordOutbox(tenant: TenantContext, action: string, document: DocumentRecord): Promise<void> {
+  private createOutboxEvent(tenant: TenantContext, action: string, document: DocumentRecord): OutboxEvent {
     const createdAt = this.now().toISOString();
-    await this.outbox.record({
+    return {
       id: this.idGenerator(),
       tenantId: tenant.tenantId,
       type: `${document.doctype}.${action}`,
@@ -665,13 +773,71 @@ export class FramekitRuntime {
       payload: {
         id: document.id,
         doctype: document.doctype,
+        revision: document.revision,
         state: document.state,
         data: document.data
       },
       status: "pending",
       attempts: 0,
       createdAt
-    });
+    };
+  }
+
+  private async createWithoutUnitOfWork(
+    tenant: TenantContext,
+    doctype: DocTypeDefinition,
+    document: DocumentRecord,
+    data: DocumentData,
+    audit: AuditEvent,
+    outbox: OutboxEvent
+  ): Promise<DocumentRecord> {
+    const created = await this.repository.create(tenant, doctype, document);
+    await this.runHooks("afterInsert", tenant, doctype, created, data);
+    await this.audit.record(audit);
+    await this.outbox.record(outbox);
+    return created;
+  }
+
+  private async updateWithoutUnitOfWork(
+    tenant: TenantContext,
+    doctype: DocTypeDefinition,
+    document: DocumentRecord,
+    data: DocumentData,
+    expectedRevision: number,
+    audit: AuditEvent,
+    outbox: OutboxEvent,
+    hook: "afterUpdate" | "afterTransition" = "afterUpdate"
+  ): Promise<DocumentRecord> {
+    const saved = await this.repository.update(tenant, doctype, document, { expectedRevision });
+    await this.runHooks(hook, tenant, doctype, saved, data);
+    await this.audit.record(audit);
+    await this.outbox.record(outbox);
+    return saved;
+  }
+
+  private async deleteWithoutUnitOfWork(
+    tenant: TenantContext,
+    doctype: DocTypeDefinition,
+    document: DocumentRecord,
+    expectedRevision: number,
+    audit: AuditEvent,
+    outbox: OutboxEvent
+  ): Promise<void> {
+    await this.repository.delete(tenant, doctype, document.id, { expectedRevision });
+    await this.runHooks("afterDelete", tenant, doctype, document, document.data);
+    await this.audit.record(audit);
+    await this.outbox.record(outbox);
+  }
+
+  private async replayMutation(
+    tenant: TenantContext,
+    idempotencyKey: string | undefined,
+    fingerprint: string
+  ): Promise<DocumentRecord | null | undefined> {
+    if (!idempotencyKey || !this.mutations?.replay) return undefined;
+    const replay = await this.mutations.replay(tenant, idempotencyKey, fingerprint);
+    if (!replay.found) return undefined;
+    return replay.result ?? null;
   }
 
   private async publishDocumentEvent(tenant: TenantContext, action: string, document: DocumentRecord): Promise<void> {
@@ -682,6 +848,7 @@ export class FramekitRuntime {
         id: document.id,
         doctype: document.doctype,
         tenantId: tenant.tenantId,
+        revision: document.revision,
         state: document.state,
         data: document.data
       }
@@ -715,21 +882,56 @@ export class InMemoryDocumentRepository implements DocumentRepository {
     if (this.records.has(key)) {
       throw new FramekitError("DOCUMENT_EXISTS", `${doctype.name} "${record.id}" already exists`, 409);
     }
+    this.assertUnique(tenant, doctype, record);
     this.records.set(key, { ...record, data: { ...record.data } });
     return record;
   }
 
-  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): Promise<DocumentRecord> {
+  async update(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord, options: { expectedRevision?: number } = {}): Promise<DocumentRecord> {
     const key = keyFor(tenant.tenantId, doctype.name, record.id);
-    if (!this.records.has(key)) {
+    const existing = this.records.get(key);
+    if (!existing) {
       throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${record.id}" does not exist`, 404);
     }
+    if (options.expectedRevision !== undefined && existing.revision !== options.expectedRevision) {
+      throw revisionConflict(doctype.name, record.id, options.expectedRevision, existing.revision);
+    }
+    this.assertUnique(tenant, doctype, record);
     this.records.set(key, { ...record, data: { ...record.data } });
     return record;
   }
 
-  async delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string): Promise<void> {
-    this.records.delete(keyFor(tenant.tenantId, doctype.name, id));
+  async delete(tenant: TenantContext, doctype: DocTypeDefinition, id: string, options: { expectedRevision?: number } = {}): Promise<void> {
+    const key = keyFor(tenant.tenantId, doctype.name, id);
+    const existing = this.records.get(key);
+    if (!existing) {
+      throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${id}" does not exist`, 404);
+    }
+    if (options.expectedRevision !== undefined && existing.revision !== options.expectedRevision) {
+      throw revisionConflict(doctype.name, id, options.expectedRevision, existing.revision);
+    }
+    this.records.delete(key);
+  }
+
+  private assertUnique(tenant: TenantContext, doctype: DocTypeDefinition, record: DocumentRecord): void {
+    for (const field of doctype.fields.filter((candidate) => candidate.unique)) {
+      const value = record.data[field.name];
+      if (value === undefined || value === null || value === "") continue;
+      const conflict = [...this.records.values()].find((candidate) =>
+        candidate.tenantId === tenant.tenantId &&
+        candidate.doctype === doctype.name &&
+        candidate.id !== record.id &&
+        candidate.data[field.name] === value
+      );
+      if (conflict) {
+        throw new FramekitError("UNIQUE_CONSTRAINT_FAILED", `${doctype.name}.${field.name} must be unique`, 409, {
+          doctype: doctype.name,
+          field: field.name,
+          value,
+          conflictId: conflict.id
+        });
+      }
+    }
   }
 }
 
@@ -753,6 +955,14 @@ export class InMemoryAuditStore implements AuditStore {
       .filter((event) => event.tenantId === tenant.tenantId)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, options.limit ?? 100);
+  }
+
+  checkpoint(): number {
+    return this.events.length;
+  }
+
+  rollback(checkpoint: number): void {
+    this.events.length = checkpoint;
   }
 }
 
@@ -797,6 +1007,98 @@ export class InMemoryOutboxStore implements OutboxStore {
     event.processedAt = new Date().toISOString();
     event.error = error;
     return { ...event, payload: { ...event.payload } };
+  }
+
+  checkpoint(): number {
+    return this.events.length;
+  }
+
+  rollback(checkpoint: number): void {
+    this.events.length = checkpoint;
+  }
+}
+
+export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
+  private readonly idempotency = new Map<string, { fingerprint: string; result?: DocumentRecord }>();
+  private mutationTail: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly repository: InMemoryDocumentRepository,
+    private readonly audit: InMemoryAuditStore,
+    private readonly outbox: InMemoryOutboxStore
+  ) {}
+
+  describe(): RepositoryDiagnostics {
+    return {
+      kind: "memory",
+      durable: false,
+      features: ["atomic-mutations", "optimistic-concurrency", "uniqueness", "idempotency"]
+    };
+  }
+
+  async replay(tenant: TenantContext, idempotencyKey: string, fingerprint: string): Promise<{ found: boolean; result?: DocumentRecord }> {
+    const replay = this.idempotency.get(`${tenant.tenantId}:${idempotencyKey}`);
+    if (!replay) return { found: false };
+    assertMemoryIdempotencyFingerprint(idempotencyKey, fingerprint, replay.fingerprint);
+    return replay.result ? { found: true, result: cloneRecord(replay.result) } : { found: true };
+  }
+
+  async execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }> {
+    const idempotencyKey = command.idempotencyKey ? `${command.tenant.tenantId}:${command.idempotencyKey}` : undefined;
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous.catch(() => undefined);
+    try {
+      return await this.executeUnlocked(command, idempotencyKey);
+    } finally {
+      release();
+    }
+  }
+
+  private async executeUnlocked(command: MutationCommand, idempotencyKey?: string): Promise<{ document?: DocumentRecord; replayed: boolean }> {
+    if (idempotencyKey) {
+      const replay = this.idempotency.get(idempotencyKey);
+      if (replay) {
+        assertMemoryIdempotencyFingerprint(command.idempotencyKey!, command.idempotencyFingerprint, replay.fingerprint);
+        return { document: replay.result ? cloneRecord(replay.result) : undefined, replayed: true };
+      }
+    }
+    const previous = command.operation === "create"
+      ? undefined
+      : await this.repository.get(command.tenant, command.doctype, command.document.id);
+    const auditCheckpoint = this.audit.checkpoint();
+    const outboxCheckpoint = this.outbox.checkpoint();
+    let wrote = false;
+    try {
+      let result: DocumentRecord | undefined;
+      if (command.operation === "create") {
+        result = await this.repository.create(command.tenant, command.doctype, command.document);
+      } else if (command.operation === "update") {
+        result = await this.repository.update(command.tenant, command.doctype, command.document, { expectedRevision: command.expectedRevision });
+      } else {
+        await this.repository.delete(command.tenant, command.doctype, command.document.id, { expectedRevision: command.expectedRevision });
+      }
+      wrote = true;
+      await command.afterWrite();
+      await this.audit.record(command.audit);
+      await this.outbox.record(command.outbox);
+      if (idempotencyKey) this.idempotency.set(idempotencyKey, { fingerprint: command.idempotencyFingerprint, result: result && cloneRecord(result) });
+      return { document: result, replayed: false };
+    } catch (error) {
+      this.audit.rollback(auditCheckpoint);
+      this.outbox.rollback(outboxCheckpoint);
+      if (wrote) {
+        if (command.operation === "create") {
+          await this.repository.delete(command.tenant, command.doctype, command.document.id);
+        } else if (command.operation === "update" && previous) {
+          await this.repository.update(command.tenant, command.doctype, previous);
+        } else if (command.operation === "delete" && previous) {
+          await this.repository.create(command.tenant, command.doctype, previous);
+        }
+      }
+      throw error;
+    }
   }
 }
 
@@ -904,6 +1206,42 @@ export function createRuntime(app: AppDefinition, options?: RuntimeOptions): Fra
 
 function keyFor(tenantId: string, doctype: string, id: string): string {
   return `${tenantId}:${doctype}:${id}`;
+}
+
+function revisionConflict(doctype: string, id: string, expectedRevision: number, actualRevision: number): FramekitError {
+  return new FramekitError("REVISION_CONFLICT", `${doctype} "${id}" changed since it was read`, 409, {
+    doctype,
+    id,
+    expectedRevision,
+    actualRevision
+  });
+}
+
+function mutationFingerprint(operation: string, doctype: string, value: unknown): string {
+  return JSON.stringify({ operation, doctype, value }, (_key, candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
+    return Object.fromEntries(Object.entries(candidate).sort(([left], [right]) => left.localeCompare(right)));
+  });
+}
+
+function requireExpectedRevisionForRetry(options: MutationOptions): void {
+  if (options.idempotencyKey && options.expectedRevision === undefined) {
+    throw new FramekitError(
+      "IDEMPOTENCY_REQUIRES_REVISION",
+      "Retried update, delete, and transition commands require expectedRevision.",
+      422
+    );
+  }
+}
+
+function cloneRecord(record: DocumentRecord): DocumentRecord {
+  return { ...record, data: { ...record.data } };
+}
+
+function assertMemoryIdempotencyFingerprint(key: string, expected: string, actual: string): void {
+  if (expected !== actual) {
+    throw new FramekitError("IDEMPOTENCY_KEY_REUSED", `Idempotency key "${key}" was already used for another command`, 409, { key });
+  }
 }
 
 function migrationChange(change: Omit<MigrationChange, "rollback">): MigrationChange {
@@ -1192,6 +1530,7 @@ function createRuntimeWarnings(
   outbox: RepositoryDiagnostics,
   customization: RepositoryDiagnostics,
   namingSeries: RepositoryDiagnostics,
+  mutations: RepositoryDiagnostics,
   doctypes: DocTypeDefinition[]
 ): string[] {
   const warnings: string[] = [];
@@ -1209,6 +1548,9 @@ function createRuntimeWarnings(
   }
   if (!namingSeries.durable) {
     warnings.push("Naming series store is not durable; use @framekit/db PostgresNamingSeriesStore for production IDs.");
+  }
+  if (repository.durable && !mutations.features.includes("atomic-mutations")) {
+    warnings.push("Durable document mutations are not atomic; configure a backend MutationUnitOfWork.");
   }
   for (const doctype of doctypes) {
     if (doctype.permissions.length === 0) {

@@ -221,7 +221,73 @@ describe("runtime document service", () => {
 
     await expect(runtime.create(tenant, "customer", { name: "Duplicate", email: "owner@example.com" })).rejects.toMatchObject({ code: "UNIQUE_CONSTRAINT_FAILED" });
     await expect(runtime.update(tenant, "customer", second.id, { email: "owner@example.com" })).rejects.toMatchObject({ code: "UNIQUE_CONSTRAINT_FAILED" });
-    await expect(runtime.update(tenant, "customer", first.id, { name: "First renamed" })).resolves.toMatchObject({ id: first.id, data: { email: "owner@example.com" } });
+    const updated = await runtime.update(tenant, "customer", first.id, { name: "First renamed" }, { expectedRevision: 1 });
+    expect(updated).toMatchObject({ id: first.id, revision: 2, data: { email: "owner@example.com" } });
+    await expect(runtime.update(tenant, "customer", first.id, { name: "Stale" }, { expectedRevision: 1 })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+
+    const concurrent = await Promise.allSettled([
+      runtime.create(tenant, "customer", { name: "Concurrent A", email: "race@example.com" }),
+      runtime.create(tenant, "customer", { name: "Concurrent B", email: "race@example.com" })
+    ]);
+    expect(concurrent.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(concurrent.filter((result) => result.status === "rejected")).toHaveLength(1);
+
+    const [retried, replay] = await Promise.all([
+      runtime.create(tenant, "customer", { name: "Retried", email: "retry@example.com" }, { idempotencyKey: "memory-create-1" }),
+      runtime.create(tenant, "customer", { name: "Retried", email: "retry@example.com" }, { idempotencyKey: "memory-create-1" })
+    ]);
+    expect(replay).toEqual(retried);
+    await expect(runtime.list(tenant, "customer", { filters: { email: "retry@example.com" } })).resolves.toHaveLength(1);
+  });
+
+  it("preserves a queued mutation when an earlier in-memory mutation rolls back", async () => {
+    let signalFirstHook!: () => void;
+    let releaseFirstHook!: () => void;
+    const firstHookStarted = new Promise<void>((resolve) => { signalFirstHook = resolve; });
+    const firstHookRelease = new Promise<void>((resolve) => { releaseFirstHook = resolve; });
+    const app = defineApp({
+      name: "Atomic memory",
+      modules: [defineModule({
+        id: "atomic",
+        name: "Atomic",
+        doctypes: [defineDocType({
+          name: "customer",
+          label: "Customer",
+          naming: { field: "name" },
+          fields: [{ name: "name", label: "Name", type: "text", required: true }],
+          permissions: [
+            { action: "create", permissions: ["crm.customer"] },
+            { action: "read", permissions: ["crm.customer"] }
+          ]
+        })],
+        hooks: {
+          afterInsert: {
+            customer: [async ({ document }) => {
+              if (document?.id !== "a") return;
+              signalFirstHook();
+              await firstHookRelease;
+              throw new Error("injected A failure");
+            }]
+          }
+        }
+      })]
+    });
+    let id = 0;
+    const runtime = createRuntime(app, { idGenerator: () => `atomic-${++id}` });
+
+    const failed = runtime.create(tenant, "customer", { name: "A" }).then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error })
+    );
+    await firstHookStarted;
+    const successful = runtime.create(tenant, "customer", { name: "B" });
+    releaseFirstHook();
+
+    await expect(failed).resolves.toMatchObject({ ok: false, error: { message: "injected A failure" } });
+    await expect(successful).resolves.toMatchObject({ id: "b", revision: 1 });
+    await expect(runtime.list(tenant, "customer")).resolves.toEqual([expect.objectContaining({ id: "b" })]);
+    await expect(runtime.auditTrail(tenant)).resolves.toEqual([expect.objectContaining({ documentId: "b" })]);
+    await expect(runtime.outboxEvents(tenant)).resolves.toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: "b" }) })]);
   });
 
   it("runs workflow transitions", async () => {

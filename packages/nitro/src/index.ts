@@ -87,8 +87,8 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       event.res.headers.set("access-control-allow-origin", "*");
       event.res.headers.set("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
       event.res.headers.set("access-control-allow-headers", allowHeaderIdentity
-        ? "authorization,content-type,x-tenant-id,x-user-id,x-roles,x-permissions"
-        : "authorization,content-type,x-tenant-id");
+        ? "authorization,content-type,if-match,idempotency-key,x-tenant-id,x-user-id,x-roles,x-permissions"
+        : "authorization,content-type,if-match,idempotency-key,x-tenant-id");
       event.res.headers.set("x-request-id", requestId);
       event.res.headers.set("x-content-type-options", "nosniff");
       event.res.headers.set("referrer-policy", "no-referrer");
@@ -452,19 +452,19 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       }
       if (method === "POST" && !match.id) {
         setResponseStatus(event, 201);
-        return await runtime.create(tenant, match.doctype, (await readBody(event)) ?? {});
+        return await runtime.create(tenant, match.doctype, (await readBody(event)) ?? {}, mutationOptions(event.req));
       }
       if (method === "PATCH" && match.id) {
-        return await runtime.update(tenant, match.doctype, match.id, (await readBody(event)) ?? {});
+        return await runtime.update(tenant, match.doctype, match.id, (await readBody(event)) ?? {}, mutationOptions(event.req));
       }
       if (method === "DELETE" && match.id) {
-        await runtime.delete(tenant, match.doctype, match.id);
+        await runtime.delete(tenant, match.doctype, match.id, mutationOptions(event.req));
         setResponseStatus(event, 204);
         return null;
       }
       if (method === "POST" && match.id && match.operation === "transition") {
         const body = (await readBody(event)) as { action?: string };
-        return await runtime.transition(tenant, match.doctype, match.id, body.action ?? "");
+        return await runtime.transition(tenant, match.doctype, match.id, body.action ?? "", mutationOptions(event.req));
       }
 
       throw new FramekitError("METHOD_NOT_ALLOWED", "Method not allowed", 405);
@@ -704,6 +704,18 @@ function requestKey(request: Request): string {
 
 function nodeEnvironment(): string | undefined {
   return (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
+}
+
+function mutationOptions(request: Request): { expectedRevision?: number; idempotencyKey?: string } {
+  const ifMatch = request.headers.get("if-match")?.replaceAll('"', "");
+  const expectedRevision = ifMatch === undefined ? undefined : Number(ifMatch);
+  if (expectedRevision !== undefined && (!Number.isInteger(expectedRevision) || expectedRevision < 1)) {
+    throw new FramekitError("INVALID_REVISION", "If-Match must contain a positive integer revision.", 422);
+  }
+  return {
+    expectedRevision,
+    idempotencyKey: request.headers.get("idempotency-key") ?? undefined
+  };
 }
 
 async function runHealthChecks(checks: Record<string, NitroHealthCheck>) {
