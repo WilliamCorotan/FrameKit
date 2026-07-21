@@ -17,11 +17,28 @@ Postgres apply proceeds in this order:
 
 Concurrent identical applies serialize and become an idempotent replay. Any statement, backfill, or record failure rolls the transaction back. A database created before schema fingerprints has one compatibility transition: an empty legacy target fingerprint is accepted once, after which the hardened fingerprint chain is enforced.
 
-## Rollback and conversions
+## Rollback and online conversions
 
 Rollback is itself a new, locked migration from the original target fingerprint to its source fingerprint. Adding a field or DocType can be rolled back only with destructive approval because it removes data created after apply. Removing a field or DocType cannot restore deleted values, so Framekit marks those plans as irreversible and refuses automatic rollback.
 
-Automatic field-type conversion is not supported. Such a plan fails before any SQL or history write. Operators must create and review a purpose-built data migration, verify it against a backup, and then establish the new metadata baseline.
+The atomic apply path still rejects field-type changes. Type-changing plans use `PostgresMigrationStore.applyOnlinePlan()` and include one `MigrationConversion` descriptor per changed field. The descriptor binds the ID, positive integer version, source/target field contract, immutable artifact SHA-256, and strict canonical-JSON `parameters` into the plan checksum. Conversion functions are not accepted in per-call options. They are installed once in `PostgresMigrationStore`'s frozen `conversionRegistry`, keyed by ID and version; startup rejects duplicate identities and native/bound functions, while apply requires the registry artifact digest to equal the reviewed plan digest.
+
+`migrationConversionArtifactDigest()` hashes immutable built module bytes or an attested artifact manifest; it does not hash `Function.prototype.toString()`. Registry construction is the trust boundary: operators must verify that the configured digest identifies the deployed immutable artifact and all of its dependencies. Conversion functions receive their behavior-affecting parameters as the third argument and must be self-contained—captured mutable state and hidden closure/bound parameters are forbidden. Framekit passes a cloned, recursively frozen parameter value, executes each conversion twice against isolated document copies, and stops if results differ. Results must be JSON-safe plain data: no `undefined`, non-finite numbers, sparse arrays, custom prototypes, accessors, symbols, or non-enumerable properties.
+
+Online apply requires durable approval evidence: approver identity, approval timestamp, outcome, and the exact plan digest. Rejected outcomes are recorded and terminal for that migration ID: they never execute and cannot later be replaced with approved evidence. A retry after rejection requires a distinct plan/run ID and a newly reviewed checksum and approval. `framekit_migration_runs` records the approval, conversion digest, status, attempt identity, error, and a per-conversion document cursor. Changed parameters, artifact identity, or plan metadata change the checksum and are rejected before resume, so an interrupted run must use the exact reviewed artifact and descriptor.
+
+Documents are transformed in configurable chunks (100 by default) using short transactions and a bounded tenant-plus-app advisory lock. Each chunk and its checkpoint commit together. Attempt and checkpoint compare-and-set guards prevent stale operators from overwriting a peer's progress or terminal state. A lock timeout is local to the waiting operator and never marks the shared run failed; failure transitions reacquire the same app lock and cannot overwrite an applied or completed run. Concurrent operators serialize, already-completed chunks are not repeated, other tenants and apps have independent run state, and transient serialization/deadlock/lock/connection failures can be retried. A completed transform then applies the remaining metadata/index work and migration-history record atomically. The hook should be idempotent as an additional defense, even though committed checkpoints prevent ordinary replay.
+
+### Safe rollout and recovery
+
+1. Back up the affected tenant data, test the conversion against a production-shaped copy, and record row counts plus representative before/after values.
+2. Deploy code that can read both old and new field representations. Pause incompatible writers or make writes dual-compatible before starting the run.
+3. Build and review the self-contained conversion artifact, calculate `artifactDigest` from its immutable bytes or attested manifest, declare every behavior-affecting value in `parameters`, and issue approval for the resulting exact `plan.checksum`. Install that artifact in the startup registry before applying. Never reuse approval after editing the descriptor or artifact, and never reuse a rejected plan/run identity.
+4. Start with a conservative `chunkSize`, `lockTimeoutMs`, and `maxRetries`. Monitor `framekit_migration_runs.status`, `checkpoint.processed`, `updated_at`, and `error`, together with database lock wait, transaction latency, deadlock, replication-lag, and application-error metrics.
+5. On interruption, keep the compatibility reader deployed, correct the operational cause, and replay the same plan and hook. `failed` is resumable; plan or conversion drift is not. Do not edit checkpoints or digests manually.
+6. After `completed`, compare transformed counts and application invariants, then remove compatibility reads in a later deployment.
+
+Online field conversion has no automatic data rollback because the reverse operation requires its own reviewed semantics. Recovery before completion is restore-from-backup or a separately planned, versioned reverse conversion. Retain the run row and approval evidence for audit even after the migration history record is written.
 
 ## Upgrade procedure
 

@@ -7,6 +7,7 @@ import {
   createCustomFieldTableSql,
   createDocumentTableSql,
   createMigrationTableSql,
+  migrationConversionArtifactDigest,
   createNamingSeriesTableSql,
   createOutboxTableSql,
   createPostgresMigrationSql,
@@ -14,7 +15,8 @@ import {
   createRoleTableSql,
   createSessionRevocationTableSql,
   createUserTableSql,
-  createViewTableSql
+  createViewTableSql,
+  PostgresMigrationStore
 } from "./index.js";
 
 describe("db migration sql", () => {
@@ -44,7 +46,27 @@ describe("db migration sql", () => {
     expect(createViewTableSql()).toContain("framekit_views");
     expect(createNamingSeriesTableSql()).toContain("framekit_naming_series");
     expect(createMigrationTableSql()).toContain("framekit_migrations");
+    expect(createMigrationTableSql()).toContain("framekit_migration_runs");
+    expect(createMigrationTableSql()).toContain("conversion_digest");
+    expect(createMigrationTableSql()).toContain("attempt_id text");
+    expect(createMigrationTableSql()).toContain("approval jsonb not null");
     expect(createMigrationTableSql()).toContain("checksum");
+  });
+
+  it("hashes immutable conversion artifacts and rejects duplicate registry identities", async () => {
+    const artifactDigest = await migrationConversionArtifactDigest("compiled conversion module v1");
+    await expect(migrationConversionArtifactDigest("compiled conversion module v1")).resolves.toBe(artifactDigest);
+    await expect(migrationConversionArtifactDigest("compiled conversion module v2")).resolves.not.toBe(artifactDigest);
+    const artifact = { id: "customer-score-number", version: 1, artifactDigest, convert: (value: unknown) => Number(value) };
+
+    expect(() => new PostgresMigrationStore({
+      connectionString: "postgres://localhost/framekit_registry_validation",
+      conversionRegistry: [artifact, { ...artifact }]
+    })).toThrow(/registered more than once/);
+    expect(() => new PostgresMigrationStore({
+      connectionString: "postgres://localhost/framekit_registry_validation",
+      conversionRegistry: [{ ...artifact, id: "bound-conversion", convert: artifact.convert.bind(null) }]
+    })).toThrow(/native or bound function/);
   });
 
   it("generates executable SQL for JSON document migration plans", async () => {

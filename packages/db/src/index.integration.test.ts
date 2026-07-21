@@ -11,6 +11,7 @@ import {
   PostgresCustomizationStore,
   PostgresDocumentRepository,
   PostgresMigrationStore,
+  migrationConversionArtifactDigest,
   PostgresMutationUnitOfWork,
   type PostgresMutationStage,
   PostgresNamingSeriesStore,
@@ -484,6 +485,188 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       await sql.unsafe("drop index if exists framekit_documents_legacy_upgrade_code_uniq");
       await sql.unsafe("drop index if exists framekit_documents_legacy_conflict_code_uniq");
       await (faultStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
+    }
+  });
+
+  it("resumes approved online conversions with durable checkpoints and isolated concurrent operators", async () => {
+    const onlineTenant = { ...tenant, tenantId: "pg_online_migration_tenant" };
+    const isolatedTenant = { ...tenant, tenantId: "pg_online_migration_isolated" };
+    const timeoutTenant = { ...tenant, tenantId: "pg_online_migration_timeout" };
+    const tenantIds = [onlineTenant.tenantId, isolatedTenant.tenantId, timeoutTenant.tenantId];
+    const textDocType = defineDocType({ name: "online_record", label: "Online Record", fields: [{ name: "score", label: "Score", type: "text" }] });
+    const numberDocType = defineDocType({ ...textDocType, fields: [{ name: "score", label: "Score", type: "number" }] });
+    const currentApp = defineApp({ name: "Online Migration", modules: [defineModule({ id: "online", name: "Online", doctypes: [textDocType] })] });
+    const targetApp = defineApp({ name: "Online Migration", modules: [defineModule({ id: "online", name: "Online", doctypes: [numberDocType] })] });
+    const artifactDigest = await migrationConversionArtifactDigest("fixture://online-record-score-number/v1");
+    const invalidArtifactDigest = await migrationConversionArtifactDigest("fixture://online-record-score-invalid-date/v1");
+    const convertScore = (value: unknown, _document: Readonly<Record<string, unknown>>, parameters: unknown) =>
+      Number(value) + Number((parameters as { offset?: number }).offset ?? 0);
+    const invalidConvert = () => new Date("2026-07-21T00:00:00.000Z");
+    const conversionRegistry = [
+      { id: "online-record-score-number", version: 1, artifactDigest, convert: convertScore },
+      { id: "online-record-score-invalid-date", version: 1, artifactDigest: invalidArtifactDigest, convert: invalidConvert }
+    ];
+    let interruptOnce = true;
+    const onlineStore = new PostgresMigrationStore({
+      connectionString: connectionString!,
+      conversionRegistry,
+      faultInjector: (stage) => {
+        if (stage === "online_chunk" && interruptOnce) {
+          interruptOnce = false;
+          throw new Error("injected online interruption");
+        }
+      }
+    });
+    let releaseChunk!: () => void;
+    let signalChunkEntered!: () => void;
+    const chunkGate = new Promise<void>((resolve) => { releaseChunk = resolve; });
+    const chunkEntered = new Promise<void>((resolve) => { signalChunkEntered = resolve; });
+    let gateOnce = true;
+    const gatedStore = new PostgresMigrationStore({
+      connectionString: connectionString!,
+      conversionRegistry,
+      faultInjector: async (stage) => {
+        if (stage === "online_chunk" && gateOnce) {
+          gateOnce = false;
+          signalChunkEntered();
+          await chunkGate;
+        }
+      }
+    });
+    const peerStore = new PostgresMigrationStore({ connectionString: connectionString!, conversionRegistry });
+    try {
+      await onlineStore.migrate();
+      await sql`delete from framekit_migration_runs where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_migrations where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_documents where tenant_id = any(${tenantIds})`;
+      for (const tenantId of tenantIds) {
+        await sql`
+          insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+          values (${tenantId}, ${textDocType.name}, 'row-1', 1, null, ${sql.json({ score: "10" })}, now(), now()),
+                 (${tenantId}, ${textDocType.name}, 'row-2', 1, null, ${sql.json({ score: "20" })}, now(), now()),
+                 (${tenantId}, ${textDocType.name}, 'row-3', 1, null, ${sql.json({ score: "30" })}, now(), now())
+        `;
+      }
+      const planned = await createRuntime(currentApp, { idGenerator: () => "online-v1" }).planMigration(onlineTenant, targetApp);
+      const isolatedPlanned = await createRuntime(currentApp, { idGenerator: () => "online-isolated" }).planMigration(isolatedTenant, targetApp);
+      const conversionDescriptor = {
+        id: "online-record-score-number",
+        version: 1,
+        doctype: textDocType.name,
+        field: "score",
+        fromType: "text",
+        toType: "number",
+        parameters: { offset: 0 }
+      };
+      const conversion = {
+        ...conversionDescriptor,
+        artifactDigest
+      };
+      const unsignedPlan = { ...planned, conversions: [conversion] };
+      const plan = { ...unsignedPlan, checksum: await migrationChecksum(unsignedPlan) };
+      const approval = {
+        approver: "release-manager@example.test",
+        planDigest: plan.checksum,
+        approvedAt: "2026-07-21T00:00:00.000Z",
+        outcome: "approved" as const
+      };
+      const options = { approval, chunkSize: 2, maxRetries: 0 };
+
+      const rejectedUnsigned = { ...isolatedPlanned, id: "online-rejected", conversions: [conversion] };
+      const rejectedPlan = { ...rejectedUnsigned, checksum: await migrationChecksum(rejectedUnsigned) };
+      const rejectedApproval = { ...approval, planDigest: rejectedPlan.checksum, outcome: "rejected" as const };
+      await expect(onlineStore.applyOnlinePlan(isolatedTenant, rejectedPlan, {
+        ...options,
+        approval: rejectedApproval
+      })).rejects.toMatchObject({ code: "MIGRATION_APPROVAL_REJECTED" });
+      await expect(onlineStore.applyOnlinePlan(isolatedTenant, rejectedPlan, {
+        ...options,
+        approval: { ...rejectedApproval, outcome: "approved" }
+      })).rejects.toMatchObject({ code: "MIGRATION_APPROVAL_REJECTED" });
+      await expect(onlineStore.getOnlineRun(isolatedTenant, rejectedPlan.appName, rejectedPlan.id)).resolves.toMatchObject({
+        status: "failed",
+        approval: rejectedApproval
+      });
+
+      const invalidDescriptor = { ...conversionDescriptor, id: "online-record-score-invalid-date", parameters: null };
+      const invalidConversion = {
+        ...invalidDescriptor,
+        artifactDigest: invalidArtifactDigest
+      };
+      const invalidUnsigned = { ...isolatedPlanned, id: "online-invalid-json", conversions: [invalidConversion] };
+      const invalidPlan = { ...invalidUnsigned, checksum: await migrationChecksum(invalidUnsigned) };
+      await expect(onlineStore.applyOnlinePlan(isolatedTenant, invalidPlan, {
+        ...options,
+        approval: { ...approval, planDigest: invalidPlan.checksum }
+      })).rejects.toMatchObject({ code: "INVALID_MIGRATION_CONVERSION_VALUE" });
+
+      await expect(onlineStore.applyOnlinePlan(onlineTenant, plan, options)).rejects.toThrow("injected online interruption");
+      await expect(onlineStore.getOnlineRun(onlineTenant, plan.appName, plan.id)).resolves.toMatchObject({
+        status: "failed",
+        checkpoint: { conversionIndex: 0, processed: 0 },
+        approval
+      });
+      const driftedConversion = { ...conversion, parameters: { offset: 100 } };
+      const driftedUnsigned = { ...plan, conversions: [driftedConversion] };
+      const driftedPlan = { ...driftedUnsigned, checksum: await migrationChecksum(driftedUnsigned) };
+      expect(driftedPlan.checksum).not.toBe(plan.checksum);
+      await expect(onlineStore.applyOnlinePlan(onlineTenant, driftedPlan, {
+        ...options,
+        approval: { ...approval, planDigest: driftedPlan.checksum }
+      })).rejects.toMatchObject({ code: "MIGRATION_PLAN_DRIFT" });
+
+      const concurrent = await Promise.all([
+        onlineStore.applyOnlinePlan(onlineTenant, plan, options),
+        peerStore.applyOnlinePlan(onlineTenant, plan, options)
+      ]);
+      expect(concurrent[1]).toEqual(concurrent[0]);
+      const converted = await sql<{ id: string; score: number; revision: number }[]>`
+        select id, (data ->> 'score')::int as score, revision from framekit_documents
+        where tenant_id = ${onlineTenant.tenantId} and doctype = ${textDocType.name} order by id
+      `;
+      expect(converted).toEqual([
+        { id: "row-1", score: 10, revision: 2 },
+        { id: "row-2", score: 20, revision: 2 },
+        { id: "row-3", score: 30, revision: 2 }
+      ]);
+      const isolated = await sql<{ scores: string[]; revisions: number[] }[]>`
+        select array_agg(data ->> 'score' order by id) as scores, array_agg(revision order by id) as revisions
+        from framekit_documents where tenant_id = ${isolatedTenant.tenantId} and doctype = ${textDocType.name}
+      `;
+      expect(isolated[0]).toEqual({ scores: ["10", "20", "30"], revisions: [1, 1, 1] });
+      await expect(onlineStore.getOnlineRun(onlineTenant, plan.appName, plan.id)).resolves.toMatchObject({
+        status: "completed",
+        checkpoint: { conversionIndex: 1, processed: 3 },
+        approval
+      });
+      await expect(onlineStore.getOnlineRun(onlineTenant, "Other App", plan.id)).resolves.toBeUndefined();
+
+      const timeoutPlanned = await createRuntime(currentApp, { idGenerator: () => "online-timeout" }).planMigration(timeoutTenant, targetApp);
+      const timeoutUnsigned = { ...timeoutPlanned, conversions: [conversion] };
+      const timeoutPlan = { ...timeoutUnsigned, checksum: await migrationChecksum(timeoutUnsigned) };
+      const timeoutOptions = {
+        ...options,
+        approval: { ...approval, planDigest: timeoutPlan.checksum },
+        lockTimeoutMs: 20
+      };
+      const completingApply = gatedStore.applyOnlinePlan(timeoutTenant, timeoutPlan, timeoutOptions);
+      await chunkEntered;
+      await expect(peerStore.applyOnlinePlan(timeoutTenant, timeoutPlan, timeoutOptions)).rejects.toMatchObject({
+        code: "MIGRATION_LOCK_TIMEOUT"
+      });
+      releaseChunk();
+      await expect(completingApply).resolves.toMatchObject({ id: timeoutPlan.id });
+      await expect(gatedStore.getOnlineRun(timeoutTenant, timeoutPlan.appName, timeoutPlan.id)).resolves.toMatchObject({
+        status: "completed"
+      });
+    } finally {
+      releaseChunk();
+      await sql`delete from framekit_migration_runs where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_migrations where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_documents where tenant_id = any(${tenantIds})`;
+      await (onlineStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
+      await (gatedStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
+      await (peerStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
     }
   });
 

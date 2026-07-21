@@ -793,6 +793,24 @@ describe("runtime document service", () => {
     });
     const conversionPlan = await runtime.planMigration(tenant, converted);
     await expect(runtime.applyMigration(tenant, conversionPlan, { allowDestructive: true })).rejects.toMatchObject({ code: "UNSUPPORTED_MIGRATION_CONVERSION" });
+    const conversion = {
+      id: "customer-name-number",
+      version: 1,
+      doctype: "customer",
+      field: "name",
+      fromType: "text",
+      toType: "number",
+      parameters: { offset: 0 },
+      artifactDigest: `sha256:${"A".repeat(43)}`
+    };
+    const onlineUnsigned = { ...conversionPlan, conversions: [conversion] };
+    const onlinePlan = { ...onlineUnsigned, checksum: await migrationChecksum(onlineUnsigned) };
+    await expect(validateMigrationPlan(onlinePlan)).resolves.toBeUndefined();
+    const changedParameters = { ...onlineUnsigned, conversions: [{ ...conversion, parameters: { offset: 100 } }] };
+    expect(await migrationChecksum(changedParameters)).not.toBe(onlinePlan.checksum);
+    const mismatchedUnsigned = { ...conversionPlan, conversions: [{ ...conversion, toType: "boolean" }] };
+    const mismatchedPlan = { ...mismatchedUnsigned, checksum: await migrationChecksum(mismatchedUnsigned) };
+    await expect(validateMigrationPlan(mismatchedPlan)).rejects.toMatchObject({ code: "INVALID_MIGRATION_CONVERSION" });
     await expect(runtime.migrationHistory(tenant)).resolves.toHaveLength(1);
 
     const supplier = defineDocType({ name: "supplier", label: "Supplier", fields: [{ name: "name", label: "Name", type: "text" }] });

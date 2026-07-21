@@ -21,10 +21,14 @@ import {
   type FilterOperator,
   type ListOptions,
   type MigrationChange,
+  type MigrationConversion,
+  type MigrationConversionArtifact,
   type MigrationPlan,
   type MigrationRecord,
   type MigrationRollback,
   type MigrationStore,
+  type OnlineMigrationOptions,
+  type OnlineMigrationRun,
   type MutationCommand,
   type MutationUnitOfWork,
   type NamingSeriesStore,
@@ -242,6 +246,7 @@ export const framekitMigrations = pgTable(
     fromUniqueConstraints: jsonb("from_unique_constraints").notNull().$type<MigrationRecord["fromUniqueConstraints"]>().default([]),
     toUniqueConstraints: jsonb("to_unique_constraints").notNull().$type<MigrationRecord["toUniqueConstraints"]>().default([]),
     changes: jsonb("changes").notNull().$type<MigrationRecord["changes"]>(),
+    conversions: jsonb("conversions").notNull().$type<MigrationConversion[]>().default([]),
     checksum: text("checksum").notNull().default(""),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
     appliedAt: timestamp("applied_at", { withTimezone: true }).notNull()
@@ -261,10 +266,11 @@ export type PostgresMutationUnitOfWorkOptions = PostgresRepositoryOptions & {
   faultInjector?: (stage: PostgresMutationStage, command: MutationCommand) => void | Promise<void>;
 };
 
-export type PostgresMigrationStage = "statement" | "backfill" | "record";
+export type PostgresMigrationStage = "statement" | "backfill" | "online_chunk" | "record";
 
 export type PostgresMigrationStoreOptions = PostgresRepositoryOptions & {
   faultInjector?: (stage: PostgresMigrationStage, plan: MigrationPlan, statementIndex?: number) => void | Promise<void>;
+  conversionRegistry?: readonly MigrationConversionArtifact[];
 };
 
 export type PostgresRealtimeStage = "locked" | "inserted";
@@ -1442,8 +1448,10 @@ export class PostgresMigrationStore implements MigrationStore {
   private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
   private readonly faultInjector?: PostgresMigrationStoreOptions["faultInjector"];
+  private readonly conversionRegistry: ReadonlyMap<string, Readonly<MigrationConversionArtifact>>;
 
   constructor(options: PostgresMigrationStoreOptions) {
+    this.conversionRegistry = createOnlineConversionRegistry(options.conversionRegistry ?? []);
     this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
     this.db = drizzle(this.sql);
     this.faultInjector = options.faultInjector;
@@ -1484,6 +1492,7 @@ export class PostgresMigrationStore implements MigrationStore {
       fromUniqueConstraints: migration.fromUniqueConstraints,
       toUniqueConstraints: migration.toUniqueConstraints,
       changes: migration.changes,
+      conversions: migration.conversions ?? [],
       checksum: migration.checksum,
       createdAt: new Date(migration.createdAt),
       appliedAt: new Date(migration.appliedAt)
@@ -1502,7 +1511,7 @@ export class PostgresMigrationStore implements MigrationStore {
       const existing = await sql<MigrationSqlRow[]>`
         select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
                to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
-               to_unique_constraints as "toUniqueConstraints", changes, checksum, created_at as "createdAt", applied_at as "appliedAt"
+               to_unique_constraints as "toUniqueConstraints", changes, conversions, checksum, created_at as "createdAt", applied_at as "appliedAt"
         from framekit_migrations where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and id = ${plan.id} limit 1
       `;
       if (existing[0]) {
@@ -1513,7 +1522,7 @@ export class PostgresMigrationStore implements MigrationStore {
       const latestRows = await sql<MigrationSqlRow[]>`
         select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
                to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
-               to_unique_constraints as "toUniqueConstraints", changes, checksum, created_at as "createdAt", applied_at as "appliedAt"
+               to_unique_constraints as "toUniqueConstraints", changes, conversions, checksum, created_at as "createdAt", applied_at as "appliedAt"
         from framekit_migrations where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} order by applied_at desc, id desc limit 1
       `;
       assertMigrationDrift(latestRows[0] ? migrationSqlRowToRecord(latestRows[0]) : undefined, plan);
@@ -1528,16 +1537,200 @@ export class PostgresMigrationStore implements MigrationStore {
       await sql`
         insert into framekit_migrations (
           tenant_id, id, app_name, from_schema_checksum, to_schema_checksum, from_unique_constraints,
-          to_unique_constraints, changes, checksum, created_at, applied_at
+          to_unique_constraints, changes, conversions, checksum, created_at, applied_at
         ) values (
           ${record.tenantId}, ${record.id}, ${record.appName}, ${record.fromSchemaChecksum}, ${record.toSchemaChecksum},
           ${JSON.stringify(record.fromUniqueConstraints)}::jsonb, ${JSON.stringify(record.toUniqueConstraints)}::jsonb,
-          ${JSON.stringify(record.changes)}::jsonb,
+          ${JSON.stringify(record.changes)}::jsonb, ${JSON.stringify(record.conversions ?? [])}::jsonb,
           ${record.checksum}, ${record.createdAt}::timestamptz, ${record.appliedAt}::timestamptz
         )
       `;
       return record;
     });
+  }
+
+  async getOnlineRun(tenant: TenantContext, appName: string, migrationId: string): Promise<OnlineMigrationRun | undefined> {
+    const rows = await this.sql<OnlineMigrationRunSqlRow[]>`
+      select tenant_id as "tenantId", app_name as "appName", migration_id as "migrationId",
+             plan_digest as "planDigest", conversion_digest as "conversionDigest", status, checkpoint,
+             approval, attempt_id as "attemptId", error, started_at as "startedAt", updated_at as "updatedAt", completed_at as "completedAt"
+      from framekit_migration_runs
+      where tenant_id = ${tenant.tenantId} and app_name = ${appName} and migration_id = ${migrationId}
+      limit 1
+    `;
+    return rows[0] ? onlineMigrationSqlRowToRun(rows[0]) : undefined;
+  }
+
+  async applyOnlinePlan(tenant: TenantContext, plan: MigrationPlan, options: OnlineMigrationOptions): Promise<MigrationRecord> {
+    await validateMigrationPlan(plan);
+    assertMigrationIdentity(tenant, plan.appName, plan);
+    const conversions = validateOnlineConversions(plan, this.conversionRegistry);
+    const conversionDigest = await onlineConversionDigest(conversions);
+    validateOnlineOptions(plan, options);
+    const attemptId = crypto.randomUUID();
+    const checkpoint = { conversionIndex: 0, processed: 0 };
+    await this.withOnlineLock(tenant, plan, options.lockTimeoutMs ?? 5_000, async (sql) => {
+      const existing = await selectOnlineRun(sql, tenant.tenantId, plan.appName, plan.id);
+      if (existing) {
+        assertOnlineRunMatches(existing, plan, conversionDigest);
+        if (existing.approval.outcome === "rejected") throw new FramekitError("MIGRATION_APPROVAL_REJECTED", "Rejected online migration evidence is terminal; create a distinct reviewed plan and run identity.", 409);
+        if (stableOnlineJson(existing.approval) !== stableOnlineJson(options.approval)) throw new FramekitError("MIGRATION_APPROVAL_DRIFT", "Resume approval does not match the stored approval evidence.", 409);
+        await sql`update framekit_migration_runs set attempt_id = ${attemptId}, updated_at = now()
+          where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id} and status <> 'completed'`;
+        return;
+      }
+      await sql`
+        insert into framekit_migration_runs (
+          tenant_id, app_name, migration_id, plan_digest, conversion_digest, status, checkpoint,
+          approval, attempt_id, error, started_at, updated_at
+        ) values (
+          ${tenant.tenantId}, ${plan.appName}, ${plan.id}, ${plan.checksum}, ${conversionDigest},
+          ${options.approval.outcome === "approved" ? "pending" : "failed"}, ${JSON.stringify(checkpoint)}::jsonb,
+          ${JSON.stringify(options.approval)}::jsonb, ${options.approval.outcome === "approved" ? attemptId : null}, ${options.approval.outcome === "approved" ? null : "Migration approval was rejected."}, now(), now()
+        )
+      `;
+    });
+    if (options.approval.outcome !== "approved") {
+      throw new FramekitError("MIGRATION_APPROVAL_REJECTED", "Online migration approval was rejected.", 409);
+    }
+
+    const chunkSize = options.chunkSize ?? 100;
+    const maxRetries = options.maxRetries ?? 3;
+    try {
+      while (true) {
+        const transformed = await retryOnlineChunk(maxRetries, () => this.withOnlineLock(
+          tenant,
+          plan,
+          options.lockTimeoutMs ?? 5_000,
+          async (sql) => this.transformOnlineChunk(sql, tenant, plan, conversions, this.conversionRegistry, conversionDigest, chunkSize, attemptId)
+        ));
+        if (transformed) break;
+      }
+      return await this.withOnlineLock(tenant, plan, options.lockTimeoutMs ?? 5_000, async (sql) => {
+        const run = await selectOnlineRun(sql, tenant.tenantId, plan.appName, plan.id);
+        if (!run) throw new FramekitError("MIGRATION_RUN_MISSING", "Online migration run state is missing.", 409);
+        assertOnlineRunMatches(run, plan, conversionDigest);
+        if (run.approval.outcome === "rejected") throw new FramekitError("MIGRATION_APPROVAL_REJECTED", "Rejected online migration evidence is terminal.", 409);
+        const prior = await selectAppliedMigration(sql, tenant.tenantId, plan.appName, plan.id);
+        if (prior) {
+          if (prior.checksum !== plan.checksum) throw new FramekitError("MIGRATION_ID_CONFLICT", `Migration ID "${plan.id}" was already applied with a different checksum.`, 409);
+          await markOnlineRunCompleted(sql, tenant.tenantId, plan.appName, plan.id);
+          return prior;
+        }
+        const latestRows = await sql<MigrationSqlRow[]>`
+          select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
+                 to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
+                 to_unique_constraints as "toUniqueConstraints", changes, conversions, checksum, created_at as "createdAt", applied_at as "appliedAt"
+          from framekit_migrations where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} order by applied_at desc, id desc limit 1
+        `;
+        assertMigrationDrift(latestRows[0] ? migrationSqlRowToRecord(latestRows[0]) : undefined, plan);
+        await assertLegacyUniqueValues(sql, tenant.tenantId, plan.toUniqueConstraints);
+        const statements = executableStatements(createPostgresMigrationStatements(plan));
+        for (const [statementIndex, statement] of statements.entries()) {
+          await sql.unsafe(statement);
+          await this.faultInjector?.("statement", plan, statementIndex);
+        }
+        await resynchronizeUniqueValues(sql, tenant.tenantId, plan.fromUniqueConstraints, plan.toUniqueConstraints);
+        await this.faultInjector?.("backfill", plan);
+        await this.faultInjector?.("record", plan);
+        const record: MigrationRecord = { ...plan, appliedAt: options.appliedAt ?? new Date().toISOString() };
+        await insertAppliedMigration(sql, record);
+        await markOnlineRunCompleted(sql, tenant.tenantId, plan.appName, plan.id);
+        return record;
+      });
+    } catch (error) {
+      if (!(error instanceof FramekitError && error.code === "MIGRATION_LOCK_TIMEOUT")) {
+        await this.withOnlineLock(tenant, plan, options.lockTimeoutMs ?? 5_000, async (sql) => {
+          const applied = await selectAppliedMigration(sql, tenant.tenantId, plan.appName, plan.id);
+          if (applied) return;
+          await sql`update framekit_migration_runs set status = 'failed', error = ${errorMessage(error)}, updated_at = now()
+            where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id}
+              and plan_digest = ${plan.checksum} and conversion_digest = ${conversionDigest}
+              and attempt_id = ${attemptId} and status <> 'completed'`;
+        });
+      }
+      throw error;
+    }
+  }
+
+  private async transformOnlineChunk(
+    sql: postgres.TransactionSql,
+    tenant: TenantContext,
+    plan: MigrationPlan,
+    conversions: MigrationConversion[],
+    registry: ReadonlyMap<string, Readonly<MigrationConversionArtifact>>,
+    conversionDigest: string,
+    chunkSize: number,
+    attemptId: string
+  ): Promise<boolean> {
+    const run = await selectOnlineRun(sql, tenant.tenantId, plan.appName, plan.id);
+    if (!run) throw new FramekitError("MIGRATION_RUN_MISSING", "Online migration run state is missing.", 409);
+    assertOnlineRunMatches(run, plan, conversionDigest);
+    if (run.approval.outcome === "rejected") throw new FramekitError("MIGRATION_APPROVAL_REJECTED", "Rejected online migration evidence is terminal.", 409);
+    if (run.status === "completed" || run.checkpoint.conversionIndex >= conversions.length) return true;
+    await sql`update framekit_migration_runs set attempt_id = ${attemptId}, status = 'running', updated_at = now()
+      where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id} and status <> 'completed'`;
+    const conversion = conversions[run.checkpoint.conversionIndex]!;
+    const artifact = registry.get(onlineConversionIdentity(conversion.id, conversion.version))!;
+    const rows = await sql<{ id: string; data: Record<string, unknown> }[]>`
+      select id, data from framekit_documents
+      where tenant_id = ${tenant.tenantId} and doctype = ${conversion.doctype}
+        and id > ${run.checkpoint.lastDocumentId ?? ""}
+      order by id asc limit ${chunkSize}
+      for update
+    `;
+    for (const row of rows) {
+      const first = await artifact.convert(structuredClone(row.data[conversion.field]), structuredClone(row.data), immutableOnlineParameters(conversion.parameters));
+      const second = await artifact.convert(structuredClone(row.data[conversion.field]), structuredClone(row.data), immutableOnlineParameters(conversion.parameters));
+      assertOnlineConversionValue(conversion, first, row.id);
+      assertOnlineConversionValue(conversion, second, row.id);
+      if (stableOnlineJson(first) !== stableOnlineJson(second)) {
+        throw new FramekitError("NONDETERMINISTIC_MIGRATION_CONVERSION", `Conversion ${conversion.id}@${conversion.version} returned different results for document ${row.id}.`, 422);
+      }
+      const data = { ...row.data, [conversion.field]: first };
+      await sql`
+        update framekit_documents set data = ${JSON.stringify(data)}::jsonb, revision = revision + 1, updated_at = now()
+        where tenant_id = ${tenant.tenantId} and doctype = ${conversion.doctype} and id = ${row.id}
+      `;
+    }
+    await this.faultInjector?.("online_chunk", plan, run.checkpoint.conversionIndex);
+    const finishedConversion = rows.length < chunkSize;
+    const nextCheckpoint = {
+      conversionIndex: finishedConversion ? run.checkpoint.conversionIndex + 1 : run.checkpoint.conversionIndex,
+      ...(finishedConversion || rows.length === 0 ? {} : { lastDocumentId: rows.at(-1)!.id }),
+      processed: run.checkpoint.processed + rows.length
+    };
+    const updated = await sql<{ migrationId: string }[]>`
+      update framekit_migration_runs set status = 'running', checkpoint = ${JSON.stringify(nextCheckpoint)}::jsonb,
+        error = null, updated_at = now()
+      where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id}
+        and attempt_id = ${attemptId} and checkpoint = ${JSON.stringify(run.checkpoint)}::jsonb and status <> 'completed'
+      returning migration_id as "migrationId"
+    `;
+    if (!updated[0]) throw new FramekitError("MIGRATION_ATTEMPT_SUPERSEDED", "Online migration checkpoint ownership changed; retry the run.", 409);
+    return nextCheckpoint.conversionIndex >= conversions.length;
+  }
+
+  private async withOnlineLock<T>(
+    tenant: TenantContext,
+    plan: MigrationPlan,
+    timeoutMs: number,
+    callback: (sql: postgres.TransactionSql) => Promise<T>
+  ): Promise<T> {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const result = await this.sql.begin(async (sql) => {
+        const locked = await sql<{ locked: boolean }[]>`
+          select pg_try_advisory_xact_lock(hashtextextended(${`framekit:migration:${tenant.tenantId}:${plan.appName}`}, 0)) as locked
+        `;
+        if (!locked[0]?.locked) return { locked: false as const };
+        await sql`select set_config('lock_timeout', ${`${timeoutMs}ms`}, true)`;
+        return { locked: true as const, value: await callback(sql) };
+      });
+      if (result.locked) return result.value;
+      if (Date.now() >= deadline) throw new FramekitError("MIGRATION_LOCK_TIMEOUT", "Timed out waiting for the tenant/app migration lock.", 409);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(25, Math.max(1, deadline - Date.now()))));
+    }
   }
 
   async rollback(tenant: TenantContext, migration: MigrationRecord, options: { allowDestructive?: boolean; id?: string; appliedAt?: string } = {}): Promise<MigrationRecord> {
@@ -1807,6 +2000,7 @@ create table if not exists framekit_migrations (
   from_unique_constraints jsonb not null default '[]'::jsonb,
   to_unique_constraints jsonb not null default '[]'::jsonb,
   changes jsonb not null,
+  conversions jsonb not null default '[]'::jsonb,
   checksum text not null default '',
   created_at timestamptz not null,
   applied_at timestamptz not null,
@@ -1817,9 +2011,28 @@ alter table framekit_migrations add column if not exists from_schema_checksum te
 alter table framekit_migrations add column if not exists to_schema_checksum text not null default '';
 alter table framekit_migrations add column if not exists from_unique_constraints jsonb not null default '[]'::jsonb;
 alter table framekit_migrations add column if not exists to_unique_constraints jsonb not null default '[]'::jsonb;
+alter table framekit_migrations add column if not exists conversions jsonb not null default '[]'::jsonb;
 alter table framekit_migrations drop constraint if exists framekit_migrations_identity;
 create unique index if not exists framekit_migrations_identity on framekit_migrations (tenant_id, app_name, id);
 create index if not exists framekit_migrations_lookup on framekit_migrations (tenant_id, applied_at desc);
+create table if not exists framekit_migration_runs (
+  tenant_id text not null,
+  app_name text not null,
+  migration_id text not null,
+  plan_digest text not null,
+  conversion_digest text not null,
+  status text not null,
+  checkpoint jsonb not null,
+  approval jsonb not null,
+  attempt_id text,
+  error text,
+  started_at timestamptz not null,
+  updated_at timestamptz not null,
+  completed_at timestamptz,
+  constraint framekit_migration_runs_identity unique (tenant_id, app_name, migration_id)
+);
+alter table framekit_migration_runs add column if not exists attempt_id text;
+create index if not exists framekit_migration_runs_status on framekit_migration_runs (tenant_id, app_name, status, updated_at);
 `;
 }
 
@@ -1891,14 +2104,280 @@ type MigrationSqlRow = {
   fromUniqueConstraints: MigrationRecord["fromUniqueConstraints"];
   toUniqueConstraints: MigrationRecord["toUniqueConstraints"];
   changes: MigrationRecord["changes"];
+  conversions: MigrationConversion[];
   checksum: string;
   createdAt: Date | string;
   appliedAt: Date | string;
 };
 
-function migrationSqlRowToRecord(row: MigrationSqlRow): MigrationRecord {
+type OnlineMigrationRunSqlRow = Omit<OnlineMigrationRun, "startedAt" | "updatedAt" | "completedAt" | "error" | "attemptId"> & {
+  attemptId: string | null;
+  error: string | null;
+  startedAt: Date | string;
+  updatedAt: Date | string;
+  completedAt: Date | string | null;
+};
+
+function onlineMigrationSqlRowToRun(row: OnlineMigrationRunSqlRow): OnlineMigrationRun {
+  const { completedAt, error, attemptId, ...rest } = row;
   return {
-    ...row,
+    ...rest,
+    startedAt: isoTimestamp(row.startedAt),
+    updatedAt: isoTimestamp(row.updatedAt),
+    ...(attemptId ? { attemptId } : {}),
+    ...(error ? { error } : {}),
+    ...(completedAt ? { completedAt: isoTimestamp(completedAt) } : {})
+  };
+}
+
+function isoTimestamp(value: Date | string): string {
+  return typeof value === "string" ? new Date(value).toISOString() : value.toISOString();
+}
+
+function validateOnlineConversions(
+  plan: MigrationPlan,
+  registry: ReadonlyMap<string, Readonly<MigrationConversionArtifact>>
+): MigrationConversion[] {
+  const conversions = plan.conversions ?? [];
+  const typeChanges = plan.changes.filter((change) => change.kind === "change_field_type");
+  if (conversions.length !== typeChanges.length) {
+    throw new FramekitError("MISSING_MIGRATION_CONVERSION", "Every field type change requires exactly one versioned conversion.", 422);
+  }
+  const conversionIdentities = new Set<string>();
+  for (const conversion of conversions) {
+    const identity = `${conversion.id}@${conversion.version}`;
+    if (conversionIdentities.has(identity)) throw new FramekitError("DUPLICATE_MIGRATION_CONVERSION", `Conversion descriptor ${identity} is registered more than once.`, 422);
+    conversionIdentities.add(identity);
+  }
+  for (const conversion of conversions) {
+    const artifact = registry.get(onlineConversionIdentity(conversion.id, conversion.version));
+    if (!artifact) throw new FramekitError("MISSING_MIGRATION_CONVERSION", `Conversion artifact ${conversion.id}@${conversion.version} is not registered.`, 422);
+    if (artifact.artifactDigest !== conversion.artifactDigest) {
+      throw new FramekitError("MIGRATION_CONVERSION_DRIFT", `Conversion artifact ${conversion.id}@${conversion.version} does not match the reviewed artifact digest.`, 409);
+    }
+  }
+  return conversions;
+}
+
+export async function migrationConversionArtifactDigest(artifact: string | Uint8Array): Promise<string> {
+  const bytes = typeof artifact === "string" ? new TextEncoder().encode(artifact) : Uint8Array.from(artifact);
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let binary = "";
+  for (const byte of digest) binary += String.fromCharCode(byte);
+  return `sha256:${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")}`;
+}
+
+function createOnlineConversionRegistry(
+  artifacts: readonly MigrationConversionArtifact[]
+): ReadonlyMap<string, Readonly<MigrationConversionArtifact>> {
+  const registry = new Map<string, Readonly<MigrationConversionArtifact>>();
+  for (const artifact of artifacts) {
+    const identity = onlineConversionIdentity(artifact.id, artifact.version);
+    if (registry.has(identity)) throw new FramekitError("DUPLICATE_MIGRATION_CONVERSION", `Conversion artifact ${identity} is registered more than once.`, 422);
+    if (!artifact.id || !Number.isSafeInteger(artifact.version) || artifact.version < 1 || !/^sha256:[A-Za-z0-9_-]{43}$/.test(artifact.artifactDigest)) {
+      throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion artifact ${identity} requires a positive version and SHA-256 artifact digest.`, 422);
+    }
+    const source = Function.prototype.toString.call(artifact.convert);
+    if (source.includes("[native code]")) throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion artifact ${identity} cannot use a native or bound function.`, 422);
+    registry.set(identity, Object.freeze({ ...artifact }));
+  }
+  return registry;
+}
+
+function onlineConversionIdentity(id: string, version: number): string {
+  return `${id}@${version}`;
+}
+
+function validateOnlineOptions(plan: MigrationPlan, options: OnlineMigrationOptions): void {
+  if (!options.approval.approver || !options.approval.approvedAt || !Number.isFinite(Date.parse(options.approval.approvedAt))) {
+    throw new FramekitError("INVALID_MIGRATION_APPROVAL", "Online migration approval requires an approver and valid timestamp.", 422);
+  }
+  if (options.approval.planDigest !== plan.checksum) {
+    throw new FramekitError("MIGRATION_APPROVAL_DRIFT", "Approval digest does not match the migration plan.", 409);
+  }
+  if (options.chunkSize !== undefined && (!Number.isSafeInteger(options.chunkSize) || options.chunkSize < 1 || options.chunkSize > 10_000)) {
+    throw new FramekitError("INVALID_MIGRATION_CHUNK_SIZE", "Online migration chunk size must be between 1 and 10000.", 422);
+  }
+  if (options.lockTimeoutMs !== undefined && (!Number.isSafeInteger(options.lockTimeoutMs) || options.lockTimeoutMs < 1 || options.lockTimeoutMs > 300_000)) {
+    throw new FramekitError("INVALID_MIGRATION_LOCK_TIMEOUT", "Online migration lock timeout must be between 1 and 300000 milliseconds.", 422);
+  }
+  if (options.maxRetries !== undefined && (!Number.isSafeInteger(options.maxRetries) || options.maxRetries < 0 || options.maxRetries > 20)) {
+    throw new FramekitError("INVALID_MIGRATION_RETRIES", "Online migration retries must be between 0 and 20.", 422);
+  }
+}
+
+async function onlineConversionDigest(conversions: MigrationConversion[]): Promise<string> {
+  const bytes = new TextEncoder().encode(stableOnlineJson(conversions));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let binary = "";
+  for (const byte of digest) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+function stableOnlineJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableOnlineJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => `${JSON.stringify(key)}:${stableOnlineJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function assertJsonSafeOnlineValue(value: unknown, path = "value", ancestors = new WeakSet<object>()): void {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) return;
+    throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must be a finite JSON number.`, 422);
+  }
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must not contain circular references.`, 422);
+    ancestors.add(value);
+    if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0 || Object.getOwnPropertyNames(value).length !== value.length + 1) {
+      throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must be a plain JSON array.`, 422);
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor?.enumerable || !("value" in descriptor)) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must be a dense plain-data JSON array.`, 422);
+      assertJsonSafeOnlineValue(descriptor.value, `${path}[${index}]`, ancestors);
+    }
+    ancestors.delete(value);
+    return;
+  }
+  if (value && typeof value === "object") {
+    if (ancestors.has(value)) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must not contain circular references.`, 422);
+    ancestors.add(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must be a plain JSON object.`, 422);
+    if (Object.getOwnPropertySymbols(value).length > 0) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must not contain symbol properties.`, 422);
+    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+      if (!descriptor.enumerable || !("value" in descriptor)) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path}.${key} must be enumerable plain data.`, 422);
+      assertJsonSafeOnlineValue(descriptor.value, `${path}.${key}`, ancestors);
+    }
+    ancestors.delete(value);
+    return;
+  }
+  throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} is not JSON-safe.`, 422);
+}
+
+function immutableOnlineParameters(parameters: MigrationConversion["parameters"]): MigrationConversion["parameters"] {
+  const cloned = structuredClone(parameters);
+  const freeze = (value: MigrationConversion["parameters"]): MigrationConversion["parameters"] => {
+    if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+    for (const item of Array.isArray(value) ? value : Object.values(value)) freeze(item);
+    return Object.freeze(value) as MigrationConversion["parameters"];
+  };
+  return freeze(cloned);
+}
+
+function assertOnlineConversionValue(conversion: MigrationConversion, value: unknown, documentId: string): void {
+  assertJsonSafeOnlineValue(value, `${conversion.id}@${conversion.version} document ${documentId}`);
+  let compatible = value === null;
+  switch (conversion.toType) {
+    case "number":
+    case "currency":
+      compatible ||= typeof value === "number" && Number.isFinite(value);
+      break;
+    case "boolean":
+      compatible ||= typeof value === "boolean";
+      break;
+    case "json":
+      compatible ||= value !== undefined;
+      break;
+    default:
+      compatible ||= typeof value === "string";
+  }
+  if (!compatible) {
+    throw new FramekitError(
+      "INVALID_MIGRATION_CONVERSION_VALUE",
+      `Conversion ${conversion.id}@${conversion.version} produced an incompatible ${conversion.toType} value for document ${documentId}.`,
+      422
+    );
+  }
+}
+
+async function retryOnlineChunk<T>(maxRetries: number, operation: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (attempt >= maxRetries || !isRetryableMigrationError(error)) throw error;
+      attempt += 1;
+    }
+  }
+}
+
+function isRetryableMigrationError(error: unknown): boolean {
+  if (error instanceof FramekitError) return error.code === "MIGRATION_LOCK_TIMEOUT";
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "40001" || code === "40P01" || code === "55P03" || code === "57P01" || code === "08006";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function assertOnlineRunMatches(run: OnlineMigrationRun, plan: MigrationPlan, conversionDigest: string): void {
+  if (run.planDigest !== plan.checksum) {
+    throw new FramekitError("MIGRATION_PLAN_DRIFT", "Migration plan changed after the online run started.", 409);
+  }
+  if (run.conversionDigest !== conversionDigest) {
+    throw new FramekitError("MIGRATION_CONVERSION_DRIFT", "Migration conversion metadata changed after the online run started.", 409);
+  }
+}
+
+async function selectOnlineRun(
+  sql: postgres.TransactionSql,
+  tenantId: string,
+  appName: string,
+  migrationId: string
+): Promise<OnlineMigrationRun | undefined> {
+  const rows = await sql<OnlineMigrationRunSqlRow[]>`
+    select tenant_id as "tenantId", app_name as "appName", migration_id as "migrationId",
+           plan_digest as "planDigest", conversion_digest as "conversionDigest", status, checkpoint,
+           approval, attempt_id as "attemptId", error, started_at as "startedAt", updated_at as "updatedAt", completed_at as "completedAt"
+    from framekit_migration_runs
+    where tenant_id = ${tenantId} and app_name = ${appName} and migration_id = ${migrationId}
+    limit 1
+  `;
+  return rows[0] ? onlineMigrationSqlRowToRun(rows[0]) : undefined;
+}
+
+async function selectAppliedMigration(sql: postgres.TransactionSql, tenantId: string, appName: string, migrationId: string): Promise<MigrationRecord | undefined> {
+  const rows = await sql<MigrationSqlRow[]>`
+    select tenant_id as "tenantId", id, app_name as "appName", from_schema_checksum as "fromSchemaChecksum",
+           to_schema_checksum as "toSchemaChecksum", from_unique_constraints as "fromUniqueConstraints",
+           to_unique_constraints as "toUniqueConstraints", changes, conversions, checksum, created_at as "createdAt", applied_at as "appliedAt"
+    from framekit_migrations where tenant_id = ${tenantId} and app_name = ${appName} and id = ${migrationId} limit 1
+  `;
+  return rows[0] ? migrationSqlRowToRecord(rows[0]) : undefined;
+}
+
+async function insertAppliedMigration(sql: postgres.TransactionSql, record: MigrationRecord): Promise<void> {
+  await sql`
+    insert into framekit_migrations (
+      tenant_id, id, app_name, from_schema_checksum, to_schema_checksum, from_unique_constraints,
+      to_unique_constraints, changes, conversions, checksum, created_at, applied_at
+    ) values (
+      ${record.tenantId}, ${record.id}, ${record.appName}, ${record.fromSchemaChecksum}, ${record.toSchemaChecksum},
+      ${JSON.stringify(record.fromUniqueConstraints)}::jsonb, ${JSON.stringify(record.toUniqueConstraints)}::jsonb,
+      ${JSON.stringify(record.changes)}::jsonb, ${JSON.stringify(record.conversions ?? [])}::jsonb,
+      ${record.checksum}, ${record.createdAt}::timestamptz, ${record.appliedAt}::timestamptz
+    )
+  `;
+}
+
+async function markOnlineRunCompleted(sql: postgres.TransactionSql, tenantId: string, appName: string, migrationId: string): Promise<void> {
+  await sql`
+    update framekit_migration_runs set status = 'completed', attempt_id = null, error = null, updated_at = now(), completed_at = now()
+    where tenant_id = ${tenantId} and app_name = ${appName} and migration_id = ${migrationId} and status <> 'completed'
+  `;
+}
+
+function migrationSqlRowToRecord(row: MigrationSqlRow): MigrationRecord {
+  const { conversions, ...rest } = row;
+  return {
+    ...rest,
+    ...(conversions.length > 0 ? { conversions } : {}),
     createdAt: typeof row.createdAt === "string" ? new Date(row.createdAt).toISOString() : row.createdAt.toISOString(),
     appliedAt: typeof row.appliedAt === "string" ? new Date(row.appliedAt).toISOString() : row.appliedAt.toISOString()
   };
@@ -2004,7 +2483,12 @@ function indexIdentifier(change: Pick<MigrationChange, "doctype" | "field">, suf
 }
 
 function identifierPart(value: string): string {
-  return value.replaceAll(/[^a-zA-Z0-9_]+/g, "_").replaceAll(/^_+|_+$/g, "").toLowerCase();
+  const normalized = value.replaceAll(/[^a-zA-Z0-9_]+/g, "_");
+  let start = 0;
+  let end = normalized.length;
+  while (normalized[start] === "_") start += 1;
+  while (end > start && normalized[end - 1] === "_") end -= 1;
+  return normalized.slice(start, end).toLowerCase();
 }
 
 function indexExpressions(fields: string): string[] {
@@ -2307,6 +2791,7 @@ function rowToMigration(row: typeof framekitMigrations.$inferSelect): MigrationR
     fromUniqueConstraints: row.fromUniqueConstraints,
     toUniqueConstraints: row.toUniqueConstraints,
     changes: row.changes,
+    ...(row.conversions.length > 0 ? { conversions: row.conversions } : {}),
     checksum: row.checksum,
     createdAt: row.createdAt.toISOString(),
     appliedAt: row.appliedAt.toISOString()
