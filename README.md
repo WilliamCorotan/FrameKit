@@ -347,10 +347,10 @@ pnpm audit:all
 Current verification status:
 
 - Full audit passes: lint, typecheck, tests, and build.
-- Unit/in-process suite passes locally: 11 files and 104 tests; 2 service-backed files and 13 tests skip without service environment variables.
+- Unit/in-process suite passes locally: 11 files and 109 tests; 2 service-backed files and 13 tests skip without service environment variables.
 - Coverage gates enforce at least 60% statements/functions/lines and 50% branches across public package source.
 - Production build passes for packages, Desk, and CRM example.
-- Split CI covers package-local tests, coverage, Node 22/24 exports, Postgres 16/17, Redis 7/8, built smoke, standalone consumption, browsers, CodeQL, dependency review/audit, and SBOM generation.
+- Split CI covers package-local tests, coverage, Node 22/24 exports, Postgres 16/17, Redis 7/8, built smoke, standalone consumption, browsers, CodeQL, dependency audit, and SBOM generation.
 - In-process Nitro smoke covers auth lifecycle, provider login, OpenAPI, diagnostics, document CRUD, uniqueness, filters, cursor/projection, auth admin, password reset/change, customization, migrations, outbox, realtime history, and security/operations headers.
 
 ## Architecture
@@ -372,7 +372,7 @@ Postgres query pushdown and stable opaque cursor semantics are documented in [do
 
 ## Roadmap Status
 
-Framekit is currently assessed as a beta: 82% implemented toward a production-ready 1.0, with the primary remaining product gap in deeper business-document metadata semantics. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
+Framekit is currently assessed as a beta: 83% implemented toward a production-ready 1.0. The bounded metadata/lifecycle contract is implemented; explicitly deferred metadata primitives remain tracked in issues #39 through #42. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
 
 ## License
 

@@ -37,7 +37,7 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 | Jobs, events, and realtime | 85% | BullMQ queues/workers, atomic outbox leases, retry/backoff/dead-letter behavior, idempotency keys, scheduling, Postgres fanout/replay, SSE, lifecycle and cancellation | Operational load evidence, poison-message tooling, richer scheduler persistence |
 | Desk and admin UI | 82% | Metadata lists/forms, workflows, auth administration, customization, operations screens, real-stack Chromium/Firefox journeys, accessibility checks | Richer field errors, keyboard depth, visual regression policy |
 | SDK, CLI, and developer experience | 75% | Broad HTTP parity, generated model types, scaffolding, migration commands, packed standalone consumer proof | Typed/retriable errors, upgrade/config workflows, packaged Desk template |
-| Operations, security, and release | 82% | Secure defaults, lifecycle, bounded readiness, OpenTelemetry-compatible adapters/redaction, tested compatibility, provenance publication, dependency audit/review, CodeQL, Dependabot, and SBOM artifacts | Alert/runbook examples, SLO guidance, sustained fault/load evidence |
+| Operations, security, and release | 82% | Secure defaults, lifecycle, bounded readiness, OpenTelemetry-compatible adapters/redaction, tested compatibility, provenance publication, dependency audit, CodeQL, Dependabot, and SBOM artifacts | Alert/runbook examples, SLO guidance, sustained fault/load evidence |
 | Testing and CI | 88% | Unit, service, concurrency/fault, built smoke, standalone package, full-stack browser, package-local, compatibility matrix, and enforced coverage gates | Sustained load/soak testing, more failure injection, visual regression |
 | Documentation and adoption | 72% | README, architecture, deployment, security, identity, consistency, querying, migrations, observability, compatibility, contribution, disclosure, support, release, and roadmaps | Generated API reference site, versioned upgrade guides, external tutorial feedback |
 
@@ -96,12 +96,12 @@ Exit criteria:
 
 Reevaluation checks on 2026-07-21:
 
-- `pnpm audit:all`: lint/typecheck, 104 unit/in-process tests, enforced coverage thresholds, and all package, CRM, and Desk builds pass.
+- `pnpm audit:all`: lint/typecheck, 109 unit/in-process tests, enforced coverage thresholds, and all package, CRM, and Desk builds pass.
 - `pnpm test:desk:browser`: 5 Chromium journeys passed against mocked API routes.
 - `pnpm smoke:crm:built`: assertions and bounded cleanup regression tests pass and terminate; #18 is closed.
-- CI defines bounded package-local/coverage, Node 22/24, Postgres 16/17, Redis 7/8, built-smoke, standalone, browser, CodeQL, dependency review/audit, Dependabot, and SBOM gates.
+- CI defines bounded package-local/coverage, Node 22/24, Postgres 16/17, Redis 7/8, built-smoke, standalone, browser, CodeQL, dependency audit, Dependabot, and SBOM gates.
 - Forged-header, cross-tenant, operation-permission, realtime-history, and SSE authorization checks pass; #16 is closed.
-- All ten public packages expose working package-local test commands; coverage is 65.57% statements, 59.81% branches, 64.65% functions, and 67.10% lines at this reevaluation.
+- All ten public packages expose working package-local test commands; coverage is 66.98% statements, 61.31% branches, 65.38% functions, and 68.90% lines at this reevaluation.
 - GitHub issues #2 through #7 are closed and their implemented work is present; older pending references were stale.
 
 ## Score Update Policy
