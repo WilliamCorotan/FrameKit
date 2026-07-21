@@ -722,7 +722,7 @@ describe("runtime document service", () => {
       }
     );
 
-    const unsubscribe = runtime.subscribeRealtime(tenant, (event) => received.push(event));
+    const unsubscribe = await runtime.subscribeRealtime(tenant, (event) => received.push(event));
     await runtime.create(tenant, "customer", { name: "Stream Co" });
     unsubscribe();
 

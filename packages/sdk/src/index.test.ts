@@ -113,7 +113,7 @@ describe("generateSdkTypes", () => {
       new Response(
         new ReadableStream({
           start(controller) {
-            controller.enqueue(new TextEncoder().encode('event: customer.created\ndata: {"id":"customer-1"}\n\n'));
+            controller.enqueue(new TextEncoder().encode('id: 42\nevent: customer.created\ndata: {"id":"customer-1"}\n\n'));
             controller.close();
           }
         }),
@@ -123,9 +123,10 @@ describe("generateSdkTypes", () => {
     const events: unknown[] = [];
     const client = createClient({ baseUrl: "http://localhost:3000", token: "session" });
 
-    await client.streamRealtimeEvents((event) => events.push(event));
+    await client.streamRealtimeEvents((event) => events.push(event), { lastEventId: "41" });
 
-    expect(events).toEqual([{ type: "customer.created", data: { id: "customer-1" } }]);
+    expect(events).toEqual([{ id: "42", type: "customer.created", data: { id: "customer-1" } }]);
+    expect(vi.mocked(fetch).mock.calls[0]?.[1]?.headers).toMatchObject({ "last-event-id": "41" });
   });
 
   it("includes credentials for cookie-backed auth helpers", async () => {

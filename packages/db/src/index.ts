@@ -25,8 +25,11 @@ import {
   type MutationUnitOfWork,
   type NamingSeriesStore,
   type OutboxEvent,
+  type OutboxClaimOptions,
   type OutboxStore,
   type RepositoryDiagnostics,
+  type RealtimePublisher,
+  type RuntimeRealtimeEvent,
   assertDestructiveMigration,
   assertMigrationDrift,
   assertMigrationIdentity,
@@ -131,7 +134,10 @@ export const framekitOutboxEvents = pgTable("framekit_outbox_events", {
   attempts: integer("attempts").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true }),
-  error: text("error")
+  error: text("error"),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
 });
 
 export const framekitDocumentUniqueValues = pgTable(
@@ -225,6 +231,12 @@ export type PostgresMigrationStage = "statement" | "backfill" | "record";
 
 export type PostgresMigrationStoreOptions = PostgresRepositoryOptions & {
   faultInjector?: (stage: PostgresMigrationStage, plan: MigrationPlan, statementIndex?: number) => void | Promise<void>;
+};
+
+export type PostgresRealtimeStage = "locked" | "inserted";
+
+export type PostgresRealtimePublisherOptions = PostgresRepositoryOptions & {
+  faultInjector?: (stage: PostgresRealtimeStage, event: RuntimeRealtimeEvent) => void | Promise<void>;
 };
 
 export class PostgresDocumentRepository implements DocumentRepository {
@@ -746,10 +758,12 @@ export class PostgresAuditStore implements AuditStore {
 }
 
 export class PostgresOutboxStore implements OutboxStore {
+  private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.db = drizzle(postgres(options.connectionString, { max: options.max ?? 5 }));
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.db = drizzle(this.sql);
   }
 
   async migrate(): Promise<void> {
@@ -764,6 +778,10 @@ export class PostgresOutboxStore implements OutboxStore {
     };
   }
 
+  async close(): Promise<void> {
+    await this.sql.end({ timeout: 1 });
+  }
+
   async record(event: OutboxEvent): Promise<void> {
     await this.db.insert(framekitOutboxEvents).values({
       tenantId: event.tenantId,
@@ -775,7 +793,10 @@ export class PostgresOutboxStore implements OutboxStore {
       attempts: event.attempts,
       createdAt: new Date(event.createdAt),
       processedAt: event.processedAt ? new Date(event.processedAt) : null,
-      error: event.error
+      error: event.error,
+      leaseOwner: event.leaseOwner,
+      leaseExpiresAt: event.leaseExpiresAt ? new Date(event.leaseExpiresAt) : null,
+      nextAttemptAt: event.nextAttemptAt ? new Date(event.nextAttemptAt) : null
     });
   }
 
@@ -795,6 +816,76 @@ export class PostgresOutboxStore implements OutboxStore {
     return this.updateStatus(tenant, id, "failed", error);
   }
 
+  async claim(tenant: TenantContext, options: OutboxClaimOptions): Promise<OutboxEvent[]> {
+    const now = new Date(options.now ?? new Date().toISOString());
+    const nowIso = now.toISOString();
+    const maxAttempts = options.maxAttempts ?? 5;
+    const leaseExpiresAt = new Date(now.getTime() + (options.leaseMs ?? 30_000)).toISOString();
+    return this.sql.begin(async (sql) => {
+      await sql`
+        update framekit_outbox_events
+        set status = 'dead_letter', processed_at = ${nowIso}::timestamptz,
+            error = coalesce(error, case when status = 'leased' then 'Lease expired after maximum delivery attempts' else 'Maximum delivery attempts exhausted' end),
+            lease_owner = null, lease_expires_at = null
+        where tenant_id = ${tenant.tenantId} and attempts >= ${maxAttempts} and (
+          status = 'failed' or (status = 'leased' and lease_expires_at <= ${nowIso}::timestamptz)
+        )
+      `;
+      const rows = await sql<OutboxSqlRow[]>`
+        with candidates as (
+          select tenant_id, id
+          from framekit_outbox_events
+          where tenant_id = ${tenant.tenantId} and attempts < ${maxAttempts} and (
+            status = 'pending' or
+            (status = 'failed' and (next_attempt_at is null or next_attempt_at <= ${nowIso}::timestamptz)) or
+            (status = 'leased' and lease_expires_at <= ${nowIso}::timestamptz)
+          )
+          order by created_at asc, id asc
+          for update skip locked
+          limit ${options.limit ?? 100}
+        )
+        update framekit_outbox_events event
+        set status = 'leased', attempts = event.attempts + 1, lease_owner = ${options.ownerId},
+            lease_expires_at = ${leaseExpiresAt}::timestamptz, next_attempt_at = null
+        from candidates
+        where event.tenant_id = candidates.tenant_id and event.id = candidates.id
+        returning event.*
+      `;
+      return rows.map(outboxSqlRowToEvent);
+    });
+  }
+
+  async acknowledge(tenant: TenantContext, id: string, ownerId: string): Promise<OutboxEvent> {
+    return this.finishLease(tenant, id, ownerId, { status: "dispatched" });
+  }
+
+  async reject(tenant: TenantContext, id: string, ownerId: string, error: string, options: { backoffMs?: number; maxAttempts?: number; now?: string } = {}): Promise<OutboxEvent> {
+    const now = new Date(options.now ?? new Date().toISOString());
+    const nowIso = now.toISOString();
+    const nextAttemptAt = new Date(now.getTime() + (options.backoffMs ?? 0)).toISOString();
+    const rows = await this.sql<OutboxSqlRow[]>`
+      update framekit_outbox_events
+      set status = case when attempts >= ${options.maxAttempts ?? 5} then 'dead_letter' else 'failed' end,
+          error = ${error}, processed_at = ${nowIso}::timestamptz, lease_owner = null, lease_expires_at = null,
+          next_attempt_at = case when attempts >= ${options.maxAttempts ?? 5} then null else ${nextAttemptAt}::timestamptz end
+      where tenant_id = ${tenant.tenantId} and id = ${id} and status = 'leased' and lease_owner = ${ownerId}
+      returning *
+    `;
+    if (!rows[0]) throw new FramekitError("OUTBOX_LEASE_LOST", `Outbox event "${id}" is not leased by "${ownerId}"`, 409);
+    return outboxSqlRowToEvent(rows[0]);
+  }
+
+  private async finishLease(tenant: TenantContext, id: string, ownerId: string, update: { status: "dispatched" }): Promise<OutboxEvent> {
+    const rows = await this.sql<OutboxSqlRow[]>`
+      update framekit_outbox_events
+      set status = ${update.status}, error = null, processed_at = now(), lease_owner = null, lease_expires_at = null, next_attempt_at = null
+      where tenant_id = ${tenant.tenantId} and id = ${id} and status = 'leased' and lease_owner = ${ownerId}
+      returning *
+    `;
+    if (!rows[0]) throw new FramekitError("OUTBOX_LEASE_LOST", `Outbox event "${id}" is not leased by "${ownerId}"`, 409);
+    return outboxSqlRowToEvent(rows[0]);
+  }
+
   private async updateStatus(tenant: TenantContext, id: string, status: OutboxEvent["status"], error?: string): Promise<OutboxEvent> {
     const rows = await this.db
       .update(framekitOutboxEvents)
@@ -802,7 +893,9 @@ export class PostgresOutboxStore implements OutboxStore {
         status,
         error,
         attempts: drizzleSql`${framekitOutboxEvents.attempts} + 1`,
-        processedAt: new Date()
+        processedAt: new Date(),
+        leaseOwner: null,
+        leaseExpiresAt: null
       })
       .where(and(eq(framekitOutboxEvents.tenantId, tenant.tenantId), eq(framekitOutboxEvents.id, id)))
       .returning();
@@ -810,6 +903,196 @@ export class PostgresOutboxStore implements OutboxStore {
       throw new FramekitError("OUTBOX_EVENT_NOT_FOUND", `No outbox event with id "${id}"`, 404);
     }
     return rowToOutboxEvent(rows[0]);
+  }
+}
+
+type RealtimeSqlRow = {
+  cursor: string;
+  channel: string;
+  type: string;
+  payload: Record<string, unknown>;
+  created_at: Date | string;
+};
+
+export class PostgresRealtimePublisher implements RealtimePublisher {
+  private readonly sql: Sql;
+  private readonly listenerSql: Sql;
+  private readonly listeners = new Map<string, Set<(event: RuntimeRealtimeEvent) => void>>();
+  private readonly deliveredCursors = new Map<string, string>();
+  private readonly channelReady = new Map<string, Promise<void>>();
+  private readonly deliveryPumps = new Map<string, Promise<void>>();
+  private readonly dirtyChannels = new Set<string>();
+  private readonly faultInjector?: PostgresRealtimePublisherOptions["faultInjector"];
+  private listener?: Awaited<ReturnType<Sql["listen"]>>;
+  private listenerReady?: Promise<void>;
+  private closed = false;
+
+  constructor(options: PostgresRealtimePublisherOptions) {
+    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.listenerSql = postgres(options.connectionString, { max: 1 });
+    this.faultInjector = options.faultInjector;
+  }
+
+  async migrate(): Promise<void> {
+    await this.sql.unsafe(createRealtimeTableSql());
+  }
+
+  describe(): RepositoryDiagnostics {
+    return { kind: "postgres", durable: true, features: ["publish", "subscribe", "history", "cursor-replay"] };
+  }
+
+  async publish(event: RuntimeRealtimeEvent): Promise<void> {
+    if (this.closed) throw new FramekitError("REALTIME_CLOSED", "Realtime publisher is closed", 503);
+    await this.sql.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended(${event.channel}, 0))`;
+      await this.faultInjector?.("locked", event);
+      const rows = await tx<RealtimeSqlRow[]>`
+        insert into framekit_realtime_events (channel, type, payload, created_at)
+        values (${event.channel}, ${event.type}, ${tx.json(event.payload as Parameters<Sql["json"]>[0])}, ${event.createdAt ? new Date(event.createdAt) : new Date()})
+        returning cursor::text, channel, type, payload, created_at
+      `;
+      const persisted = realtimeSqlRowToEvent(rows[0]!);
+      await this.faultInjector?.("inserted", event);
+      await tx`select pg_notify('framekit_realtime_events', ${JSON.stringify({ cursor: persisted.cursor, channel: persisted.channel })})`;
+    });
+  }
+
+  async list(channel: string, options: { limit?: number; after?: string; order?: "asc" | "desc" } = {}): Promise<RuntimeRealtimeEvent[]> {
+    const limit = options.limit ?? 100;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new FramekitError("INVALID_REALTIME_CURSOR", "Realtime history limit must be an integer between 1 and 1000", 422);
+    }
+    if (options.after && !/^\d+$/.test(options.after)) {
+      throw new FramekitError("INVALID_REALTIME_CURSOR", "Realtime cursor must be a positive integer", 422);
+    }
+    const rows = options.after
+      ? await this.sql<RealtimeSqlRow[]>`
+          select cursor::text, channel, type, payload, created_at from framekit_realtime_events
+          where channel = ${channel} and cursor > ${options.after}::bigint
+          order by case when ${options.order ?? "asc"} = 'asc' then cursor end asc,
+                   case when ${options.order ?? "asc"} = 'desc' then cursor end desc limit ${limit}
+        `
+      : await this.sql<RealtimeSqlRow[]>`
+          select cursor::text, channel, type, payload, created_at from framekit_realtime_events
+          where channel = ${channel}
+          order by case when ${options.order ?? "desc"} = 'asc' then cursor end asc,
+                   case when ${options.order ?? "desc"} = 'desc' then cursor end desc limit ${limit}
+        `;
+    return rows.map(realtimeSqlRowToEvent);
+  }
+
+  async subscribe(channel: string, listener: (event: RuntimeRealtimeEvent) => void): Promise<() => void> {
+    if (this.closed) throw new FramekitError("REALTIME_CLOSED", "Realtime publisher is closed", 503);
+    const listeners = this.listeners.get(channel) ?? new Set<(event: RuntimeRealtimeEvent) => void>();
+    listeners.add(listener);
+    this.listeners.set(channel, listeners);
+    const unsubscribe = () => {
+      listeners.delete(listener);
+      if (listeners.size === 0) {
+        this.listeners.delete(channel);
+        this.deliveredCursors.delete(channel);
+        this.channelReady.delete(channel);
+      }
+    };
+    try {
+      await this.ensureListener();
+      let ready = this.channelReady.get(channel);
+      if (!ready) {
+        ready = this.initializeChannel(channel);
+        this.channelReady.set(channel, ready);
+      }
+      await ready;
+      return unsubscribe;
+    } catch (error) {
+      unsubscribe();
+      throw error;
+    }
+  }
+
+  async health(): Promise<{ ok: boolean; details?: Record<string, unknown> }> {
+    try {
+      await this.ensureListener();
+      await this.sql`select 1`;
+      return { ok: true, details: { kind: "postgres", listening: true } };
+    } catch (error) {
+      return { ok: false, details: { kind: "postgres", error: error instanceof Error ? error.message : "Unknown realtime failure" } };
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    await this.listenerReady;
+    await this.listener?.unlisten();
+    this.listeners.clear();
+    await Promise.allSettled([...this.deliveryPumps.values()]);
+    await Promise.all([this.listenerSql.end({ timeout: 1 }), this.sql.end({ timeout: 1 })]);
+    this.deliveredCursors.clear();
+    this.channelReady.clear();
+  }
+
+  private async ensureListener(): Promise<void> {
+    if (this.listener || this.closed) return;
+    this.listenerReady ??= this.listenerSql.listen("framekit_realtime_events", (payload) => {
+      void this.receive(payload).catch(() => undefined);
+    }).then((listener) => {
+      this.listener = listener;
+    });
+    await this.listenerReady;
+  }
+
+  private async receive(payload: string): Promise<void> {
+    const notification = JSON.parse(payload) as { cursor?: string; channel?: string };
+    if (!notification.cursor || !notification.channel || !this.listeners.has(notification.channel)) return;
+    const ready = this.channelReady.get(notification.channel);
+    if (ready) await ready;
+    await this.deliverChannel(notification.channel);
+  }
+
+  private async initializeChannel(channel: string): Promise<void> {
+    const rows = await this.sql<{ cursor: string }[]>`
+      select coalesce(max(cursor), 0)::text as cursor from framekit_realtime_events where channel = ${channel}
+    `;
+    this.deliveredCursors.set(channel, rows[0]?.cursor ?? "0");
+  }
+
+  private async deliverChannel(channel: string): Promise<void> {
+    this.dirtyChannels.add(channel);
+    const existing = this.deliveryPumps.get(channel);
+    if (existing) return existing;
+    const pump = (async () => {
+      while (this.dirtyChannels.delete(channel) && this.listeners.has(channel)) {
+        while (this.listeners.has(channel)) {
+          const after = this.deliveredCursors.get(channel) ?? "0";
+          const rows = await this.sql<RealtimeSqlRow[]>`
+            select cursor::text, channel, type, payload, created_at from framekit_realtime_events
+            where channel = ${channel} and cursor > ${after}::bigint order by cursor asc limit 1000
+          `;
+          if (rows.length === 0) break;
+          for (const row of rows) {
+            const event = realtimeSqlRowToEvent(row);
+            this.deliveredCursors.set(channel, event.cursor!);
+            this.emit(event);
+          }
+          if (rows.length < 1_000) break;
+        }
+      }
+    })().finally(() => {
+      this.deliveryPumps.delete(channel);
+      if (this.dirtyChannels.has(channel) && this.listeners.has(channel)) void this.deliverChannel(channel).catch(() => undefined);
+    });
+    this.deliveryPumps.set(channel, pump);
+    return pump;
+  }
+
+  private emit(event: RuntimeRealtimeEvent): void {
+    for (const listener of this.listeners.get(event.channel) ?? []) {
+      try {
+        listener(event);
+      } catch {
+        // One subscriber must not prevent other subscribers from advancing.
+      }
+    }
   }
 }
 
@@ -1160,10 +1443,30 @@ create table if not exists framekit_outbox_events (
   attempts integer not null default 0,
   created_at timestamptz not null,
   processed_at timestamptz,
-  error text
+  error text,
+  lease_owner text,
+  lease_expires_at timestamptz,
+  next_attempt_at timestamptz
 );
+alter table framekit_outbox_events add column if not exists lease_owner text;
+alter table framekit_outbox_events add column if not exists lease_expires_at timestamptz;
+alter table framekit_outbox_events add column if not exists next_attempt_at timestamptz;
 create unique index if not exists framekit_outbox_events_identity on framekit_outbox_events (tenant_id, id);
 create index if not exists framekit_outbox_events_pending on framekit_outbox_events (tenant_id, status, created_at asc);
+create index if not exists framekit_outbox_events_claim on framekit_outbox_events (tenant_id, status, next_attempt_at, lease_expires_at, created_at asc);
+`;
+}
+
+export function createRealtimeTableSql(): string {
+  return `
+create table if not exists framekit_realtime_events (
+  cursor bigserial primary key,
+  channel text not null,
+  type text not null,
+  payload jsonb not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists framekit_realtime_events_channel_cursor on framekit_realtime_events (channel, cursor desc);
 `;
 }
 
@@ -1710,7 +2013,55 @@ function rowToOutboxEvent(row: typeof framekitOutboxEvents.$inferSelect): Outbox
     attempts: row.attempts,
     createdAt: row.createdAt.toISOString(),
     processedAt: row.processedAt?.toISOString(),
-    error: row.error ?? undefined
+    error: row.error ?? undefined,
+    leaseOwner: row.leaseOwner ?? undefined,
+    leaseExpiresAt: row.leaseExpiresAt?.toISOString(),
+    nextAttemptAt: row.nextAttemptAt?.toISOString()
+  };
+}
+
+type OutboxSqlRow = {
+  tenant_id: string;
+  id: string;
+  type: string;
+  topic: string;
+  payload: Record<string, unknown>;
+  status: OutboxEvent["status"];
+  attempts: number;
+  created_at: Date | string;
+  processed_at: Date | string | null;
+  error: string | null;
+  lease_owner: string | null;
+  lease_expires_at: Date | string | null;
+  next_attempt_at: Date | string | null;
+};
+
+function outboxSqlRowToEvent(row: OutboxSqlRow): OutboxEvent {
+  const iso = (value: Date | string | null): string | undefined => value === null ? undefined : new Date(value).toISOString();
+  return {
+    tenantId: row.tenant_id,
+    id: row.id,
+    type: row.type,
+    topic: row.topic,
+    payload: row.payload,
+    status: row.status,
+    attempts: row.attempts,
+    createdAt: iso(row.created_at)!,
+    processedAt: iso(row.processed_at),
+    error: row.error ?? undefined,
+    leaseOwner: row.lease_owner ?? undefined,
+    leaseExpiresAt: iso(row.lease_expires_at),
+    nextAttemptAt: iso(row.next_attempt_at)
+  };
+}
+
+function realtimeSqlRowToEvent(row: RealtimeSqlRow): RuntimeRealtimeEvent {
+  return {
+    cursor: row.cursor,
+    channel: row.channel,
+    type: row.type,
+    payload: row.payload,
+    createdAt: new Date(row.created_at).toISOString()
   };
 }
 

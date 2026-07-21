@@ -50,11 +50,13 @@ Status: implemented
 
 ### Phase 4 - Automation, Jobs, And Realtime
 
-Status: partially implemented
+Status: implemented
 
 - Implement event outbox, job registration, retry helpers, and failed-event inspection.
 - Add realtime document events for Desk refreshes.
-- Provide a BullMQ adapter while keeping queue ports portable. A production worker/scheduler path remains tracked in [#22](https://github.com/WilliamCorotan/FrameKit/issues/22).
+- Provide a BullMQ adapter while keeping queue ports portable.
+- Atomically lease durable outbox events across competing workers, with retry backoff, dead-letter handling, stable idempotency keys, and lifecycle health/close contracts.
+- Persist realtime history in PostgreSQL and support cross-instance fanout plus cursor/SSE replay. See [Durable Jobs And Realtime](./jobs-and-realtime.md).
 
 ### Phase 5 - Developer Experience And Release Hardening
 

@@ -96,7 +96,7 @@ Exit criteria:
 3. Postgres document lists materialize the tenant/DocType result set before applying filters, sort, projection, and pagination.
 4. Unique checks are list-then-write and updates have no expected revision, so concurrent requests can duplicate or overwrite data.
 5. Runtime migration apply and CLI executable migration behavior are not one consistent contract; removal, drift, locking, and replay policies remain incomplete.
-6. Outbox dispatch has no atomic claim/lease and realtime history is process-local.
+6. Outbox and realtime durability are implemented; remaining operational maturity depends on broader observability and compatibility work.
 7. Package-local test scripts fail to discover tests because their package working directory conflicts with the root Vitest include pattern.
 
 ## Verification Snapshot

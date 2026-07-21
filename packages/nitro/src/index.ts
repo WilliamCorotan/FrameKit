@@ -2,7 +2,7 @@ import { defineEventHandler, getCookie, getQuery, getRouterParam, readBody, setC
 import { assertSecureAuthSecret, bearerToken, type PasswordAuthService } from "@framekit/auth";
 import { FramekitError, type TenantContext } from "@framekit/core";
 import { createOpenApiDocument } from "@framekit/openapi";
-import type { FilterValue, FramekitRuntime } from "@framekit/runtime";
+import type { FilterValue, FramekitRuntime, RuntimeRealtimeEvent } from "@framekit/runtime";
 
 export type NitroAdapterOptions = {
   basePath?: string;
@@ -392,13 +392,14 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         assertOperationPermission(tenant, "framekit.realtime.read", "read realtime events");
         const query = getQuery(event);
         return await runtime.realtimeEvents(tenant, {
-          limit: typeof query.limit === "string" ? Number(query.limit) : undefined
+          limit: typeof query.limit === "string" ? Number(query.limit) : undefined,
+          after: typeof query.after === "string" ? query.after : undefined
         });
       }
       if (method === "GET" && path === basePath + "/realtime/stream") {
         const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
         assertOperationPermission(tenant, "framekit.realtime.read", "stream realtime events");
-        return createRealtimeStream(runtime, tenant, event.req.signal);
+        return createRealtimeStream(runtime, tenant, event.req.signal, event.req.headers.get("last-event-id") ?? undefined);
       }
       if (method === "POST" && path === basePath + "/migrations/plan") {
         const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
@@ -1040,22 +1041,92 @@ function toFilterValue(value: unknown): FilterValue {
   throw new FramekitError("VALIDATION_FAILED", "filters may only contain primitive values, arrays, or operator objects.", 422);
 }
 
-function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal): Response {
+function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal, after?: string): Response {
   const encoder = new TextEncoder();
   let unsubscribe: (() => void) | undefined;
+  let closed = false;
+  let dispose = () => {
+    closed = true;
+    unsubscribe?.();
+  };
   const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
+    async start(controller) {
       controller.enqueue(encoder.encode("retry: 3000\n\n"));
-      unsubscribe = runtime.subscribeRealtime(tenant, (event) => {
-        controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event.payload)}\n\n`));
-      });
-      signal.addEventListener("abort", () => {
+      let lastCursor = after;
+      let ready = false;
+      let dirty = true;
+      let pump: Promise<void> | undefined;
+      const ephemeral: RuntimeRealtimeEvent[] = [];
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
         unsubscribe?.();
+        signal.removeEventListener("abort", abort);
+      };
+      const abort = () => {
+        if (closed) return;
+        cleanup();
         controller.close();
-      }, { once: true });
+      };
+      dispose = cleanup;
+      signal.addEventListener("abort", abort, { once: true });
+      const send = (event: RuntimeRealtimeEvent) => {
+        if (closed) return;
+        if (event.cursor && lastCursor && compareRealtimeCursors(event.cursor, lastCursor) <= 0) return;
+        if (event.cursor) lastCursor = event.cursor;
+        const id = event.cursor ? `id: ${event.cursor}\n` : "";
+        controller.enqueue(encoder.encode(`${id}event: ${event.type}\ndata: ${JSON.stringify(event.payload)}\n\n`));
+      };
+      const replayAvailable = async () => {
+        while (!closed) {
+          const previousCursor = lastCursor;
+          const events = await runtime.realtimeEvents(tenant, { after: lastCursor, limit: 1_000, order: "asc" });
+          events.sort((left, right) => compareRealtimeCursors(left.cursor, right.cursor));
+          for (const event of events) send(event);
+          if (events.length < 1_000 || lastCursor === previousCursor) return;
+        }
+      };
+      const requestPump = () => {
+        dirty = true;
+        if (!ready || pump || closed) return;
+        pump = (async () => {
+          while (dirty && !closed) {
+            dirty = false;
+            await replayAvailable();
+          }
+        })().catch((error) => {
+          cleanup();
+          controller.error(error);
+        }).finally(() => {
+          pump = undefined;
+          if (dirty && !closed) requestPump();
+        });
+      };
+      try {
+        const subscribed = await runtime.subscribeRealtime(tenant, (event) => {
+          if (!event.cursor) {
+            if (!ready) ephemeral.push(event);
+            else send(event);
+            return;
+          }
+          requestPump();
+        });
+        unsubscribe = subscribed;
+        if (closed || signal.aborted) {
+          subscribed();
+          return;
+        }
+        ready = true;
+        requestPump();
+        await pump;
+        for (const event of ephemeral) send(event);
+      } catch (error) {
+        cleanup();
+        controller.error(error);
+      }
     },
     cancel() {
-      unsubscribe?.();
+      dispose();
     }
   });
   return new Response(stream, {
@@ -1065,6 +1136,18 @@ function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, s
       connection: "keep-alive"
     }
   });
+}
+
+function compareRealtimeCursors(left?: string, right?: string): number {
+  if (left === right) return 0;
+  if (left === undefined) return 1;
+  if (right === undefined) return -1;
+  if (/^\d+$/.test(left) && /^\d+$/.test(right)) {
+    const leftValue = BigInt(left);
+    const rightValue = BigInt(right);
+    return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+  }
+  return left.localeCompare(right);
 }
 
 function toErrorResponse(error: unknown): { statusCode: number; body: { error: true; code: string; message: string; details?: unknown } } {
