@@ -47,6 +47,8 @@ describe("generateSdkTypes", () => {
     await client.cancel("note", "note-1", { expectedRevision: 4, idempotencyKey: "cancel-note-1" });
     await client.transferOwner("note", "note-1", "user-2", { expectedRevision: 5, idempotencyKey: "owner-note-1" });
     await client.migrations();
+    await client.settings({ locale: "fr-CA" });
+    await client.upsertSetting("ops.token", "secret");
     await client.planMigration(app);
     await client.applyMigration(plan, { allowDestructive: true });
 
@@ -58,6 +60,8 @@ describe("generateSdkTypes", () => {
       ["http://localhost:3000/api/doctypes/note/note-1/cancel", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "if-match": "4", "idempotency-key": "cancel-note-1" }) })],
       ["http://localhost:3000/api/doctypes/note/note-1/owner", expect.objectContaining({ method: "POST", body: { ownerId: "user-2" }, headers: expect.objectContaining({ "if-match": "5", "idempotency-key": "owner-note-1" }) })],
       ["http://localhost:3000/api/migrations", expect.objectContaining({ headers: expect.objectContaining({ authorization: "Bearer session" }) })],
+      ["http://localhost:3000/api/settings?locale=fr-CA", expect.objectContaining({ headers: expect.objectContaining({ authorization: "Bearer session" }) })],
+      ["http://localhost:3000/api/settings/ops.token", expect.objectContaining({ method: "PUT", body: { value: "secret" } })],
       ["http://localhost:3000/api/migrations/plan", expect.objectContaining({ method: "POST", body: { app } })],
       ["http://localhost:3000/api/migrations/apply", expect.objectContaining({ method: "POST", body: { plan, allowDestructive: true } })]
     ]);

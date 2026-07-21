@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineApp, defineDocType, defineModule, FramekitError, getDocType, hasRowAccess, rowPolicyScope } from "./index.js";
+import { defineApp, defineDocType, defineModule, FramekitError, getDocType, hasRowAccess, localeFallbackChain, resolveTranslation, rowPolicyScope, validateSettingValue } from "./index.js";
 
 describe("core metadata", () => {
   it("defines an app with modules and doctypes", () => {
@@ -121,5 +121,32 @@ describe("core metadata", () => {
     expect(hasRowAccess(alice, note, "read", "bob")).toBe(false);
     expect(rowPolicyScope({ ...alice, roles: ["manager"] }, note, "read")).toBe("all");
     expect(rowPolicyScope({ ...alice, permissions: ["note.manage"] }, note, "write")).toBe("all");
+  });
+
+  it("resolves deterministic locale fallbacks without changing identifiers", () => {
+    const app = defineApp({
+      name: "CRM", nameKey: "app.name",
+      localization: {
+        defaultLocale: "en", supportedLocales: ["en", "fr", "fr-CA", "zh", "zh-Hant", "zh-Hant-TW"], fallbackLocales: ["fr"],
+        translations: { en: { "app.name": "CRM" }, fr: { "app.name": "GRC" }, "fr-CA": {}, zh: {}, "zh-Hant": {}, "zh-Hant-TW": {} }
+      },
+      modules: [defineModule({ id: "crm", name: "CRM" })]
+    });
+    expect(localeFallbackChain(app.localization, "fr-CA")).toEqual(["fr-CA", "fr", "en"]);
+    expect(localeFallbackChain(app.localization, "zh-Hant-TW")).toEqual(["zh-Hant-TW", "zh-Hant", "zh", "fr", "en"]);
+    expect(resolveTranslation(app, "app.name", "CRM", "fr-CA")).toBe("GRC");
+    expect(app.modules[0]?.id).toBe("crm");
+    expect(() => defineApp({ name: "Bad", localization: { defaultLocale: "en", supportedLocales: ["fr"], fallbackLocales: [], translations: {} } })).toThrow(/defaultLocale/);
+  });
+
+  it("validates typed settings and forbids plaintext secret defaults", () => {
+    const module = defineModule({ id: "ops", name: "Ops", settings: [
+      { key: "ops.limit", label: "Limit", type: "number", default: 10 },
+      { key: "ops.mode", label: "Mode", type: "select", options: ["safe", "fast"], default: "safe" },
+      { key: "ops.token", label: "Token", type: "secret", required: true }
+    ] });
+    expect(validateSettingValue(module.settings[0]!, 12)).toBe(12);
+    expect(() => validateSettingValue(module.settings[1]!, "unknown")).toThrow(FramekitError);
+    expect(() => defineModule({ id: "bad", name: "Bad", settings: [{ key: "bad.token", label: "Token", type: "secret", default: "plaintext" }] })).toThrow(/plaintext default/);
   });
 });

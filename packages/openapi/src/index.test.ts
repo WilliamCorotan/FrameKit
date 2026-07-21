@@ -56,6 +56,17 @@ describe("createOpenApiDocument", () => {
     expect(doc.paths["/api/migrations/plan"]).toBeDefined();
     expect(doc.paths["/api/migrations/apply"]).toBeDefined();
     expect(doc.paths["/api/realtime/stream"]).toBeDefined();
+    expect(doc.paths["/api/settings"]?.get?.["x-framekit-permission"]).toBe("framekit.settings.read");
+    expect(doc.paths["/api/settings/{key}"]?.put?.["x-framekit-permission"]).toBe("framekit.settings.manage");
+    expect(JSON.stringify(doc.paths["/api/settings"]?.get?.responses)).toContain("#/components/schemas/PublicSetting");
+    expect(JSON.stringify(doc.paths["/api/settings/{key}"]?.put?.responses)).toContain("#/components/schemas/PublicSetting");
+    expect(JSON.stringify(doc.paths["/api/migrations"]?.get?.responses)).not.toContain("PublicSetting");
+    expect(JSON.stringify(doc.paths["/api/migrations/plan"]?.post?.responses)).not.toContain("PublicSetting");
+    expect(doc.components.schemas.PublicSetting).toMatchObject({
+      required: ["key", "label", "type", "scope", "required", "configured", "redacted"],
+      additionalProperties: false
+    });
+    expect(doc.components.schemas.PublicSetting?.properties).not.toHaveProperty("default");
     expect(doc.paths["/api/doctypes/deal"]).toBeDefined();
     expect(doc.paths["/api/doctypes/deal/{id}/transition"]).toBeDefined();
     expect(doc.paths["/api/doctypes/deal/{id}/submit"]?.post?.operationId).toBe("submitDeal");

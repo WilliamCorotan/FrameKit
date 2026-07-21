@@ -170,6 +170,8 @@ export const FRAMEKIT_HTTP_ENDPOINTS = [
   ["health", "GET", "/health/live"],
   ["dependencyHealth", "GET", "/health/ready"],
   ["meta", "GET", "/api/meta"],
+  ["settings", "GET", "/api/settings"],
+  ["upsertSetting", "PUT", "/api/settings/:key"],
   ["diagnostics", "GET", "/api/diagnostics"],
   ["migrations", "GET", "/api/migrations"],
   ["realtimeEvents", "GET", "/api/realtime/events"],
@@ -249,8 +251,16 @@ export class FramekitClient {
     return this.request("/health/ready", { skipAuth: true, signal: options.signal });
   }
 
-  meta<T = unknown>(): Promise<T> {
-    return this.request("/api/meta");
+  meta<T = unknown>(options: { locale?: string } = {}): Promise<T> {
+    return this.request(`/api/meta${options.locale ? `?locale=${encodeURIComponent(options.locale)}` : ""}`);
+  }
+
+  settings<T = unknown>(options: { locale?: string } = {}): Promise<T> {
+    return this.request(`/api/settings${options.locale ? `?locale=${encodeURIComponent(options.locale)}` : ""}`);
+  }
+
+  upsertSetting<T = unknown>(key: string, value: unknown): Promise<T> {
+    return this.request(`/api/settings/${encodeURIComponent(key)}`, { method: "PUT", body: { value } });
   }
 
   diagnostics<T = unknown>(): Promise<T> {

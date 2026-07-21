@@ -38,7 +38,23 @@ type ModuleDefinition = {
 type Metadata = {
   name: string;
   version: string;
+  locale?: string;
+  supportedLocales?: string[];
+  messages?: Record<string, string>;
   modules: ModuleDefinition[];
+};
+
+type PublicSetting = {
+  key: string;
+  label: string;
+  description?: string;
+  type: "text" | "number" | "boolean" | "select" | "secret";
+  scope: "tenant" | "app";
+  required: boolean;
+  options?: string[];
+  value?: string | number | boolean;
+  configured: boolean;
+  redacted: boolean;
 };
 
 type DocumentRecord = {
@@ -115,7 +131,7 @@ type CustomField = {
   field: FieldDefinition;
 };
 
-type DeskSection = "documents" | "users" | "roles" | "tokens" | "audit" | "outbox" | "diagnostics" | "customization";
+type DeskSection = "documents" | "users" | "roles" | "tokens" | "audit" | "outbox" | "diagnostics" | "customization" | "settings";
 
 const apiUrl = import.meta.env.VITE_FRAMEKIT_API_URL ?? "http://localhost:3000";
 const pageSize = 5;
@@ -138,12 +154,13 @@ function App() {
 
   const doctypes = useMemo(() => metadata?.modules.flatMap((module) => module.doctypes) ?? [], [metadata]);
   const active = doctypes.find((doctype) => doctype.name === activeDocType) ?? doctypes[0];
+  const message = (key: string, fallback: string) => metadata?.messages?.[key] ?? fallback;
 
   useEffect(() => {
     if (!token) {
       return;
     }
-    fetchJson<Metadata>("/api/meta", { token })
+    fetchJson<Metadata>(`/api/meta?locale=${encodeURIComponent(navigator.language)}`, { token })
       .then((next) => {
         setMetadata(next);
         setActiveDocType(next.modules.flatMap((module) => module.doctypes)[0]?.name ?? "customer");
@@ -220,7 +237,7 @@ function App() {
         setPage(0);
       }
       await refresh(active.name, query, creating ? 0 : page);
-      setStatus("Saved");
+      setStatus(message("desk.saved", "Saved"));
     } catch (error) {
       setStatus(errorMessage(error));
     }
@@ -294,7 +311,7 @@ function App() {
       const targetPage = records.length === 1 && page > 0 ? page - 1 : page;
       setPage(targetPage);
       await refresh(active.name, query, targetPage);
-      setStatus("Deleted");
+      setStatus(message("desk.deleted", "Deleted"));
     } catch (error) {
       setStatus(errorMessage(error));
     }
@@ -354,6 +371,7 @@ function App() {
           <button className={section === "roles" ? "active" : ""} onClick={() => setSection("roles")}><Shield size={17} /><span>Roles</span></button>
           <button className={section === "tokens" ? "active" : ""} onClick={() => setSection("tokens")}><KeyRound size={17} /><span>API Tokens</span></button>
           <button className={section === "customization" ? "active" : ""} onClick={() => setSection("customization")}><Settings size={17} /><span>Customization</span></button>
+          <button className={section === "settings" ? "active" : ""} onClick={() => setSection("settings")}><Settings size={17} /><span>{message("desk.settings", "Settings")}</span></button>
           <button className={section === "audit" ? "active" : ""} onClick={() => setSection("audit")}><FileClock size={17} /><span>Audit</span></button>
           <button className={section === "outbox" ? "active" : ""} onClick={() => setSection("outbox")}><Radio size={17} /><span>Outbox</span></button>
           <button className={section === "diagnostics" ? "active" : ""} onClick={() => setSection("diagnostics")}><Activity size={17} /><span>Diagnostics</span></button>
@@ -363,7 +381,7 @@ function App() {
 
       <section className="workbench" aria-label="Desk workbench" id="desk-main" tabIndex={-1}>
         {section === "users" || section === "roles" || section === "tokens" ? <AdminPanel section={section} token={token} status={status} setStatus={setStatus} /> : null}
-        {section === "audit" || section === "outbox" || section === "diagnostics" || section === "customization" ? <OperationsPanel section={section} token={token} doctypes={doctypes} status={status} setStatus={setStatus} /> : null}
+        {section === "audit" || section === "outbox" || section === "diagnostics" || section === "customization" || section === "settings" ? <OperationsPanel section={section} token={token} doctypes={doctypes} status={status} setStatus={setStatus} locale={metadata?.locale} /> : null}
         {section === "documents" ? (
         <>
         <header className="topbar">
@@ -577,12 +595,14 @@ function AdminPanel({ section, token, status, setStatus }: { section: "users" | 
   );
 }
 
-function OperationsPanel({ section, token, doctypes, status, setStatus }: { section: "audit" | "outbox" | "diagnostics" | "customization"; token: string; doctypes: DocTypeDefinition[]; status: string; setStatus: (status: string) => void }) {
+function OperationsPanel({ section, token, doctypes, status, setStatus, locale }: { section: "audit" | "outbox" | "diagnostics" | "customization" | "settings"; token: string; doctypes: DocTypeDefinition[]; status: string; setStatus: (status: string) => void; locale?: string }) {
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [outbox, setOutbox] = useState<OutboxEvent[]>([]);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | undefined>();
   const [customFields, setCustomFields] = useState<CustomField[]>([]);
   const [form, setForm] = useState<Record<string, string>>({});
+  const [settings, setSettings] = useState<PublicSetting[]>([]);
+  const [settingDrafts, setSettingDrafts] = useState<Record<string, string | number | boolean>>({});
 
   useEffect(() => {
     void refresh();
@@ -602,6 +622,11 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
       }
       if (section === "customization") {
         setCustomFields(await fetchJson<CustomField[]>("/api/custom-fields", { token }));
+      }
+      if (section === "settings") {
+        const loaded = await fetchJson<PublicSetting[]>(`/api/settings${locale ? `?locale=${encodeURIComponent(locale)}` : ""}`, { token });
+        setSettings(loaded);
+        setSettingDrafts(Object.fromEntries(loaded.filter((setting) => !setting.redacted && setting.value !== undefined).map((setting) => [setting.key, setting.value!] )));
       }
       setStatus("Ready");
     } catch (error) {
@@ -644,7 +669,21 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
     }
   }
 
-  const title = section === "audit" ? "Audit Trail" : section === "outbox" ? "Outbox" : section === "diagnostics" ? "Diagnostics" : "Customization";
+  async function saveSetting(setting: PublicSetting) {
+    try {
+      setStatus("Saving…");
+      const draft = settingDrafts[setting.key];
+      const value = setting.type === "number" ? Number(draft) : setting.type === "boolean" ? Boolean(draft) : String(draft ?? "");
+      await fetchJson(`/api/settings/${encodeURIComponent(setting.key)}`, { method: "PUT", token, body: { value } });
+      setSettingDrafts((current) => ({ ...current, ...(setting.type === "secret" ? { [setting.key]: "" } : {}) }));
+      await refresh();
+      setStatus("Saved");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
+  }
+
+  const title = section === "audit" ? "Audit Trail" : section === "outbox" ? "Outbox" : section === "diagnostics" ? "Diagnostics" : section === "settings" ? "Settings" : "Customization";
 
   return (
     <>
@@ -677,6 +716,24 @@ function OperationsPanel({ section, token, doctypes, status, setStatus }: { sect
           </section>
           <RecordList items={customFields.map((field) => ({ id: field.id, label: `${field.doctype}.${field.field.name}`, detail: `${field.field.label} · ${field.field.type}` }))} status={status} />
         </div>
+      ) : null}
+
+      {section === "settings" ? (
+        <section className="editor">
+          <div className="editor-head"><div><p className="eyebrow">Application settings</p><h2>Typed configuration</h2></div></div>
+          <div className="fields">
+            {settings.map((setting) => (
+              <label className="field" key={setting.key}>
+                <span>{setting.label}{setting.required ? " *" : ""} · {setting.scope}</span>
+                {setting.type === "boolean" ? <input type="checkbox" checked={Boolean(settingDrafts[setting.key])} onChange={(event) => setSettingDrafts((current) => ({ ...current, [setting.key]: event.target.checked }))} />
+                  : setting.type === "select" ? <select value={String(settingDrafts[setting.key] ?? "")} onChange={(event) => setSettingDrafts((current) => ({ ...current, [setting.key]: event.target.value }))}>{(setting.options ?? []).map((option) => <option key={option}>{option}</option>)}</select>
+                    : <input type={setting.type === "secret" ? "password" : setting.type === "number" ? "number" : "text"} value={String(settingDrafts[setting.key] ?? "")} placeholder={setting.redacted && setting.configured ? "Configured — enter to replace" : undefined} autoComplete={setting.type === "secret" ? "new-password" : "off"} onChange={(event) => setSettingDrafts((current) => ({ ...current, [setting.key]: event.target.value }))} />}
+                {setting.description ? <small>{setting.description}</small> : null}
+                <button type="button" onClick={() => void saveSetting(setting)}><Save size={15} /> Save {setting.label}</button>
+              </label>
+            ))}
+          </div>
+        </section>
       ) : null}
 
       {section === "audit" ? <RecordList items={audit.map((event) => ({ id: event.id, label: `${event.action} ${event.doctype}`, detail: `${event.documentId} · ${event.userId} · ${event.createdAt}` }))} status={status} /> : null}

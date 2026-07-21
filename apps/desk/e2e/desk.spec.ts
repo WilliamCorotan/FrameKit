@@ -208,6 +208,28 @@ test("covers operations screens for customization, audit, outbox, and diagnostic
   await expect(page.getByText("ephemeral").first()).toBeVisible();
 });
 
+test("renders localized typed settings and keeps secrets redacted after update", async ({ page }) => {
+  await signIn(page);
+
+  await page.getByRole("button", { name: "Paramètres" }).click();
+  await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+  await expect(page.getByLabel(/Région/)).toHaveValue("us");
+  await page.getByLabel(/Région/).selectOption("eu");
+  await page.getByRole("button", { name: "Save Région" }).click();
+  await expect(page.getByLabel(/Région/)).toHaveValue("eu");
+
+  const secret = page.getByLabel(/Jeton/);
+  await expect(secret).toHaveAttribute("type", "password");
+  await expect(secret).toHaveValue("");
+  await expect(secret).toHaveAttribute("placeholder", "Configured — enter to replace");
+  await secret.fill("replacement-secret");
+  const update = page.waitForRequest((request) => request.url().endsWith("/api/settings/ops.token") && request.method() === "PUT");
+  await page.getByRole("button", { name: "Save Jeton" }).click();
+  expect((await update).postDataJSON()).toEqual({ value: "replacement-secret" });
+  await expect(secret).toHaveValue("");
+  await expect(page.getByText("replacement-secret")).toHaveCount(0);
+});
+
 test("keeps core Desk controls reachable on a narrow viewport", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await signIn(page);
@@ -266,6 +288,10 @@ async function mockDeskApi(page: Page) {
     { id: "outbox-1", type: "DocumentCreated", topic: "crm.customer", status: "pending", attempts: 0, createdAt: now }
   ];
   const customFields: Array<{ id: string; doctype: string; field: Record<string, unknown> }> = [];
+  const settings = [
+    { key: "ops.region", label: "Région", type: "select", scope: "tenant", required: true, options: ["us", "eu"], value: "us", configured: true, redacted: false },
+    { key: "ops.token", label: "Jeton", type: "secret", scope: "tenant", required: true, configured: true, redacted: true }
+  ];
 
   await page.route(`${apiOrigin}/api/**`, async (route) => {
     const request = route.request();
@@ -414,6 +440,16 @@ async function mockDeskApi(page: Page) {
       customFields.push(field as typeof customFields[number]);
       return json(route, field);
     }
+    if (path === "/api/settings" && method === "GET") {
+      return json(route, settings);
+    }
+    const settingMatch = path.match(/^\/api\/settings\/(.+)$/);
+    if (settingMatch && method === "PUT" && body) {
+      const setting = settings.find((item) => item.key === decodeURIComponent(settingMatch[1]!))!;
+      if (!setting.redacted) setting.value = body.value as string;
+      setting.configured = true;
+      return json(route, setting);
+    }
 
     return route.fulfill({ status: 404, body: `Unhandled ${method} ${path}` });
   });
@@ -438,6 +474,9 @@ function jsonError(route: Route, status: number, code: string, message: string) 
 const metadata = {
   name: "Framekit CRM",
   version: "0.1.0",
+  locale: "fr",
+  supportedLocales: ["en", "fr"],
+  messages: { "desk.settings": "Paramètres" },
   modules: [
     {
       id: "crm",

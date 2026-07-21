@@ -2,7 +2,7 @@
 
 Last reevaluated: 2026-07-21
 
-Framekit is a beta, metadata-driven TypeScript business application framework. Its production path now covers secure HTTP/auth defaults, atomic durable mutations, pushed-down queries, executable migrations, durable jobs and realtime, standalone package verification, full-stack browser checks, bounded business-document lifecycle semantics, resource lifecycle, observability adapters, compatibility testing, and supply-chain automation. Deferred metadata primitives are tracked separately in #39 through #42.
+Framekit is a beta, metadata-driven TypeScript business application framework. Its production path now covers secure HTTP/auth defaults, atomic durable mutations, pushed-down queries, executable migrations, durable jobs and realtime, standalone package verification, full-stack browser checks, bounded business-document lifecycle semantics, localization, typed secret-aware settings, resource lifecycle, observability adapters, compatibility testing, and supply-chain automation. Remaining deferred metadata primitives are tracked in #39 and #40.
 
 ## Scoring Model
 
@@ -18,25 +18,25 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 
 ## Overall Assessment
 
-- Component-average implementation: **84%**.
-- Functional breadth: approximately **89%**.
-- Production readiness: approximately **79%**.
+- Component-average implementation: **85%**.
+- Functional breadth: approximately **90%**.
+- Production readiness: approximately **80%**.
 - Current stage: **beta**.
-- Remaining 1.0 decisions: the explicitly deferred metadata primitives in #39 through #42.
+- Remaining 1.0 decisions: the explicitly deferred metadata primitives in #39 and #40.
 
 ## Modern Framework Component Matrix
 
 | Component | Implementation | In place | Missing or incomplete |
 | --- | ---: | --- | --- |
-| Core metadata and domain model | 82% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, immutable ownership, composable row policies, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics, localization, typed settings |
+| Core metadata and domain model | 86% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, immutable ownership, composable row policies, canonical locale fallback, typed setting definitions, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics |
 | Runtime and command lifecycle | 92% | CRUD, ordered validation/hooks, draft-submit-cancel lifecycle, post-submit immutability, atomic durable commands, revisions, idempotency, audit/outbox/realtime, diagnostics, and ordered start/close/dispose | Bulk/cross-document commands and deeper cancellation propagation |
-| Data, query, and persistence | 84% | In-memory and Postgres adapters, pushed-down filters/sorts/projections, opaque cursors, durable uniqueness, revisions, locking, and atomic document/outbox persistence | Load/performance evidence, sharding/partition guidance, broader physical schema modeling |
-| HTTP API and OpenAPI | 82% | Secure routing defaults, broad Nitro/OpenAPI surface, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
+| Data, query, and persistence | 86% | In-memory and Postgres adapters, pushed-down filters/sorts/projections, opaque cursors, durable uniqueness, tenant/app setting values, sealed-secret storage boundary, revisions, locking, and atomic document/outbox persistence | Load/performance evidence, sharding/partition guidance, broader physical schema modeling |
+| HTTP API and OpenAPI | 85% | Secure routing defaults, localized metadata, typed settings schemas/routes, broad Nitro/OpenAPI surface, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
 | Authentication and IAM | 78% | Password sessions, cookies, refresh/logout/revocation, lockout, API tokens, roles, durable audit and identity links, OIDC discovery/JWKS authorization-code/PKCE, single-use invitations and recovery, forged-header and cross-tenant protection | Native WebAuthn/TOTP enrollment and step-up assurance policy; provider-enforced MFA is the current production scope |
-| Schema evolution | 94% | Executable HTTP/CLI contract, schema fingerprints, full DocType diffs, checksums, destructive and irreversible guards, atomic apply/rollback, versioned deterministic conversion hooks, durable approval evidence, resumable chunk checkpoints, bounded tenant/app locking, drift/replay guards, and legacy uniqueness backfill | Physical-schema inspection beyond managed indexes, automated dual-read/write rollout coordination, and production-scale migration performance evidence |
+| Schema evolution | 94% | Executable HTTP/CLI contract, schema fingerprints, full DocType diffs, checksums, destructive and irreversible guards, atomic apply/rollback, trusted conversion artifact registry, durable approval evidence, resumable chunk checkpoints, bounded tenant/app locking, drift/replay guards, and legacy uniqueness backfill | Physical-schema inspection beyond managed indexes, automated dual-read/write rollout coordination, and production-scale migration performance evidence |
 | Jobs, events, and realtime | 85% | BullMQ queues/workers, atomic outbox leases, retry/backoff/dead-letter behavior, idempotency keys, scheduling, Postgres fanout/replay, SSE, lifecycle and cancellation | Operational load evidence, poison-message tooling, richer scheduler persistence |
-| Desk and admin UI | 82% | Metadata lists/forms, workflows, auth administration, customization, operations screens, real-stack Chromium/Firefox journeys, accessibility checks | Richer field errors, keyboard depth, visual regression policy |
-| SDK, CLI, and developer experience | 75% | Broad HTTP parity, generated model types, scaffolding, migration commands, packed standalone consumer proof | Typed/retriable errors, upgrade/config workflows, packaged Desk template |
+| Desk and admin UI | 84% | Metadata lists/forms, localized labels/messages, typed setting forms with secret redaction, workflows, auth administration, customization, operations screens, real-stack Chromium/Firefox journeys, accessibility checks | Richer field errors, keyboard depth, visual regression policy |
+| SDK, CLI, and developer experience | 78% | Broad HTTP parity including localized metadata/settings, typed/retriable errors, generated model types, scaffolding, migration commands, packed standalone consumer proof | Upgrade/config workflows, packaged Desk template |
 | Operations, security, and release | 82% | Secure defaults, lifecycle, bounded readiness, OpenTelemetry-compatible adapters/redaction, tested compatibility, provenance publication, dependency audit, CodeQL, Dependabot, and SBOM artifacts | Alert/runbook examples, SLO guidance, sustained fault/load evidence |
 | Testing and CI | 88% | Unit, service, concurrency/fault, built smoke, standalone package, full-stack browser, package-local, compatibility matrix, and enforced coverage gates | Sustained load/soak testing, more failure injection, visual regression |
 | Documentation and adoption | 72% | README, architecture, deployment, security, identity, consistency, querying, migrations, observability, compatibility, contribution, disclosure, support, release, and roadmaps | Generated API reference site, versioned upgrade guides, external tutorial feedback |
@@ -74,7 +74,7 @@ Exit criteria:
 
 ## Priority 2 - Production Maturity
 
-1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26) — bounded 1.0 contract and [#41 ownership/row policies](https://github.com/WilliamCorotan/FrameKit/issues/41) implemented; deferred primitives are tracked by [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), and [#42](https://github.com/WilliamCorotan/FrameKit/issues/42).
+1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26) — bounded 1.0 contract, [#41 ownership/row policies](https://github.com/WilliamCorotan/FrameKit/issues/41), and [#42 localization/typed settings](https://github.com/WilliamCorotan/FrameKit/issues/42) implemented; remaining deferred primitives are tracked by [#39](https://github.com/WilliamCorotan/FrameKit/issues/39) and [#40](https://github.com/WilliamCorotan/FrameKit/issues/40).
 2. [#27 Add production lifecycle, observability, compatibility, and supply-chain gates](https://github.com/WilliamCorotan/FrameKit/issues/27) — implemented by this change; closes when merged.
 3. [#46 Add approved, resumable online schema conversions](https://github.com/WilliamCorotan/FrameKit/issues/46)
 
@@ -87,7 +87,7 @@ Exit criteria:
 
 ## Highest-Risk Technical Findings
 
-1. The metadata model still lacks the selected child-record, attachment, ownership, computed-field, localization, and decimal semantics required for 1.0.
+1. The metadata model still lacks the selected child-record, attachment, computed-field, and decimal semantics required for 1.0.
 2. Compatibility gates prove supported combinations functionally, but sustained load, soak, and infrastructure fault testing remain limited.
 3. Nitro and H3 remain pre-release dependencies; upgrades require explicit compatibility evidence.
 4. OpenTelemetry adapters are exporter-neutral and tested for redaction, but production sampling, alerting, and SLOs remain operator responsibilities.
@@ -99,7 +99,7 @@ Exit criteria:
 Reevaluation checks on 2026-07-21:
 
 - `pnpm audit:all`: lint/typecheck, 115 unit/in-process tests, enforced coverage thresholds, and all package, CRM, and Desk builds pass.
-- `pnpm test:desk:browser`: 5 Chromium journeys passed against mocked API routes.
+- `pnpm test:desk:browser`: 6 Chromium journeys passed against mocked API routes, including localized typed settings and secret redaction.
 - `pnpm smoke:crm:built`: assertions and bounded cleanup regression tests pass and terminate; #18 is closed.
 - CI defines bounded package-local/coverage, Node 22/24, Postgres 16/17, Redis 7/8, built-smoke, standalone, browser, CodeQL, dependency audit, Dependabot, and SBOM gates.
 - Forged-header, cross-tenant, operation-permission, realtime-history, and SSE authorization checks pass; #16 is closed.

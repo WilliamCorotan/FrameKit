@@ -6,6 +6,29 @@ import { createRuntime, migrationChecksum, type RealtimePublisher, type RuntimeR
 import { assertSecureProductionCredentials, createNitroHandler, createOpenTelemetryAdapters } from "./index.js";
 
 describe("createNitroHandler", () => {
+  it("localizes metadata and keeps typed secret settings redacted over HTTP", async () => {
+    const app = defineApp({
+      name: "Localized", localization: { defaultLocale: "en", supportedLocales: ["en", "fr"], fallbackLocales: ["en"], translations: { en: {}, fr: { "module.ops": "Exploitation", "setting.token": "Jeton" } } },
+      modules: [defineModule({ id: "ops", name: "Operations", nameKey: "module.ops", settings: [{ key: "ops.token", label: "Token", labelKey: "setting.token", type: "secret", required: true }] })]
+    });
+    const runtime = createRuntime(app, { settingsSecrets: { seal: (value) => `sealed:${value}`, unseal: (value) => value.slice(7) } });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { development: { allowHeaderIdentity: true } }));
+    const fetch = toWebHandler(h3);
+    const headers = { "x-user-id": "operator", "x-permissions": "framekit.settings.read,framekit.settings.manage" };
+
+    await expect(json<{ locale: string; modules: Array<{ name: string }> }>(fetch, "/api/meta?locale=fr", { headers })).resolves.toMatchObject({ locale: "fr", modules: [{ name: "Exploitation" }] });
+    await expect(json<{ locale: string; modules: Array<{ name: string }> }>(fetch, "/api/meta", {
+      headers: { ...headers, "accept-language": "de;q=1, fr;q=0.9, en;q=0.5" }
+    })).resolves.toMatchObject({ locale: "fr", modules: [{ name: "Exploitation" }] });
+    const secret = await json<Record<string, unknown>>(fetch, "/api/settings/ops.token", { method: "PUT", headers, body: { value: "http-secret" } });
+    expect(secret).toMatchObject({ key: "ops.token", configured: true, redacted: true });
+    expect(JSON.stringify(secret)).not.toContain("http-secret");
+    const listed = await json<Array<Record<string, unknown>>>(fetch, "/api/settings?locale=fr", { headers });
+    expect(listed).toEqual([expect.objectContaining({ label: "Jeton", redacted: true })]);
+    expect(JSON.stringify(listed)).not.toContain("http-secret");
+  });
+
   it("exposes submit and cancel document lifecycle commands", async () => {
     const invoice = defineDocType({
       name: "invoice",

@@ -241,7 +241,7 @@ export const deal = defineDocType({
 });
 ```
 
-`Module` groups DocTypes, permissions, navigation, hooks, jobs, settings, and dependencies.
+`Module` groups DocTypes, permissions, navigation, hooks, jobs, typed settings, and dependencies. Apps can provide stable translation keys and canonical BCP 47 locale fallback; see [Localization and Typed Settings](docs/localization-settings.md).
 
 `Runtime` executes framework use cases: validation, permissions, hooks, document persistence, audit, outbox, realtime publishing, custom fields, views, and naming series.
 
@@ -374,7 +374,7 @@ Postgres query pushdown and stable opaque cursor semantics are documented in [do
 
 ## Roadmap Status
 
-Framekit is currently assessed as a beta: 83% implemented toward a production-ready 1.0. The bounded metadata/lifecycle contract is implemented; explicitly deferred metadata primitives remain tracked in issues #39 through #42. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
+Framekit is currently assessed as a beta: 85% implemented toward a production-ready 1.0. The bounded metadata/lifecycle, localization, and typed-settings contracts are implemented; remaining deferred metadata primitives are tracked in issues #39 and #40. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
 
 ## License
 

@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, gt, gte, lt, lte, ne, or, sql as drizzleSql, type SQL } from "drizzle-orm";
-import { integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import { boolean, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres, { type Sql } from "postgres";
 import type {
@@ -38,6 +38,7 @@ import {
   type RepositoryDiagnostics,
   type RealtimePublisher,
   type RuntimeRealtimeEvent,
+  type StoredSettingValue,
   assertDestructiveMigration,
   assertMigrationDrift,
   assertMigrationIdentity,
@@ -223,6 +224,15 @@ export const framekitViews = pgTable("framekit_views", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull()
 });
+
+export const framekitSettingValues = pgTable("framekit_setting_values", {
+  appName: text("app_name").notNull(),
+  scopeId: text("scope_id").notNull(),
+  key: text("key").notNull(),
+  value: jsonb("value").notNull(),
+  protected: boolean("protected").notNull().default(false),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull()
+}, (table) => [uniqueIndex("framekit_setting_values_identity").on(table.appName, table.scopeId, table.key)]);
 
 export const framekitNamingSeries = pgTable(
   "framekit_naming_series",
@@ -1351,13 +1361,14 @@ export class PostgresCustomizationStore implements CustomizationStore {
   async migrate(): Promise<void> {
     await this.db.execute(drizzleSql.raw(createCustomFieldTableSql()));
     await this.db.execute(drizzleSql.raw(createViewTableSql()));
+    await this.db.execute(drizzleSql.raw(createSettingValueTableSql()));
   }
 
   describe(): RepositoryDiagnostics {
     return {
       kind: "postgres",
       durable: true,
-      features: ["custom-fields", "views", "migration"]
+      features: ["custom-fields", "views", "settings", "migration"]
     };
   }
 
@@ -1405,6 +1416,25 @@ export class PostgresCustomizationStore implements CustomizationStore {
         }
       });
     return view;
+  }
+
+  async listSettingValues(tenant: TenantContext, appName: string): Promise<StoredSettingValue[]> {
+    const rows = await this.db.select().from(framekitSettingValues).where(and(
+      eq(framekitSettingValues.appName, appName),
+      or(eq(framekitSettingValues.scopeId, `tenant:${tenant.tenantId}`), eq(framekitSettingValues.scopeId, `app:${appName}`))
+    ));
+    return rows.map((row) => ({ appName: row.appName, scopeId: row.scopeId, key: row.key, value: row.value, protected: row.protected, updatedAt: row.updatedAt.toISOString() }));
+  }
+
+  async upsertSettingValue(tenant: TenantContext, value: StoredSettingValue): Promise<StoredSettingValue> {
+    if (value.scopeId !== `tenant:${tenant.tenantId}` && value.scopeId !== `app:${value.appName}`) {
+      throw new FramekitError("FORBIDDEN", "Setting value scope does not match the authenticated tenant or application.", 403);
+    }
+    await this.db.insert(framekitSettingValues).values({ ...value, updatedAt: new Date(value.updatedAt) }).onConflictDoUpdate({
+      target: [framekitSettingValues.appName, framekitSettingValues.scopeId, framekitSettingValues.key],
+      set: { value: value.value, protected: value.protected, updatedAt: new Date(value.updatedAt) }
+    });
+    return value;
   }
 }
 
@@ -1974,6 +2004,21 @@ create table if not exists framekit_views (
 );
 create unique index if not exists framekit_views_identity on framekit_views (tenant_id, id);
 create index if not exists framekit_views_lookup on framekit_views (tenant_id, doctype, type);
+`;
+}
+
+export function createSettingValueTableSql(): string {
+  return `
+create table if not exists framekit_setting_values (
+  app_name text not null,
+  scope_id text not null,
+  key text not null,
+  value jsonb not null,
+  protected boolean not null default false,
+  updated_at timestamptz not null,
+  constraint framekit_setting_values_identity unique (app_name, scope_id, key)
+);
+create index if not exists framekit_setting_values_scope on framekit_setting_values (app_name, scope_id);
 `;
 }
 
