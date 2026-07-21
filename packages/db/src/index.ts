@@ -8,7 +8,7 @@ import type {
   OidcAuthorizationState, OidcAuthorizationStateStore, RoleStore, SessionRevocationStore, UserStore
 } from "@framekit/auth";
 import type { CustomFieldDefinition, DocTypeDefinition, DocumentRecord, TenantContext, ViewDefinition } from "@framekit/core";
-import { canTransferOwnership, FramekitError, rowPolicyScope } from "@framekit/core";
+import { assertPermission, canTransferOwnership, FramekitError, rowPolicyScope } from "@framekit/core";
 import {
   decodeDocumentCursor,
   encodeDocumentCursor,
@@ -628,8 +628,24 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
     commands: MutationCommand[],
     options: { tenant: TenantContext; idempotencyKey?: string; idempotencyFingerprint: string }
   ): Promise<MutationBatchResult> {
-    if (commands.length === 0 || commands.some((command) => command.tenant.tenantId !== options.tenant.tenantId)) {
-      throw new FramekitError("INVALID_COMMAND", "Atomic command batches must contain operations for exactly one tenant.", 422);
+    const principalSignature = (tenant: TenantContext) => JSON.stringify({
+      tenantId: tenant.tenantId,
+      userId: tenant.userId,
+      roles: [...tenant.roles].sort(),
+      permissions: [...tenant.permissions].sort()
+    });
+    const expectedPrincipal = principalSignature(options.tenant);
+    if (commands.length === 0 || commands.some((command) =>
+      principalSignature(command.tenant) !== expectedPrincipal ||
+      !["create", "update", "delete"].includes(command.operation)
+    )) {
+      throw new FramekitError("INVALID_COMMAND", "Atomic command batches must contain supported operations for exactly one authenticated principal.", 422);
+    }
+    for (const command of commands) {
+      assertPermission(command.tenant, command.doctype, command.operation as "create" | "update" | "delete");
+      if (command.operation === "create" && ((command.doctype.ownership && command.document.ownerId !== command.tenant.userId) || (!command.doctype.ownership && command.document.ownerId !== undefined))) {
+        throw new FramekitError("INVALID_OWNER", "Document owner must be assigned by enabled ownership metadata", 403);
+      }
     }
     let activeCommand = commands[0]!;
     try {
@@ -650,30 +666,42 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
           activeCommand = command;
           let result: DocumentRecord | undefined;
           if (command.operation === "create") {
-            await tx`
-              insert into framekit_documents (tenant_id, doctype, id, revision, document_status, state, data, created_at, updated_at)
+            const rows = await tx<typeof framekitDocuments.$inferSelect[]>`
+              insert into framekit_documents (tenant_id, doctype, id, revision, document_status, owner_id, state, data, created_at, updated_at)
               values (${command.document.tenantId}, ${command.document.doctype}, ${command.document.id}, ${command.document.revision},
-                      ${command.document.documentStatus}, ${command.document.state ?? null}, ${tx.json(command.document.data as postgres.JSONValue)},
+                      ${command.document.documentStatus}, ${command.document.ownerId ?? null}, ${command.document.state ?? null}, ${tx.json(command.document.data as postgres.JSONValue)},
                       ${command.document.createdAt}, ${command.document.updatedAt})
+              returning tenant_id as "tenantId", doctype, id, revision, document_status as "documentStatus", owner_id as "ownerId", state, data,
+                        created_at as "createdAt", updated_at as "updatedAt"
             `;
-            result = command.document;
+            result = rowToRecord(rows[0]!);
             await replaceUniqueValues(tx, command);
           } else if (command.operation === "update") {
-            const rows = await tx<{ revision: number }[]>`
-              update framekit_documents set revision = ${command.document.revision}, document_status = ${command.document.documentStatus},
+            const scope = rowPolicyScope(command.tenant, command.doctype, "write");
+            const rows = await tx<typeof framekitDocuments.$inferSelect[]>`
+              update framekit_documents set revision = ${command.document.revision}, document_status = ${command.document.documentStatus}, owner_id = ${command.document.ownerId ?? null},
                 state = ${command.document.state ?? null}, data = ${tx.json(command.document.data as postgres.JSONValue)}, updated_at = ${command.document.updatedAt}
               where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
-                and id = ${command.document.id} and revision = ${command.expectedRevision!} returning revision
+                and id = ${command.document.id} and revision = ${command.expectedRevision!}
+                and (${scope === "all"} or (${scope === "self"} and owner_id = ${command.tenant.userId}))
+                and owner_id is not distinct from ${command.document.ownerId ?? null}
+              returning tenant_id as "tenantId", doctype, id, revision, document_status as "documentStatus", owner_id as "ownerId", state, data,
+                        created_at as "createdAt", updated_at as "updatedAt"
             `;
             if (!rows[0]) await throwMutationWriteFailure(tx, command);
-            result = command.document;
+            result = rowToRecord(rows[0]!);
             await replaceUniqueValues(tx, command);
           } else {
-            const rows = await tx<{ revision: number }[]>`
+            const scope = rowPolicyScope(command.tenant, command.doctype, "write");
+            const rows = await tx<typeof framekitDocuments.$inferSelect[]>`
               delete from framekit_documents where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
-                and id = ${command.document.id} and revision = ${command.expectedRevision!} returning revision
+                and id = ${command.document.id} and revision = ${command.expectedRevision!}
+                and (${scope === "all"} or (${scope === "self"} and owner_id = ${command.tenant.userId}))
+              returning tenant_id as "tenantId", doctype, id, revision, document_status as "documentStatus", owner_id as "ownerId", state, data,
+                        created_at as "createdAt", updated_at as "updatedAt"
             `;
             if (!rows[0]) await throwMutationWriteFailure(tx, command);
+            result = rowToRecord(rows[0]!);
             await tx`delete from framekit_document_unique_values where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name} and document_id = ${command.document.id}`;
           }
           await this.faultInjector?.("document", command);

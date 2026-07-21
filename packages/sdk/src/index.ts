@@ -1,5 +1,5 @@
 import { ofetch } from "ofetch";
-import { listDocTypes, type AppDefinition, type DocumentData, type DocumentRecord, type FieldDefinition, type OwnerTransferReceipt, type TenantContext } from "@framekit/core";
+import { listDocTypes, type AppDefinition, type DocumentCommandOperation, type DocumentData, type DocumentRecord, type FieldDefinition, type OwnerTransferReceipt, type TenantContext } from "@framekit/core";
 
 export type AuthUser = {
   id: string;
@@ -126,14 +126,7 @@ export type MutationRequestOptions = {
   signal?: AbortSignal;
 };
 
-export type DocumentCommandOperation = {
-  operation: "create" | "update" | "delete";
-  doctype: string;
-  id?: string;
-  data?: DocumentData;
-  expectedRevision?: number;
-  compensation?: Omit<DocumentCommandOperation, "compensation">;
-};
+export type { DocumentCommandOperation } from "@framekit/core";
 
 export type DocumentCommandResult = {
   command: string;

@@ -4,6 +4,7 @@ import {
   CustomFieldSchema,
   defineApp,
   defineDocType,
+  DocumentCommandRequestSchema,
   FramekitError,
   getDocType,
   hasRowAccess,
@@ -13,6 +14,8 @@ import {
   type CustomFieldDefinition,
   type DocTypeDefinition,
   type DocumentData,
+  type DocumentCommandOperation,
+  type DocumentCommandRequest,
   type DocumentRecord,
   type HookName,
   type OwnerTransferReceipt,
@@ -102,19 +105,7 @@ export type MutationUnitOfWork = LifecycleResource & {
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
-export type DocumentCommandOperation = {
-  operation: "create" | "update" | "delete";
-  doctype: string;
-  id?: string;
-  data?: DocumentData;
-  expectedRevision?: number;
-  compensation?: Omit<DocumentCommandOperation, "compensation">;
-};
-
-export type DocumentCommandRequest = {
-  operations: DocumentCommandOperation[];
-  idempotencyKey?: string;
-};
+export type { DocumentCommandOperation, DocumentCommandRequest } from "@framekit/core";
 
 export type DocumentCommandResult = {
   command: string;
@@ -954,6 +945,13 @@ export class FramekitRuntime {
   async executeDocumentCommand(tenant: TenantContext, commandId: string, request: DocumentCommandRequest): Promise<DocumentCommandResult> {
     const definition = this.app.modules.flatMap((module) => module.commands).find((command) => command.id === commandId);
     if (!definition) throw new FramekitError("COMMAND_NOT_FOUND", `Unknown document command "${commandId}".`, 404);
+    const parsedRequest = DocumentCommandRequestSchema.safeParse(request);
+    if (!parsedRequest.success) {
+      throw new FramekitError("INVALID_COMMAND_OPERATION", `Command "${commandId}" contains invalid operation data.`, 422, {
+        issues: parsedRequest.error.issues.map((issue) => ({ path: issue.path.join("."), message: issue.message }))
+      });
+    }
+    request = parsedRequest.data;
     if (!tenant.permissions.includes("*") && !tenant.permissions.includes(definition.permission)) {
       throw new FramekitError("FORBIDDEN", `Missing permission "${definition.permission}" for command "${commandId}".`, 403);
     }
@@ -962,16 +960,8 @@ export class FramekitRuntime {
     }
     const targets = new Set<string>();
     for (const operation of request.operations) {
-      if (!operation || typeof operation !== "object" ||
-          !["create", "update", "delete"].includes(operation.operation) ||
-          typeof operation.doctype !== "string" || (operation.id !== undefined && (typeof operation.id !== "string" || !operation.id))) {
-        throw new FramekitError("INVALID_COMMAND_OPERATION", `Command "${commandId}" contains malformed operation metadata.`, 422);
-      }
       if (!definition.doctypes.includes(operation.doctype) || !definition.operations.includes(operation.operation)) {
         throw new FramekitError("INVALID_COMMAND_OPERATION", `Command "${commandId}" does not allow ${operation.operation} on ${operation.doctype}.`, 422);
-      }
-      if ((operation.operation === "update" || operation.operation === "delete") && (!operation.id || operation.expectedRevision === undefined)) {
-        throw new FramekitError("EXPECTED_REVISION_REQUIRED", `${operation.operation} operations require id and expectedRevision.`, 422);
       }
       const target = operation.id ? `${operation.doctype}:${operation.id}` : undefined;
       if (target && targets.has(target)) throw new FramekitError("DUPLICATE_COMMAND_TARGET", `Command targets ${target} more than once.`, 422);
@@ -981,21 +971,19 @@ export class FramekitRuntime {
       }
       if (operation.compensation && (
         !definition.doctypes.includes(operation.compensation.doctype) ||
-        !definition.operations.includes(operation.compensation.operation) ||
-        ((operation.compensation.operation === "update" || operation.compensation.operation === "delete") &&
-          (!operation.compensation.id || operation.compensation.expectedRevision === undefined))
+        !definition.operations.includes(operation.compensation.operation)
       )) {
         throw new FramekitError("INVALID_COMMAND_COMPENSATION", `Command "${commandId}" contains a disallowed or incomplete compensation.`, 422);
       }
     }
-    const fingerprint = mutationFingerprint(`command:${commandId}`, commandId, request.operations);
+    const fingerprint = commandFingerprint(tenant, commandId, request.operations);
     if (definition.mode === "atomic") {
       if (!this.mutations?.executeBatch) {
         throw new FramekitError("COMMAND_ATOMICITY_UNAVAILABLE", `Command "${commandId}" requires a batch-capable mutation unit of work.`, 501);
       }
       if (request.idempotencyKey && this.mutations.replayBatch) {
         const replay = await this.mutations.replayBatch(tenant, request.idempotencyKey, fingerprint);
-        if (replay) return { command: commandId, mode: "atomic", replayed: true, documents: replay.documents };
+        if (replay) return { command: commandId, mode: "atomic", replayed: true, documents: await this.authorizeCommandReplay(tenant, commandId, request.operations, replay.documents) };
       }
       const commands: MutationCommand[] = [];
       for (const operation of request.operations) commands.push(await this.prepareDocumentCommandMutation(tenant, commandId, operation));
@@ -1004,12 +992,15 @@ export class FramekitRuntime {
         idempotencyKey: request.idempotencyKey,
         idempotencyFingerprint: fingerprint
       });
+      const documents = execution.replayed
+        ? await this.authorizeCommandReplay(tenant, commandId, request.operations, execution.documents)
+        : execution.documents;
       if (!execution.replayed) {
         for (const [index, command] of commands.entries()) {
           await this.publishDocumentEvent(tenant, command.operation === "create" ? "created" : command.operation === "update" ? "updated" : "deleted", execution.documents[index] ?? command.document);
         }
       }
-      return { command: commandId, mode: "atomic", replayed: execution.replayed, documents: execution.documents };
+      return { command: commandId, mode: "atomic", replayed: execution.replayed, documents };
     }
 
     if (!this.mutations) {
@@ -1021,16 +1012,19 @@ export class FramekitRuntime {
     try {
       for (const [index, operation] of request.operations.entries()) {
         const stepKey = request.idempotencyKey ? `${request.idempotencyKey}:step:${index}` : undefined;
-        const stepFingerprint = mutationFingerprint(`command:${commandId}:${operation.operation}`, operation.doctype, operation);
+        const stepFingerprint = commandMutationFingerprint(tenant, commandId, operation);
         if (stepKey && this.mutations.replay) {
+          if (operation.compensation) {
+            const compensationKey = `${request.idempotencyKey}:compensation:${index}`;
+            const compensated = await this.mutations.replay(tenant, compensationKey, commandMutationFingerprint(tenant, commandId, operation.compensation));
+            if (compensated.found) throw new FramekitError("COMMAND_SAGA_TERMINAL", `Command "${commandId}" was compensated and cannot be resumed with the same idempotency key.`, 409);
+          }
           const doctype = await this.getEffectiveDocType(tenant, operation.doctype);
           assertPermission(tenant, doctype, operation.operation);
           const replay = await this.mutations.replay(tenant, stepKey, stepFingerprint);
           if (replay.found) {
-            if (!(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document: replay.result }) ?? true)) {
-              throw new FramekitError("FORBIDDEN", `Row policy denied replay of command "${commandId}".`, 403);
-            }
-            completed.push({ operation, document: replay.result });
+            const [authorized] = await this.authorizeCommandReplay(tenant, commandId, [operation], [replay.result]);
+            completed.push({ operation, document: authorized });
             continue;
           }
         }
@@ -1042,7 +1036,7 @@ export class FramekitRuntime {
       }
       return { command: commandId, mode: "saga", replayed: allReplayed, documents: completed.map((item) => item.document) };
     } catch (cause) {
-      if (cause instanceof FramekitError && cause.code === "IDEMPOTENCY_KEY_REUSED") throw cause;
+      if (cause instanceof FramekitError && (cause.code === "IDEMPOTENCY_KEY_REUSED" || cause.code === "COMMAND_SAGA_TERMINAL")) throw cause;
       const compensationFailures: Array<{ index: number; message: string }> = [];
       for (const [reverseIndex, item] of completed.slice().reverse().entries()) {
         const originalIndex = completed.length - reverseIndex - 1;
@@ -1078,7 +1072,7 @@ export class FramekitRuntime {
     let expectedRevision: number | undefined;
     let auditAction: string;
     let outboxAction: string;
-    let afterWrite: () => Promise<void>;
+    let afterWrite: (persisted?: DocumentRecord) => Promise<void>;
     if (operation.operation === "create") {
       const candidate = { ...(operation.data ?? {}) };
       await this.runHooks("beforeValidate", tenant, doctype, undefined, candidate);
@@ -1093,14 +1087,15 @@ export class FramekitRuntime {
       const timestamp = this.now().toISOString();
       document = {
         id: operation.id ?? await this.createDocumentId(tenant, doctype, data), doctype: doctype.name, tenantId: tenant.tenantId,
-        revision: 1, documentStatus: "draft", data, state: doctype.workflow?.initialState, createdAt: timestamp, updatedAt: timestamp
+        revision: 1, documentStatus: "draft", ownerId: doctype.ownership ? tenant.userId : undefined,
+        data, state: doctype.workflow?.initialState, createdAt: timestamp, updatedAt: timestamp
       };
       await this.runHooks("beforeInsert", tenant, doctype, document, data);
       auditAction = "command:create";
       outboxAction = "command.created";
-      afterWrite = () => this.runHooks("afterInsert", tenant, doctype, document, data);
+      afterWrite = (persisted) => this.runCommandAfterHook("afterInsert", tenant, doctype, persisted!);
     } else {
-      const existing = await this.get(tenant, doctype.name, operation.id!);
+      const existing = await this.getForWrite(tenant, doctype, operation.id);
       if (!(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document: existing }) ?? true)) {
         throw new FramekitError("FORBIDDEN", `Row policy denied command "${commandId}" for ${doctype.name} "${existing.id}".`, 403);
       }
@@ -1111,7 +1106,7 @@ export class FramekitRuntime {
         await this.runHooks("beforeDelete", tenant, doctype, document, document.data);
         auditAction = "command:delete";
         outboxAction = "command.deleted";
-        afterWrite = () => this.runHooks("afterDelete", tenant, doctype, document, document.data);
+        afterWrite = (persisted) => this.runCommandAfterHook("afterDelete", tenant, doctype, persisted!);
       } else {
         assertDraftDocument(existing, "update");
         const candidate = { ...existing.data, ...(operation.data ?? {}) };
@@ -1123,7 +1118,7 @@ export class FramekitRuntime {
         await this.runHooks("beforeUpdate", tenant, doctype, document, data);
         auditAction = "command:update";
         outboxAction = "command.updated";
-        afterWrite = () => this.runHooks("afterUpdate", tenant, doctype, document, data);
+        afterWrite = (persisted) => this.runCommandAfterHook("afterUpdate", tenant, doctype, persisted!);
       }
     }
     if (!(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document }) ?? true)) {
@@ -1131,13 +1126,35 @@ export class FramekitRuntime {
     }
     return {
       operation: operation.operation, tenant, doctype, document, expectedRevision, idempotencyKey,
-      idempotencyFingerprint: mutationFingerprint(`command:${commandId}:${operation.operation}`, doctype.name, operation),
-      sideEffects: {
-        audit: this.createAuditEvent(tenant, auditAction, document),
-        outbox: this.createOutboxEvent(tenant, outboxAction, document)
-      },
+      idempotencyFingerprint: commandMutationFingerprint(tenant, commandId, operation),
+      sideEffects: (persisted) => ({
+        audit: this.createAuditEvent(tenant, auditAction, persisted),
+        outbox: this.createOutboxEvent(tenant, outboxAction, persisted)
+      }),
       afterWrite
     };
+  }
+
+  private async authorizeCommandReplay(
+    tenant: TenantContext,
+    commandId: string,
+    operations: DocumentCommandOperation[],
+    stored: Array<DocumentRecord | undefined>
+  ): Promise<Array<DocumentRecord | undefined>> {
+    if (stored.length !== operations.length) throw new FramekitError("COMMAND_REPLAY_UNVERIFIABLE", "Stored command result does not match the reviewed operation count.", 409);
+    const authorized: Array<DocumentRecord | undefined> = [];
+    for (const [index, operation] of operations.entries()) {
+      const doctype = await this.getEffectiveDocType(tenant, operation.doctype);
+      assertPermission(tenant, doctype, operation.operation);
+      const prior = stored[index];
+      if (!prior || operation.operation === "delete") throw new FramekitError("COMMAND_REPLAY_UNVERIFIABLE", "Deleted or missing command results cannot be reauthorized.", 409);
+      const current = await this.repository.get(tenant, doctype, prior.id, { access: operation.operation === "create" ? "read" : "write" });
+      if (!current || !(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document: current }) ?? true)) {
+        throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${prior.id}" does not exist`, 404);
+      }
+      authorized.push(prior);
+    }
+    return authorized;
   }
 
   private async changeDocumentStatus(
@@ -1322,6 +1339,15 @@ export class FramekitRuntime {
     for (const module of this.app.modules) {
       for (const hook of module.hooks?.[name]?.[doctype.name] ?? []) {
         const snapshot = structuredClone(document);
+        await hook({ app: this.app, doctype, tenant, document: snapshot, input: structuredClone(snapshot.data) });
+      }
+    }
+  }
+
+  private async runCommandAfterHook(name: "afterInsert" | "afterUpdate" | "afterDelete", tenant: TenantContext, doctype: DocTypeDefinition, persisted: DocumentRecord): Promise<void> {
+    for (const module of this.app.modules) {
+      for (const hook of module.hooks?.[name]?.[doctype.name] ?? []) {
+        const snapshot = structuredClone(persisted);
         await hook({ app: this.app, doctype, tenant, document: snapshot, input: structuredClone(snapshot.data) });
       }
     }
@@ -1850,6 +1876,7 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
         result = await this.repository.transferOwner(command.tenant, command.doctype, command.document.id, command.document.ownerId!, { expectedRevision: command.expectedRevision!, updatedAt: command.document.updatedAt });
       } else {
         await this.repository.delete(command.tenant, command.doctype, command.document.id, { expectedRevision: command.expectedRevision });
+        result = cloneRecord(command.document);
       }
       wrote = true;
       await command.afterWrite(result);
@@ -2024,6 +2051,29 @@ function mutationFingerprint(operation: string, doctype: string, value: unknown)
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
     return Object.fromEntries(Object.entries(candidate).sort(([left], [right]) => left.localeCompare(right)));
   });
+}
+
+function commandFingerprint(tenant: TenantContext, commandId: string, operations: DocumentCommandOperation[]): string {
+  return mutationFingerprint(`command:${commandId}`, commandId, {
+    principal: commandPrincipal(tenant),
+    operations
+  });
+}
+
+function commandMutationFingerprint(tenant: TenantContext, commandId: string, operation: NonNullable<DocumentCommandOperation["compensation"]> | DocumentCommandOperation): string {
+  return mutationFingerprint(`command:${commandId}:${operation.operation}`, operation.doctype, {
+    principal: commandPrincipal(tenant),
+    operation
+  });
+}
+
+function commandPrincipal(tenant: TenantContext): Record<string, unknown> {
+  return {
+    tenantId: tenant.tenantId,
+    userId: tenant.userId,
+    roles: [...tenant.roles].sort(),
+    permissions: [...tenant.permissions].sort()
+  };
 }
 
 function assertDraftDocument(document: DocumentRecord, action: string): void {

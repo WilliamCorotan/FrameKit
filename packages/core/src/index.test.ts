@@ -135,5 +135,6 @@ describe("core metadata", () => {
       defineModule({ id: "left", name: "Left", doctypes: [record], commands: [command] }),
       defineModule({ id: "right", name: "Right", commands: [{ ...command, doctypes: [record.name] }] })
     ] })).toThrow(/Duplicate command id/);
+    expect(() => defineModule({ id: "typo", name: "Typo", commands: [{ ...command, maxOperatons: 2 }] as never })).toThrow(/unrecognized key/i);
   });
 });

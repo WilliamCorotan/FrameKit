@@ -961,10 +961,15 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
   it("executes cross-DocType command batches atomically with replay and stale-revision rollback", async () => {
     const commandTenant = { ...tenant, tenantId: "pg_command_batch_tenant" };
     const commandApp = defineApp({ name: "Postgres Commands", modules: [defineModule({
-      id: "commands", name: "Commands", doctypes: [customerDocType, dealDocType], commands: [{
+      id: "commands", name: "Commands", doctypes: [customerDocType, dealDocType, securedDocType], commands: [{
         id: "customer-deal", label: "Customer and deal", permission: "commands.manage", mode: "atomic",
         doctypes: [customerDocType.name, dealDocType.name], operations: ["create", "update", "delete"], maxOperations: 10
-      }]
+      }, {
+        id: "secure-records", label: "Secure records", permission: "commands.manage", mode: "atomic",
+        doctypes: [securedDocType.name], operations: ["create", "update", "delete"], maxOperations: 10
+      }], hooks: { afterInsert: { secured_record: [({ document }) => {
+        if (document) { document.revision = 999; document.ownerId = "mallory"; document.data.title = "mutated"; }
+      }] } }
     })] });
     const runtime = createRuntime(commandApp, {
       repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
@@ -994,6 +999,32 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
         { operation: "update", doctype: dealDocType.name, id: "command-deal", expectedRevision: 99, data: { title: "Stale" } }
       ] })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
       await expect(runtime.get(commandTenant, customerDocType.name, "command-customer")).resolves.toMatchObject({ revision: 1, data: { status: "active" } });
+
+      const secureRequest = { operations: [{
+        operation: "create" as const, doctype: securedDocType.name, id: "command-secure", data: { title: "Secure command", code: "COMMAND-SECURE" }
+      }], idempotencyKey: "secure-command-1" };
+      await expect(runtime.executeDocumentCommand(commandTenant, "secure-records", secureRequest)).resolves.toMatchObject({
+        replayed: false,
+        documents: [{ id: "command-secure", revision: 1, ownerId: commandTenant.userId, data: { title: "Secure command" } }]
+      });
+      const secureRows = await sql<{ ownerId: string; revision: number; title: string }[]>`
+        select owner_id as "ownerId", revision, data ->> 'title' as title from framekit_documents
+        where tenant_id = ${commandTenant.tenantId} and doctype = ${securedDocType.name} and id = 'command-secure'
+      `;
+      expect(secureRows).toEqual([{ ownerId: commandTenant.userId, revision: 1, title: "Secure command" }]);
+      expect((await stores.outbox.list(commandTenant)).find((event) => event.payload.id === "command-secure")?.payload).toMatchObject({
+        revision: 1, ownerId: commandTenant.userId, data: { title: "Secure command" }
+      });
+
+      const reader = { ...commandTenant, userId: "command-reader", roles: ["manager"], permissions: ["commands.manage"] };
+      await expect(runtime.get(reader, securedDocType.name, "command-secure")).resolves.toMatchObject({ id: "command-secure" });
+      await expect(runtime.executeDocumentCommand(reader, "secure-records", secureRequest)).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+      await expect(runtime.executeDocumentCommand(reader, "secure-records", { operations: [{
+        operation: "update", doctype: securedDocType.name, id: "command-secure", expectedRevision: 1, data: { title: "Stolen" }
+      }] })).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+      await expect(runtime.executeDocumentCommand(reader, "secure-records", { operations: [{
+        operation: "delete", doctype: securedDocType.name, id: "command-secure", expectedRevision: 1
+      }] })).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
     } finally {
       injectedStage = undefined;
       await sql`delete from framekit_document_unique_values where tenant_id = ${commandTenant.tenantId}`;

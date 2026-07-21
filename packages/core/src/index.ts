@@ -210,9 +210,36 @@ export const CommandDefinitionSchema = z.object({
   doctypes: z.array(z.string().regex(/^[a-z][a-z0-9_]*$/)).min(1),
   operations: z.array(z.enum(["create", "update", "delete"])).min(1).default(["create", "update"]),
   maxOperations: z.number().int().min(1).max(1000).default(100)
-});
+}).strict();
 
 export type CommandDefinition = z.infer<typeof CommandDefinitionSchema>;
+
+const CommandDocumentDataSchema = z.record(z.string(), z.unknown());
+const CommandRevisionSchema = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const CommandCreateSchema = z.object({
+  operation: z.literal("create"), doctype: z.string().regex(/^[a-z][a-z0-9_]*$/), id: z.string().min(1).optional(), data: CommandDocumentDataSchema
+}).strict();
+const CommandUpdateSchema = z.object({
+  operation: z.literal("update"), doctype: z.string().regex(/^[a-z][a-z0-9_]*$/), id: z.string().min(1), data: CommandDocumentDataSchema,
+  expectedRevision: CommandRevisionSchema
+}).strict();
+const CommandDeleteSchema = z.object({
+  operation: z.literal("delete"), doctype: z.string().regex(/^[a-z][a-z0-9_]*$/), id: z.string().min(1), expectedRevision: CommandRevisionSchema
+}).strict();
+
+export const DocumentCommandCompensationSchema = z.discriminatedUnion("operation", [CommandCreateSchema, CommandUpdateSchema, CommandDeleteSchema]);
+export const DocumentCommandOperationSchema = z.discriminatedUnion("operation", [
+  CommandCreateSchema.extend({ compensation: DocumentCommandCompensationSchema.optional() }).strict(),
+  CommandUpdateSchema.extend({ compensation: DocumentCommandCompensationSchema.optional() }).strict(),
+  CommandDeleteSchema.extend({ compensation: DocumentCommandCompensationSchema.optional() }).strict()
+]);
+export const DocumentCommandRequestSchema = z.object({
+  operations: z.array(DocumentCommandOperationSchema).min(1),
+  idempotencyKey: z.string().min(1).optional()
+}).strict();
+
+export type DocumentCommandOperation = z.infer<typeof DocumentCommandOperationSchema>;
+export type DocumentCommandRequest = z.infer<typeof DocumentCommandRequestSchema>;
 
 export const ModuleSchema: z.ZodType<ModuleDefinition> = z.object({
   id: z.string().min(1).regex(/^[a-z][a-z0-9_-]*$/),

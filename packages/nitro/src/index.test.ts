@@ -28,6 +28,10 @@ describe("createNitroHandler", () => {
     await expect(json(fetch, "/api/commands/create-items", {
       method: "POST", headers: { "x-permissions": "items.write,items.bulk", "idempotency-key": "create-items-1" }, body: { operations }
     })).resolves.toMatchObject({ command: "create-items", mode: "atomic", replayed: false, documents: [{ id: "item-1" }] });
+    await expect(json(fetch, "/api/commands/create-items", {
+      method: "POST", headers: { "x-permissions": "items.write,items.bulk" },
+      body: { operations: [{ operation: "create", doctype: item.name, data: [], expectedRevision: 1, typo: true }] }
+    })).rejects.toMatchObject({ code: "INVALID_COMMAND_OPERATION" });
   });
 
   it("exposes submit and cancel document lifecycle commands", async () => {
