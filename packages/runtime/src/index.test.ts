@@ -240,6 +240,56 @@ describe("runtime document service", () => {
     await expect(runtime.list(tenant, "customer", { filters: { email: "retry@example.com" } })).resolves.toHaveLength(1);
   });
 
+  it("preserves a queued mutation when an earlier in-memory mutation rolls back", async () => {
+    let signalFirstHook!: () => void;
+    let releaseFirstHook!: () => void;
+    const firstHookStarted = new Promise<void>((resolve) => { signalFirstHook = resolve; });
+    const firstHookRelease = new Promise<void>((resolve) => { releaseFirstHook = resolve; });
+    const app = defineApp({
+      name: "Atomic memory",
+      modules: [defineModule({
+        id: "atomic",
+        name: "Atomic",
+        doctypes: [defineDocType({
+          name: "customer",
+          label: "Customer",
+          naming: { field: "name" },
+          fields: [{ name: "name", label: "Name", type: "text", required: true }],
+          permissions: [
+            { action: "create", permissions: ["crm.customer"] },
+            { action: "read", permissions: ["crm.customer"] }
+          ]
+        })],
+        hooks: {
+          afterInsert: {
+            customer: [async ({ document }) => {
+              if (document?.id !== "a") return;
+              signalFirstHook();
+              await firstHookRelease;
+              throw new Error("injected A failure");
+            }]
+          }
+        }
+      })]
+    });
+    let id = 0;
+    const runtime = createRuntime(app, { idGenerator: () => `atomic-${++id}` });
+
+    const failed = runtime.create(tenant, "customer", { name: "A" }).then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error })
+    );
+    await firstHookStarted;
+    const successful = runtime.create(tenant, "customer", { name: "B" });
+    releaseFirstHook();
+
+    await expect(failed).resolves.toMatchObject({ ok: false, error: { message: "injected A failure" } });
+    await expect(successful).resolves.toMatchObject({ id: "b", revision: 1 });
+    await expect(runtime.list(tenant, "customer")).resolves.toEqual([expect.objectContaining({ id: "b" })]);
+    await expect(runtime.auditTrail(tenant)).resolves.toEqual([expect.objectContaining({ documentId: "b" })]);
+    await expect(runtime.outboxEvents(tenant)).resolves.toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: "b" }) })]);
+  });
+
   it("runs workflow transitions", async () => {
     const app = defineApp({
       name: "CRM",

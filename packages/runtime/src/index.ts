@@ -1020,7 +1020,7 @@ export class InMemoryOutboxStore implements OutboxStore {
 
 export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
   private readonly idempotency = new Map<string, { fingerprint: string; result?: DocumentRecord }>();
-  private readonly locks = new Map<string, Promise<{ document?: DocumentRecord; replayed: boolean }>>();
+  private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly repository: InMemoryDocumentRepository,
@@ -1045,15 +1045,14 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
 
   async execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }> {
     const idempotencyKey = command.idempotencyKey ? `${command.tenant.tenantId}:${command.idempotencyKey}` : undefined;
-    if (!idempotencyKey) return this.executeUnlocked(command);
-    const previous = this.locks.get(idempotencyKey);
-    const execution = (previous ? previous.catch(() => ({ replayed: false })) : Promise.resolve())
-      .then(() => this.executeUnlocked(command, idempotencyKey));
-    this.locks.set(idempotencyKey, execution);
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous.catch(() => undefined);
     try {
-      return await execution;
+      return await this.executeUnlocked(command, idempotencyKey);
     } finally {
-      if (this.locks.get(idempotencyKey) === execution) this.locks.delete(idempotencyKey);
+      release();
     }
   }
 
