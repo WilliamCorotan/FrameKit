@@ -233,6 +233,12 @@ export type PostgresMigrationStoreOptions = PostgresRepositoryOptions & {
   faultInjector?: (stage: PostgresMigrationStage, plan: MigrationPlan, statementIndex?: number) => void | Promise<void>;
 };
 
+export type PostgresRealtimeStage = "locked" | "inserted";
+
+export type PostgresRealtimePublisherOptions = PostgresRepositoryOptions & {
+  faultInjector?: (stage: PostgresRealtimeStage, event: RuntimeRealtimeEvent) => void | Promise<void>;
+};
+
 export class PostgresDocumentRepository implements DocumentRepository {
   private readonly db: PostgresJsDatabase;
   private readonly onQuery?: PostgresRepositoryOptions["onQuery"];
@@ -916,13 +922,15 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
   private readonly channelReady = new Map<string, Promise<void>>();
   private readonly deliveryPumps = new Map<string, Promise<void>>();
   private readonly dirtyChannels = new Set<string>();
+  private readonly faultInjector?: PostgresRealtimePublisherOptions["faultInjector"];
   private listener?: Awaited<ReturnType<Sql["listen"]>>;
   private listenerReady?: Promise<void>;
   private closed = false;
 
-  constructor(options: PostgresRepositoryOptions) {
+  constructor(options: PostgresRealtimePublisherOptions) {
     this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
     this.listenerSql = postgres(options.connectionString, { max: 1 });
+    this.faultInjector = options.faultInjector;
   }
 
   async migrate(): Promise<void> {
@@ -935,13 +943,18 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
 
   async publish(event: RuntimeRealtimeEvent): Promise<void> {
     if (this.closed) throw new FramekitError("REALTIME_CLOSED", "Realtime publisher is closed", 503);
-    const rows = await this.sql<RealtimeSqlRow[]>`
-      insert into framekit_realtime_events (channel, type, payload, created_at)
-      values (${event.channel}, ${event.type}, ${this.sql.json(event.payload as Parameters<Sql["json"]>[0])}, ${event.createdAt ? new Date(event.createdAt) : new Date()})
-      returning cursor::text, channel, type, payload, created_at
-    `;
-    const persisted = realtimeSqlRowToEvent(rows[0]!);
-    await this.sql`select pg_notify('framekit_realtime_events', ${JSON.stringify({ cursor: persisted.cursor, channel: persisted.channel })})`;
+    await this.sql.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended(${event.channel}, 0))`;
+      await this.faultInjector?.("locked", event);
+      const rows = await tx<RealtimeSqlRow[]>`
+        insert into framekit_realtime_events (channel, type, payload, created_at)
+        values (${event.channel}, ${event.type}, ${tx.json(event.payload as Parameters<Sql["json"]>[0])}, ${event.createdAt ? new Date(event.createdAt) : new Date()})
+        returning cursor::text, channel, type, payload, created_at
+      `;
+      const persisted = realtimeSqlRowToEvent(rows[0]!);
+      await this.faultInjector?.("inserted", event);
+      await tx`select pg_notify('framekit_realtime_events', ${JSON.stringify({ cursor: persisted.cursor, channel: persisted.channel })})`;
+    });
   }
 
   async list(channel: string, options: { limit?: number; after?: string; order?: "asc" | "desc" } = {}): Promise<RuntimeRealtimeEvent[]> {

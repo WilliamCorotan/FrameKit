@@ -696,7 +696,21 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
   });
 
   it("publishes across Postgres instances and replays durable events after a cursor", async () => {
-    const publisher = new PostgresRealtimePublisher({ connectionString: connectionString! });
+    const heldInsert = deferred<void>();
+    const releaseInsert = deferred<void>();
+    const insertOrder: string[] = [];
+    const publisher = new PostgresRealtimePublisher({
+      connectionString: connectionString!,
+      faultInjector: async (stage, event) => {
+        if (stage !== "inserted") return;
+        const id = String(event.payload.id);
+        insertOrder.push(id);
+        if (id === "held") {
+          heldInsert.resolve();
+          await releaseInsert.promise;
+        }
+      }
+    });
     const subscriber = new PostgresRealtimePublisher({ connectionString: connectionString! });
     const channel = "tenant:pg_realtime_tenant:documents";
     await publisher.migrate();
@@ -713,15 +727,24 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       await expect(subscriber.list(channel, { after: cursor })).resolves.toEqual([
         expect.objectContaining({ type: "customer.updated", payload: { id: "second" } })
       ]);
+      const held = publisher.publish({ channel, type: "customer.updated", payload: { id: "held" } });
+      await heldInsert.promise;
+      const follower = publisher.publish({ channel, type: "customer.updated", payload: { id: "follower" } });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(insertOrder.slice(-1)).toEqual(["held"]);
+      releaseInsert.resolve();
+      await Promise.all([held, follower]);
+      await waitFor(() => received.length === 4);
       await Promise.all(Array.from({ length: 50 }, (_, index) => publisher.publish({
         channel,
         type: "customer.updated",
         payload: { id: `burst-${index}` }
       })));
-      await waitFor(() => received.length === 52);
+      await waitFor(() => received.length === 54);
       const cursors = received.map((event) => BigInt(event.cursor!));
-      expect(cursors).toHaveLength(52);
-      expect(new Set(cursors.map(String)).size).toBe(52);
+      expect(cursors).toHaveLength(54);
+      expect(new Set(cursors.map(String)).size).toBe(54);
       expect(cursors.every((value, index) => index === 0 || value > cursors[index - 1]!)).toBe(true);
       const replayed = await subscriber.list(channel, { after: cursor, order: "asc", limit: 100 });
       expect(replayed.map((event) => event.cursor)).toEqual(received.slice(1).map((event) => event.cursor));
@@ -794,6 +817,16 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
     if (Date.now() >= deadline) throw new Error("Timed out waiting for cross-instance event");
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 function createIdGenerator(namespace = "default") {
