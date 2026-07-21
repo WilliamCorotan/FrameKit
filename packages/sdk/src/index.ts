@@ -79,6 +79,89 @@ export type MutationRequestOptions = {
   idempotencyKey?: string;
 };
 
+export type HealthResponse = {
+  ok: true;
+  app: string;
+  version?: string;
+};
+
+export type DependencyHealthResponse = {
+  ok: boolean;
+  dependencies: Record<string, { ok: boolean; details?: unknown }>;
+};
+
+export type MigrationChange = {
+  kind: "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint";
+  doctype: string;
+  field: string;
+  destructive: boolean;
+  from?: unknown;
+  to?: unknown;
+  rollback?: MigrationRollback;
+};
+
+export type MigrationRollback = Omit<MigrationChange, "rollback">;
+
+export type MigrationPlan = {
+  id: string;
+  tenantId: string;
+  appName: string;
+  createdAt: string;
+  changes: MigrationChange[];
+  checksum: string;
+};
+
+export type MigrationRecord = MigrationPlan & {
+  appliedAt: string;
+};
+
+export const FRAMEKIT_HTTP_ENDPOINTS = [
+  ["health", "GET", "/health"],
+  ["dependencyHealth", "GET", "/health/dependencies"],
+  ["meta", "GET", "/api/meta"],
+  ["diagnostics", "GET", "/api/diagnostics"],
+  ["migrations", "GET", "/api/migrations"],
+  ["realtimeEvents", "GET", "/api/realtime/events"],
+  ["streamRealtimeEvents", "GET", "/api/realtime/stream"],
+  ["planMigration", "POST", "/api/migrations/plan"],
+  ["applyMigration", "POST", "/api/migrations/apply"],
+  ["openapi", "GET", "/api/openapi.json"],
+  ["audit", "GET", "/api/audit"],
+  ["outbox", "GET", "/api/outbox"],
+  ["markOutboxDispatched", "POST", "/api/outbox/:id/dispatch"],
+  ["markOutboxFailed", "POST", "/api/outbox/:id/fail"],
+  ["customFields", "GET", "/api/custom-fields"],
+  ["addCustomField", "POST", "/api/custom-fields"],
+  ["views", "GET", "/api/views"],
+  ["upsertView", "POST", "/api/views"],
+  ["login", "POST", "/api/auth/login"],
+  ["loginWithProvider", "POST", "/api/auth/providers/:providerId/login"],
+  ["me", "GET", "/api/auth/me"],
+  ["refresh", "POST", "/api/auth/refresh"],
+  ["logout", "POST", "/api/auth/logout"],
+  ["changePassword", "POST", "/api/auth/password/change"],
+  ["users", "GET", "/api/auth/users"],
+  ["createUser", "POST", "/api/auth/users"],
+  ["updateUser", "PATCH", "/api/auth/users/:id"],
+  ["deleteUser", "DELETE", "/api/auth/users/:id"],
+  ["resetUserPassword", "POST", "/api/auth/users/:id/password"],
+  ["authAudit", "GET", "/api/auth/audit"],
+  ["roles", "GET", "/api/auth/roles"],
+  ["upsertRole", "POST", "/api/auth/roles"],
+  ["updateRole", "PATCH", "/api/auth/roles/:id"],
+  ["deleteRole", "DELETE", "/api/auth/roles/:id"],
+  ["apiTokens", "GET", "/api/auth/tokens"],
+  ["createApiToken", "POST", "/api/auth/tokens"],
+  ["revokeApiToken", "DELETE", "/api/auth/tokens/:id"],
+  ["list", "GET", "/api/doctypes/:doctype"],
+  ["listPage", "GET", "/api/doctypes/:doctype"],
+  ["get", "GET", "/api/doctypes/:doctype/:id"],
+  ["create", "POST", "/api/doctypes/:doctype"],
+  ["update", "PATCH", "/api/doctypes/:doctype/:id"],
+  ["delete", "DELETE", "/api/doctypes/:doctype/:id"],
+  ["transition", "POST", "/api/doctypes/:doctype/:id/transition"]
+] as const;
+
 export class FramekitClient {
   private readonly baseUrl: string;
   private readonly tenant: Partial<TenantContext>;
@@ -94,6 +177,14 @@ export class FramekitClient {
     this.token = options.token;
   }
 
+  health(): Promise<HealthResponse> {
+    return this.request("/health", { skipAuth: true });
+  }
+
+  dependencyHealth(): Promise<DependencyHealthResponse> {
+    return this.request("/health/dependencies", { skipAuth: true });
+  }
+
   meta<T = unknown>(): Promise<T> {
     return this.request("/api/meta");
   }
@@ -102,7 +193,7 @@ export class FramekitClient {
     return this.request("/api/diagnostics");
   }
 
-  migrations<T = unknown>(): Promise<T> {
+  migrations(): Promise<MigrationRecord[]> {
     return this.request("/api/migrations");
   }
 
@@ -143,11 +234,11 @@ export class FramekitClient {
     }
   }
 
-  planMigration<T = unknown>(app: unknown): Promise<T> {
+  planMigration(app: AppDefinition): Promise<MigrationPlan> {
     return this.request("/api/migrations/plan", { method: "POST", body: { app } });
   }
 
-  applyMigration<T = unknown>(plan: unknown, options: { allowDestructive?: boolean } = {}): Promise<T> {
+  applyMigration(plan: MigrationPlan, options: { allowDestructive?: boolean } = {}): Promise<MigrationRecord> {
     return this.request("/api/migrations/apply", { method: "POST", body: { plan, allowDestructive: options.allowDestructive } });
   }
 

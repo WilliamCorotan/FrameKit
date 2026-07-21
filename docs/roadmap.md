@@ -61,7 +61,7 @@ Status: partially implemented
 Status: partially implemented
 
 - Generate typed SDK models from app metadata; generated endpoint parity remains incomplete.
-- Add a `create-app` template for Nitro, Docker/env, and a starter DocType. Standalone consumption and a complete Desk template remain tracked in [#24](https://github.com/WilliamCorotan/FrameKit/issues/24).
+- Add a `create-app` server template for Nitro, Docker/env, and a starter DocType. The scaffold intentionally excludes Desk; a future packaged Desk template requires its own stable asset and upgrade contract.
 - Add CI workflow, deployment presets docs, and package publishing metadata.
 
 ## Historical Next Candidates

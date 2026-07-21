@@ -1,12 +1,54 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
-import { createClient, generateSdkTypes } from "./index.js";
+import { ofetch } from "ofetch";
+import { createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitClient, generateSdkTypes, type MigrationPlan } from "./index.js";
+
+vi.mock("ofetch", () => ({ ofetch: vi.fn() }));
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.mocked(ofetch).mockReset();
 });
 
 describe("generateSdkTypes", () => {
+  it("keeps the explicit HTTP endpoint matrix in parity with every public client method", () => {
+    const methods = Object.getOwnPropertyNames(FramekitClient.prototype)
+      .filter((name) => !["constructor", "headers", "request"].includes(name))
+      .sort();
+
+    expect(FRAMEKIT_HTTP_ENDPOINTS.map(([method]) => method).sort()).toEqual(methods);
+  });
+
+  it("covers health, delete, and typed migration request semantics", async () => {
+    vi.mocked(ofetch).mockResolvedValue({} as never);
+    const client = createClient({ baseUrl: "http://localhost:3000", token: "session" });
+    const app = defineApp({ name: "SDK parity", modules: [] });
+    const plan: MigrationPlan = {
+      id: "migration-1",
+      tenantId: "default",
+      appName: app.name,
+      createdAt: "2026-07-21T00:00:00.000Z",
+      changes: [],
+      checksum: "checksum"
+    };
+
+    await client.health();
+    await client.dependencyHealth();
+    await client.delete("note", "note-1", { expectedRevision: 2, idempotencyKey: "delete-note-1" });
+    await client.migrations();
+    await client.planMigration(app);
+    await client.applyMigration(plan, { allowDestructive: true });
+
+    expect(vi.mocked(ofetch).mock.calls).toEqual([
+      ["http://localhost:3000/health", expect.objectContaining({ headers: expect.not.objectContaining({ authorization: expect.any(String) }) })],
+      ["http://localhost:3000/health/dependencies", expect.objectContaining({ headers: expect.not.objectContaining({ authorization: expect.any(String) }) })],
+      ["http://localhost:3000/api/doctypes/note/note-1", expect.objectContaining({ method: "DELETE", headers: expect.objectContaining({ authorization: "Bearer session", "if-match": "2", "idempotency-key": "delete-note-1" }) })],
+      ["http://localhost:3000/api/migrations", expect.objectContaining({ headers: expect.objectContaining({ authorization: "Bearer session" }) })],
+      ["http://localhost:3000/api/migrations/plan", expect.objectContaining({ method: "POST", body: { app } })],
+      ["http://localhost:3000/api/migrations/apply", expect.objectContaining({ method: "POST", body: { plan, allowDestructive: true } })]
+    ]);
+  });
+
   it("emits typed inputs, records, and workflow actions from metadata", () => {
     const app = defineApp({
       name: "SDK",

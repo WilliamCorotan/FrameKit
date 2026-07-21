@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +10,46 @@ import { createExecutableMigrationArtifact, createRuntime, migrationChecksum } f
 import { runCli } from "./index.js";
 
 describe("framekit CLI", () => {
+  it("creates a standalone server scaffold with published dependencies and a local TypeScript config", async () => {
+    await inTemporaryDirectory(async (directory) => {
+      await runCli(["create-app", "Standalone Notes"], { log: () => undefined });
+
+      const manifest = JSON.parse(await readFile(join(directory, "standalone-notes/package.json"), "utf8")) as {
+        dependencies: Record<string, string>;
+      };
+      for (const name of ["@framekit/auth", "@framekit/core", "@framekit/nitro", "@framekit/runtime"]) {
+        expect(manifest.dependencies[name]).toMatch(/^\^\d+\.\d+\.\d+/);
+      }
+      expect(Object.values(manifest.dependencies)).not.toContain("workspace:*");
+      expect(JSON.parse(await readFile(join(directory, "standalone-notes/tsconfig.json"), "utf8"))).not.toHaveProperty("extends");
+      expect(await readFile(join(directory, "standalone-notes/src/app.ts"), "utf8")).toContain("await hashPassword(bootstrapPassword)");
+      expect(await readFile(join(directory, "standalone-notes/start.mjs"), "utf8")).toContain("server.listen(port, host");
+      expect(await readFile(join(directory, "standalone-notes/test/standalone-smoke.mjs"), "utf8")).toContain("Standalone CRUD proof failed");
+    });
+  });
+
+  it("keeps scaffold writes non-destructive unless force is explicit and dry-run never writes", async () => {
+    await inTemporaryDirectory(async (directory) => {
+      const logs: string[] = [];
+      await runCli(["create-app", "safe-app", "--dry-run"], { log: (message) => logs.push(message) });
+      await expect(readFile(join(directory, "safe-app/package.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(logs.some((message) => message.startsWith("Would create"))).toBe(true);
+
+      await runCli(["create-app", "safe-app"], { log: () => undefined });
+      const manifestPath = join(directory, "safe-app/package.json");
+      await writeFile(manifestPath, "user-owned-content\n");
+      await expect(runCli(["create-app", "safe-app"], { log: () => undefined })).rejects.toThrow("Refusing to overwrite");
+      expect(await readFile(manifestPath, "utf8")).toBe("user-owned-content\n");
+
+      await runCli(["create-app", "safe-app", "--force"], { log: () => undefined });
+      expect(JSON.parse(await readFile(manifestPath, "utf8"))).toMatchObject({ name: "safe-app" });
+    });
+  });
+
+  it("rejects scaffold names that could resolve to the current directory", async () => {
+    await expect(runCli(["create-app", "../"], { log: () => undefined })).rejects.toThrow("at least one letter or number");
+  });
+
   it("generates SDK types from an app module path", async () => {
     let stdout = "";
 
@@ -117,3 +160,15 @@ describe("framekit CLI", () => {
     }
   });
 });
+
+async function inTemporaryDirectory(run: (directory: string) => Promise<void>): Promise<void> {
+  const previous = process.cwd();
+  const directory = await mkdtemp(join(tmpdir(), "framekit-cli-"));
+  process.chdir(directory);
+  try {
+    await run(directory);
+  } finally {
+    process.chdir(previous);
+    await rm(directory, { recursive: true, force: true });
+  }
+}

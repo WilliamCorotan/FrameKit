@@ -22,8 +22,10 @@
   },
   "description": "Realtime event bus helpers for Framekit.",
   "files": [
-    "dist"
+    "dist",
+    "src/index.ts"
   ],
+  "engines": { "node": ">=22 <26" },
   "publishConfig": {
     "access": "public",
     "provenance": true

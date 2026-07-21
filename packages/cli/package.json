@@ -33,8 +33,10 @@
   },
   "description": "Framekit project and code generation CLI.",
   "files": [
-    "dist"
+    "dist",
+    "src/index.ts"
   ],
+  "engines": { "node": ">=22 <26" },
   "publishConfig": {
     "access": "public",
     "provenance": true

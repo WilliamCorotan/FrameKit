@@ -317,7 +317,9 @@ VITE_FRAMEKIT_API_URL=http://localhost:3000
 pnpm --filter @framekit/cli framekit create-app alpha-suite
 ```
 
-The scaffold includes:
+Scaffold commands refuse to overwrite generated paths by default. Use `--dry-run` to inspect every planned write and `--force` to replace only the listed scaffold files.
+
+`create-app` is intentionally a server starter. It includes:
 
 - `package.json`
 - `nitro.config.ts`
@@ -327,6 +329,8 @@ The scaffold includes:
 - `.env.production.example`
 - `Dockerfile`
 - A starter `Note` DocType
+
+It does not scaffold the React Desk. Run the repository Desk separately or build a frontend against `@framekit/sdk`; a packaged Desk template is deferred until its assets, configuration, and upgrade contract can be shipped as one supported unit.
 
 ## Verification
 

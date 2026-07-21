@@ -26,8 +26,10 @@
   },
   "description": "OpenAPI document generation for Framekit apps.",
   "files": [
-    "dist"
+    "dist",
+    "src/index.ts"
   ],
+  "engines": { "node": ">=22 <26" },
   "publishConfig": {
     "access": "public",
     "provenance": true
