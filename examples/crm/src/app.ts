@@ -10,6 +10,7 @@ import {
   PostgresMutationUnitOfWork,
   PostgresNamingSeriesStore,
   PostgresOutboxStore,
+  PostgresRealtimePublisher,
   PostgresRoleStore,
   PostgresSessionRevocationStore,
   PostgresUserStore
@@ -137,7 +138,7 @@ const userStore = await createUserStore();
 const roleStore = await createRoleStore();
 const apiTokenStore = await createApiTokenStore();
 const sessionRevocations = await createSessionRevocationStore();
-export const eventBus = new InMemoryEventBus();
+export const eventBus = await createRealtimePublisher();
 export const runtime = createRuntime(app, {
   ...(repository ? { repository } : {}),
   ...(audit ? { audit } : {}),
@@ -148,6 +149,13 @@ export const runtime = createRuntime(app, {
   ...(mutations ? { mutations } : {}),
   realtime: eventBus
 });
+
+async function createRealtimePublisher() {
+  if (!process.env.DATABASE_URL) return new InMemoryEventBus();
+  const realtime = new PostgresRealtimePublisher({ connectionString: process.env.DATABASE_URL });
+  await realtime.migrate();
+  return realtime;
+}
 export const auth = new PasswordAuthService({
   secret: authSecret,
   userStore,

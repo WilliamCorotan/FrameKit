@@ -115,11 +115,22 @@ export type OutboxEvent = {
   type: string;
   topic: string;
   payload: Record<string, unknown>;
-  status: "pending" | "dispatched" | "failed";
+  status: "pending" | "leased" | "dispatched" | "failed" | "dead_letter";
   attempts: number;
   createdAt: string;
   processedAt?: string;
   error?: string;
+  leaseOwner?: string;
+  leaseExpiresAt?: string;
+  nextAttemptAt?: string;
+};
+
+export type OutboxClaimOptions = {
+  ownerId: string;
+  limit?: number;
+  leaseMs?: number;
+  maxAttempts?: number;
+  now?: string;
 };
 
 export type OutboxStore = {
@@ -127,6 +138,9 @@ export type OutboxStore = {
   list(tenant: TenantContext, options?: { limit?: number; status?: OutboxEvent["status"] }): Promise<OutboxEvent[]>;
   markDispatched(tenant: TenantContext, id: string): Promise<OutboxEvent>;
   markFailed(tenant: TenantContext, id: string, error: string): Promise<OutboxEvent>;
+  claim(tenant: TenantContext, options: OutboxClaimOptions): Promise<OutboxEvent[]>;
+  acknowledge(tenant: TenantContext, id: string, ownerId: string): Promise<OutboxEvent>;
+  reject(tenant: TenantContext, id: string, ownerId: string, error: string, options?: { backoffMs?: number; maxAttempts?: number; now?: string }): Promise<OutboxEvent>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
@@ -186,15 +200,19 @@ export type MigrationStore = {
 };
 
 export type RuntimeRealtimeEvent = {
+  cursor?: string;
   channel: string;
   type: string;
   payload: Record<string, unknown>;
+  createdAt?: string;
 };
 
 export type RealtimePublisher = {
   publish(event: RuntimeRealtimeEvent): Promise<void> | void;
-  list?(channel: string, options?: { limit?: number }): Promise<RuntimeRealtimeEvent[]> | RuntimeRealtimeEvent[];
+  list?(channel: string, options?: { limit?: number; after?: string }): Promise<RuntimeRealtimeEvent[]> | RuntimeRealtimeEvent[];
   subscribe?(channel: string, listener: (event: RuntimeRealtimeEvent) => void): () => void;
+  health?(): Promise<{ ok: boolean; details?: Record<string, unknown> }>;
+  close?(): Promise<void>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
@@ -299,7 +317,7 @@ export class FramekitRuntime {
     return this.migrations.list(tenant, { appName: this.app.name });
   }
 
-  async realtimeEvents(tenant: TenantContext, options: { limit?: number } = {}): Promise<RuntimeRealtimeEvent[]> {
+  async realtimeEvents(tenant: TenantContext, options: { limit?: number; after?: string } = {}): Promise<RuntimeRealtimeEvent[]> {
     if (!this.realtime.list) {
       return [];
     }
@@ -476,6 +494,18 @@ export class FramekitRuntime {
 
   async markOutboxFailed(tenant: TenantContext, id: string, error: string): Promise<OutboxEvent> {
     return this.outbox.markFailed(tenant, id, error);
+  }
+
+  async claimOutboxEvents(tenant: TenantContext, options: OutboxClaimOptions): Promise<OutboxEvent[]> {
+    return this.outbox.claim(tenant, options);
+  }
+
+  async acknowledgeOutboxEvent(tenant: TenantContext, id: string, ownerId: string): Promise<OutboxEvent> {
+    return this.outbox.acknowledge(tenant, id, ownerId);
+  }
+
+  async rejectOutboxEvent(tenant: TenantContext, id: string, ownerId: string, error: string, options: { backoffMs?: number; maxAttempts?: number; now?: string } = {}): Promise<OutboxEvent> {
+    return this.outbox.reject(tenant, id, ownerId, error, options);
   }
 
   async list(tenant: TenantContext, doctypeName: string, options?: ListOptions): Promise<DocumentRecord[]> {
@@ -1024,7 +1054,7 @@ export class InMemoryOutboxStore implements OutboxStore {
       .filter((event) => event.tenantId === tenant.tenantId && (!options.status || event.status === options.status))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, options.limit ?? 100)
-      .map((event) => ({ ...event, payload: { ...event.payload } }));
+      .map(cloneOutboxEvent);
   }
 
   async markDispatched(tenant: TenantContext, id: string): Promise<OutboxEvent> {
@@ -1033,6 +1063,67 @@ export class InMemoryOutboxStore implements OutboxStore {
 
   async markFailed(tenant: TenantContext, id: string, error: string): Promise<OutboxEvent> {
     return this.updateStatus(tenant, id, "failed", error);
+  }
+
+  async claim(tenant: TenantContext, options: OutboxClaimOptions): Promise<OutboxEvent[]> {
+    const now = new Date(options.now ?? new Date().toISOString());
+    const maxAttempts = options.maxAttempts ?? 5;
+    for (const event of this.events) {
+      if (event.tenantId === tenant.tenantId && event.status === "leased" && event.leaseExpiresAt && new Date(event.leaseExpiresAt) <= now && event.attempts >= maxAttempts) {
+        event.status = "dead_letter";
+        event.processedAt = now.toISOString();
+        event.error ??= "Lease expired after maximum delivery attempts";
+        event.leaseOwner = undefined;
+        event.leaseExpiresAt = undefined;
+      }
+    }
+    const events = this.events
+      .filter((event) => event.tenantId === tenant.tenantId && event.attempts < maxAttempts && (
+        event.status === "pending" ||
+        (event.status === "failed" && (!event.nextAttemptAt || new Date(event.nextAttemptAt) <= now)) ||
+        (event.status === "leased" && Boolean(event.leaseExpiresAt) && new Date(event.leaseExpiresAt!) <= now)
+      ))
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+      .slice(0, options.limit ?? 100);
+    for (const event of events) {
+      event.status = "leased";
+      event.attempts += 1;
+      event.leaseOwner = options.ownerId;
+      event.leaseExpiresAt = new Date(now.getTime() + (options.leaseMs ?? 30_000)).toISOString();
+      event.nextAttemptAt = undefined;
+    }
+    return events.map(cloneOutboxEvent);
+  }
+
+  async acknowledge(tenant: TenantContext, id: string, ownerId: string): Promise<OutboxEvent> {
+    const event = this.assertLease(tenant, id, ownerId);
+    event.status = "dispatched";
+    event.processedAt = new Date().toISOString();
+    event.error = undefined;
+    event.leaseOwner = undefined;
+    event.leaseExpiresAt = undefined;
+    return cloneOutboxEvent(event);
+  }
+
+  async reject(tenant: TenantContext, id: string, ownerId: string, error: string, options: { backoffMs?: number; maxAttempts?: number; now?: string } = {}): Promise<OutboxEvent> {
+    const event = this.assertLease(tenant, id, ownerId);
+    const now = new Date(options.now ?? new Date().toISOString());
+    event.status = event.attempts >= (options.maxAttempts ?? 5) ? "dead_letter" : "failed";
+    event.error = error;
+    event.processedAt = now.toISOString();
+    event.nextAttemptAt = event.status === "failed" ? new Date(now.getTime() + (options.backoffMs ?? 0)).toISOString() : undefined;
+    event.leaseOwner = undefined;
+    event.leaseExpiresAt = undefined;
+    return cloneOutboxEvent(event);
+  }
+
+  private assertLease(tenant: TenantContext, id: string, ownerId: string): OutboxEvent {
+    const event = this.events.find((candidate) => candidate.tenantId === tenant.tenantId && candidate.id === id);
+    if (!event) throw new FramekitError("OUTBOX_EVENT_NOT_FOUND", `No outbox event with id "${id}"`, 404);
+    if (event.status !== "leased" || event.leaseOwner !== ownerId) {
+      throw new FramekitError("OUTBOX_LEASE_LOST", `Outbox event "${id}" is not leased by "${ownerId}"`, 409);
+    }
+    return event;
   }
 
   private updateStatus(tenant: TenantContext, id: string, status: OutboxEvent["status"], error?: string): OutboxEvent {
@@ -1044,7 +1135,9 @@ export class InMemoryOutboxStore implements OutboxStore {
     event.attempts += 1;
     event.processedAt = new Date().toISOString();
     event.error = error;
-    return { ...event, payload: { ...event.payload } };
+    event.leaseOwner = undefined;
+    event.leaseExpiresAt = undefined;
+    return cloneOutboxEvent(event);
   }
 
   checkpoint(): number {
@@ -1054,6 +1147,10 @@ export class InMemoryOutboxStore implements OutboxStore {
   rollback(checkpoint: number): void {
     this.events.length = checkpoint;
   }
+}
+
+function cloneOutboxEvent(event: OutboxEvent): OutboxEvent {
+  return { ...event, payload: { ...event.payload } };
 }
 
 export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {

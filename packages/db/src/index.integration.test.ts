@@ -12,6 +12,7 @@ import {
   type PostgresMutationStage,
   PostgresNamingSeriesStore,
   PostgresOutboxStore,
+  PostgresRealtimePublisher,
   PostgresRoleStore,
   PostgresSessionRevocationStore,
   PostgresUserStore
@@ -631,6 +632,76 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       expect.objectContaining({ type: "customer.created", payload: expect.objectContaining({ id: "publish-failure", revision: 1 }) })
     ]));
   });
+
+  it("atomically leases outbox rows across stores and enforces retry ownership", async () => {
+    const other = new PostgresOutboxStore({ connectionString: connectionString! });
+    const claimTenant = { ...tenant, tenantId: "pg_outbox_claim_tenant" };
+    await other.migrate();
+    await sql`delete from framekit_outbox_events where tenant_id = ${claimTenant.tenantId}`;
+    try {
+      for (let index = 0; index < 4; index += 1) {
+        await stores.outbox.record({
+          tenantId: claimTenant.tenantId,
+          id: `claim-${index}`,
+          type: "customer.created",
+          topic: "customer",
+          payload: { index },
+          status: "pending",
+          attempts: 0,
+          createdAt: new Date(1_000 + index).toISOString()
+        });
+      }
+      const [left, right] = await Promise.all([
+        stores.outbox.claim(claimTenant, { ownerId: "left", limit: 4, now: "2026-07-21T00:00:00.000Z" }),
+        other.claim(claimTenant, { ownerId: "right", limit: 4, now: "2026-07-21T00:00:00.000Z" })
+      ]);
+      expect(left.length + right.length).toBe(4);
+      expect(new Set([...left, ...right].map((event) => event.id)).size).toBe(4);
+      const claimed = [...left, ...right];
+      const first = claimed[0]!;
+      const wrongOwner = first.leaseOwner === "left" ? "right" : "left";
+      await expect(other.acknowledge(claimTenant, first.id, wrongOwner)).rejects.toMatchObject({ code: "OUTBOX_LEASE_LOST" });
+      await stores.outbox.acknowledge(claimTenant, first.id, first.leaseOwner!);
+
+      const expired = claimed[1]!;
+      const reclaimed = await other.claim(claimTenant, {
+        ownerId: "right", maxAttempts: 2, now: "2026-07-21T00:00:31.000Z"
+      });
+      expect(reclaimed).toEqual(expect.arrayContaining([expect.objectContaining({ id: expired.id, attempts: 2, leaseOwner: "right" })]));
+      await other.reject(claimTenant, expired.id, "right", "terminal", { maxAttempts: 2, now: "2026-07-21T00:00:31.000Z" });
+      await expect(other.list(claimTenant, { status: "dead_letter" })).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: expired.id, attempts: 2, error: "terminal" })
+      ]));
+    } finally {
+      await sql`delete from framekit_outbox_events where tenant_id = ${claimTenant.tenantId}`;
+      await other.close();
+    }
+  });
+
+  it("publishes across Postgres instances and replays durable events after a cursor", async () => {
+    const publisher = new PostgresRealtimePublisher({ connectionString: connectionString! });
+    const subscriber = new PostgresRealtimePublisher({ connectionString: connectionString! });
+    const channel = "tenant:pg_realtime_tenant:documents";
+    await publisher.migrate();
+    await sql`delete from framekit_realtime_events where channel = ${channel}`;
+    const received: Array<{ cursor?: string; payload: Record<string, unknown> }> = [];
+    const unsubscribe = subscriber.subscribe(channel, (event) => received.push(event));
+    try {
+      await expect(subscriber.health()).resolves.toMatchObject({ ok: true });
+      await publisher.publish({ channel, type: "customer.created", payload: { id: "first" } });
+      await waitFor(() => received.length === 1);
+      const cursor = received[0]!.cursor!;
+      await publisher.publish({ channel, type: "customer.updated", payload: { id: "second" } });
+      await waitFor(() => received.length === 2);
+      await expect(subscriber.list(channel, { after: cursor })).resolves.toEqual([
+        expect.objectContaining({ type: "customer.updated", payload: { id: "second" } })
+      ]);
+    } finally {
+      unsubscribe();
+      await sql`delete from framekit_realtime_events where channel = ${channel}`;
+      await Promise.all([publisher.close(), subscriber.close()]);
+    }
+  });
 });
 
 type StoreSet = {
@@ -686,6 +757,14 @@ async function cleanup(sql: postgres.Sql) {
   await sql`delete from framekit_roles where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_api_tokens where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_session_revocations where session_id = 'pg-integration-session'`;
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for cross-instance event");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 function createIdGenerator(namespace = "default") {

@@ -193,7 +193,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         summary: "List recent realtime document events",
         tags: ["System"],
         "x-framekit-permission": "framekit.realtime.read",
-        parameters: [queryParam("limit", "integer")],
+        parameters: [queryParam("limit", "integer"), queryParam("after", "string")],
         responses: okResponse({ type: "array", items: { type: "object", additionalProperties: true } })
       }
     },
@@ -203,6 +203,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         summary: "Stream realtime document events using server-sent events",
         tags: ["System"],
         "x-framekit-permission": "framekit.realtime.read",
+        parameters: [{ name: "Last-Event-ID", in: "header", required: false, schema: { type: "string" }, description: "Replay events after this durable cursor before streaming live events" }],
         responses: {
           "200": {
             description: "Realtime event stream",

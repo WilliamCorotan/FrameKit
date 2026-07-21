@@ -106,17 +106,20 @@ export class FramekitClient {
     return this.request("/api/migrations");
   }
 
-  realtimeEvents<T = unknown>(options: { limit?: number } = {}): Promise<T> {
-    const query = options.limit === undefined ? "" : `?limit=${encodeURIComponent(String(options.limit))}`;
-    return this.request(`/api/realtime/events${query}`);
+  realtimeEvents<T = unknown>(options: { limit?: number; after?: string } = {}): Promise<T> {
+    const query = new URLSearchParams();
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
+    if (options.after !== undefined) query.set("after", options.after);
+    const suffix = query.size === 0 ? "" : `?${query.toString()}`;
+    return this.request(`/api/realtime/events${suffix}`);
   }
 
   async streamRealtimeEvents(
-    onEvent: (event: { type: string; data: unknown }) => void,
-    options: { signal?: AbortSignal } = {}
+    onEvent: (event: { id?: string; type: string; data: unknown }) => void,
+    options: { signal?: AbortSignal; lastEventId?: string } = {}
   ): Promise<void> {
     const response = await fetch(this.baseUrl + "/api/realtime/stream", {
-      headers: this.headers(),
+      headers: { ...this.headers(), ...(options.lastEventId ? { "last-event-id": options.lastEventId } : {}) },
       credentials: this.credentials,
       signal: options.signal
     });
@@ -425,11 +428,12 @@ function pascal(value: string): string {
   return value.split(/[-_]/g).filter(Boolean).map((part) => part[0]!.toUpperCase() + part.slice(1)).join("");
 }
 
-function parseSseChunk(chunk: string): { type: string; data: unknown } | undefined {
+function parseSseChunk(chunk: string): { id?: string; type: string; data: unknown } | undefined {
+  const id = chunk.split("\n").find((line) => line.startsWith("id: "))?.slice("id: ".length);
   const type = chunk.split("\n").find((line) => line.startsWith("event: "))?.slice("event: ".length) ?? "message";
   const data = chunk.split("\n").find((line) => line.startsWith("data: "))?.slice("data: ".length);
   if (!data) {
     return undefined;
   }
-  return { type, data: JSON.parse(data) as unknown };
+  return { ...(id ? { id } : {}), type, data: JSON.parse(data) as unknown };
 }
