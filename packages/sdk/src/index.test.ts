@@ -274,19 +274,30 @@ describe("generateSdkTypes", () => {
     expect(fetchMock).not.toHaveBeenCalled();
 
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
-    fetchMock.mockResolvedValue(new Response(new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } }), { status: 200 }));
+    fetchMock.mockResolvedValue(new Response(new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } }), { status: 200, headers: { "x-request-id": "read-abort-42" } }));
     const readController = new AbortController();
     const reading = client.streamRealtimeEvents(() => undefined, { signal: readController.signal });
     await Promise.resolve();
     await Promise.resolve();
     readController.abort("during read");
     streamController.error(new DOMException("aborted", "AbortError"));
-    await expect(reading).rejects.toBeInstanceOf(FramekitCancelledError);
+    const readError = await reading.catch((failure: unknown) => failure);
+    expect(readError).toBeInstanceOf(FramekitCancelledError);
+    expect(readError).toMatchObject({ status: 200, requestId: "read-abort-42" });
   });
 
   it("classifies malformed realtime event data as a protocol error", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("event: broken\ndata: {not-json}\n\n", { status: 200 }));
-    await expect(createClient({ baseUrl: "https://app.example" }).streamRealtimeEvents(() => undefined)).rejects.toBeInstanceOf(FramekitProtocolError);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("event: broken\ndata: {not-json}\n\n", { status: 200, headers: { "x-request-id": "protocol-42" } }));
+    const error = await createClient({ baseUrl: "https://app.example" }).streamRealtimeEvents(() => undefined).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(FramekitProtocolError);
+    expect(error).toMatchObject({ status: 200, code: "SSE_INVALID_JSON", requestId: "protocol-42" });
+  });
+
+  it("preserves established response context on stream read transport failures", async () => {
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controller.error(new TypeError("socket closed")); } });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body, { status: 200, headers: { "x-request-id": "read-failure-42" } }));
+    const error = await createClient({ baseUrl: "https://app.example" }).streamRealtimeEvents(() => undefined).catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ status: 200, code: "STREAM_READ_FAILED", requestId: "read-failure-42" });
   });
 
   it("includes credentials for cookie-backed auth helpers", async () => {

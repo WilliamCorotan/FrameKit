@@ -294,7 +294,7 @@ export class FramekitClient {
       try {
         result = await reader.read();
       } catch (cause) {
-        throw toFramekitSdkError(cause, options.signal);
+        throw streamReadError(cause, response, options.signal);
       }
       const { done, value } = result;
       if (done) {
@@ -304,7 +304,7 @@ export class FramekitClient {
       const chunks = buffer.split("\n\n");
       buffer = chunks.pop() ?? "";
       for (const chunk of chunks) {
-        const event = parseSseChunk(chunk);
+        const event = parseSseChunk(chunk, response);
         if (event) {
           onEvent(event);
         }
@@ -714,6 +714,15 @@ function cancelledError(reason: unknown): FramekitCancelledError {
   return new FramekitCancelledError("Framekit request was cancelled.", "REQUEST_CANCELLED", undefined, reason, undefined, undefined, { cause: reason });
 }
 
+function streamReadError(cause: unknown, response: Response, signal?: AbortSignal): FramekitSdkError {
+  const requestId = response.headers.get("x-request-id") ?? undefined;
+  if (signal?.aborted || (cause instanceof Error && cause.name === "AbortError")) {
+    const reason = signal?.reason ?? cause;
+    return new FramekitCancelledError("Framekit request was cancelled.", "REQUEST_CANCELLED", response.status, reason, requestId, undefined, { cause });
+  }
+  return new FramekitTransportError(cause instanceof Error ? cause.message : "Realtime stream read failed.", "STREAM_READ_FAILED", response.status, undefined, requestId, undefined, { cause });
+}
+
 function parseRetryAfter(value: string | null | undefined): number | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
@@ -757,7 +766,7 @@ function pascal(value: string): string {
   return value.split(/[-_]/g).filter(Boolean).map((part) => part[0]!.toUpperCase() + part.slice(1)).join("");
 }
 
-function parseSseChunk(chunk: string): { id?: string; type: string; data: unknown } | undefined {
+function parseSseChunk(chunk: string, response?: Response): { id?: string; type: string; data: unknown } | undefined {
   const id = chunk.split("\n").find((line) => line.startsWith("id: "))?.slice("id: ".length);
   const type = chunk.split("\n").find((line) => line.startsWith("event: "))?.slice("event: ".length) ?? "message";
   const data = chunk.split("\n").find((line) => line.startsWith("data: "))?.slice("data: ".length);
@@ -767,6 +776,6 @@ function parseSseChunk(chunk: string): { id?: string; type: string; data: unknow
   try {
     return { ...(id ? { id } : {}), type, data: JSON.parse(data) as unknown };
   } catch (cause) {
-    throw new FramekitProtocolError("Realtime event data is not valid JSON.", "SSE_INVALID_JSON", undefined, { eventId: id, eventType: type }, undefined, undefined, { cause });
+    throw new FramekitProtocolError("Realtime event data is not valid JSON.", "SSE_INVALID_JSON", response?.status, { eventId: id, eventType: type }, response?.headers.get("x-request-id") ?? undefined, undefined, { cause });
   }
 }
