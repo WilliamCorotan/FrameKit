@@ -958,6 +958,105 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(runtime.update(tenant, "customer", first.id, { status: "active" }, { expectedRevision: 1, idempotencyKey: "update-retry-1" })).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
   });
 
+  it("executes cross-DocType command batches atomically with replay and stale-revision rollback", async () => {
+    const commandTenant = { ...tenant, tenantId: "pg_command_batch_tenant" };
+    const commandApp = defineApp({ name: "Postgres Commands", modules: [defineModule({
+      id: "commands", name: "Commands", doctypes: [customerDocType, dealDocType, securedDocType], commands: [{
+        id: "customer-deal", label: "Customer and deal", permission: "commands.manage", mode: "atomic",
+        doctypes: [customerDocType.name, dealDocType.name], operations: ["create", "update", "delete"], maxOperations: 10
+      }, {
+        id: "secure-records", label: "Secure records", permission: "commands.manage", mode: "atomic",
+        doctypes: [securedDocType.name], operations: ["create", "update", "delete"], maxOperations: 10
+      }], hooks: { afterInsert: { secured_record: [({ document }) => {
+        if (document) { document.revision = 999; document.ownerId = "mallory"; document.data.title = "mutated"; }
+      }] } }
+    })] });
+    const runtime = createRuntime(commandApp, {
+      repository: stores.repository, audit: stores.audit, outbox: stores.outbox, mutations: stores.mutations,
+      idGenerator: createIdGenerator("command")
+    });
+    try {
+      const request = { operations: [
+        { operation: "create" as const, doctype: customerDocType.name, id: "command-customer", data: { name: "Command Customer", external_id: "COMMAND-001" } },
+        { operation: "create" as const, doctype: dealDocType.name, id: "command-deal", data: { title: "Command Deal" } }
+      ], idempotencyKey: "customer-deal-1" };
+      const applied = await runtime.executeDocumentCommand(commandTenant, "customer-deal", request);
+      expect(applied).toMatchObject({ replayed: false, documents: [{ id: "command-customer" }, { id: "command-deal" }] });
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", request)).resolves.toMatchObject({ replayed: true });
+      expect((await stores.audit.list(commandTenant)).filter((event) => ["command-customer", "command-deal"].includes(event.documentId))).toHaveLength(2);
+
+      injectedStage = "outbox";
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [
+        { operation: "create", doctype: customerDocType.name, id: "fault-customer", data: { name: "Fault", external_id: "COMMAND-FAULT" } },
+        { operation: "create", doctype: dealDocType.name, id: "fault-deal", data: { title: "Fault" } }
+      ] })).rejects.toThrow("injected outbox failure");
+      injectedStage = undefined;
+      await expect(runtime.get(commandTenant, customerDocType.name, "fault-customer")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+      await expect(runtime.get(commandTenant, dealDocType.name, "fault-deal")).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [
+        { operation: "update", doctype: customerDocType.name, id: "command-customer", expectedRevision: 1, data: { status: "paused" } },
+        { operation: "update", doctype: dealDocType.name, id: "command-deal", expectedRevision: 99, data: { title: "Stale" } }
+      ] })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
+      await expect(runtime.get(commandTenant, customerDocType.name, "command-customer")).resolves.toMatchObject({ revision: 1, data: { status: "active" } });
+
+      const createReplay = { operations: [{ operation: "create" as const, doctype: customerDocType.name, id: "pg-replay-create", data: { name: "Replay Create", external_id: "PG-REPLAY-CREATE" } }], idempotencyKey: "pg-replay-create-key" };
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", createReplay);
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "update", doctype: customerDocType.name, id: "pg-replay-create", expectedRevision: 1, data: { status: "paused" } }] });
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "delete", doctype: customerDocType.name, id: "pg-replay-create", expectedRevision: 2 }] });
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", createReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "pg-replay-create", revision: 1, data: { status: "active" } }] });
+
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "create", doctype: customerDocType.name, id: "pg-replay-update", data: { name: "Replay Update", external_id: "PG-REPLAY-UPDATE" } }] });
+      const updateReplay = { operations: [{ operation: "update" as const, doctype: customerDocType.name, id: "pg-replay-update", expectedRevision: 1, data: { status: "paused" } }], idempotencyKey: "pg-replay-update-key" };
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", updateReplay);
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "delete", doctype: customerDocType.name, id: "pg-replay-update", expectedRevision: 2 }] });
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", updateReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "pg-replay-update", revision: 2, data: { status: "paused" } }] });
+
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "create", doctype: customerDocType.name, id: "pg-replay-delete", data: { name: "Replay Delete", external_id: "PG-REPLAY-DELETE" } }] });
+      const deleteReplay = { operations: [{ operation: "delete" as const, doctype: customerDocType.name, id: "pg-replay-delete", expectedRevision: 1 }], idempotencyKey: "pg-replay-delete-key" };
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", deleteReplay)).resolves.toMatchObject({ replayed: false, documents: [{ id: "pg-replay-delete", revision: 1 }] });
+      const deleteAuditCount = (await stores.audit.list(commandTenant)).filter((event) => event.documentId === "pg-replay-delete").length;
+      const deleteOutboxCount = (await stores.outbox.list(commandTenant)).filter((event) => event.payload.id === "pg-replay-delete").length;
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", deleteReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "pg-replay-delete", revision: 1, data: { status: "active" } }] });
+      expect((await stores.audit.list(commandTenant)).filter((event) => event.documentId === "pg-replay-delete")).toHaveLength(deleteAuditCount);
+      expect((await stores.outbox.list(commandTenant)).filter((event) => event.payload.id === "pg-replay-delete")).toHaveLength(deleteOutboxCount);
+      await expect(runtime.executeDocumentCommand({ ...commandTenant, userId: "pg-replay-reader" }, "customer-deal", deleteReplay)).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+
+      const secureRequest = { operations: [{
+        operation: "create" as const, doctype: securedDocType.name, id: "command-secure", data: { title: "Secure command", code: "COMMAND-SECURE" }
+      }], idempotencyKey: "secure-command-1" };
+      await expect(runtime.executeDocumentCommand(commandTenant, "secure-records", secureRequest)).resolves.toMatchObject({
+        replayed: false,
+        documents: [{ id: "command-secure", revision: 1, ownerId: commandTenant.userId, data: { title: "Secure command" } }]
+      });
+      const secureRows = await sql<{ ownerId: string; revision: number; title: string }[]>`
+        select owner_id as "ownerId", revision, data ->> 'title' as title from framekit_documents
+        where tenant_id = ${commandTenant.tenantId} and doctype = ${securedDocType.name} and id = 'command-secure'
+      `;
+      expect(secureRows).toEqual([{ ownerId: commandTenant.userId, revision: 1, title: "Secure command" }]);
+      expect((await stores.outbox.list(commandTenant)).find((event) => event.payload.id === "command-secure")?.payload).toMatchObject({
+        revision: 1, ownerId: commandTenant.userId, data: { title: "Secure command" }
+      });
+
+      const reader = { ...commandTenant, userId: "command-reader", roles: ["manager"], permissions: ["commands.manage"] };
+      await expect(runtime.get(reader, securedDocType.name, "command-secure")).resolves.toMatchObject({ id: "command-secure" });
+      await expect(runtime.executeDocumentCommand(reader, "secure-records", secureRequest)).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+      await expect(runtime.executeDocumentCommand(reader, "secure-records", { operations: [{
+        operation: "update", doctype: securedDocType.name, id: "command-secure", expectedRevision: 1, data: { title: "Stolen" }
+      }] })).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+      await expect(runtime.executeDocumentCommand(reader, "secure-records", { operations: [{
+        operation: "delete", doctype: securedDocType.name, id: "command-secure", expectedRevision: 1
+      }] })).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
+    } finally {
+      injectedStage = undefined;
+      await sql`delete from framekit_document_unique_values where tenant_id = ${commandTenant.tenantId}`;
+      await sql`delete from framekit_idempotency_keys where tenant_id = ${commandTenant.tenantId}`;
+      await sql`delete from framekit_audit_events where tenant_id = ${commandTenant.tenantId}`;
+      await sql`delete from framekit_outbox_events where tenant_id = ${commandTenant.tenantId}`;
+      await sql`delete from framekit_documents where tenant_id = ${commandTenant.tenantId}`;
+    }
+  });
+
   it("commits the durable outbox before publishing realtime", async () => {
     const runtime = createRuntime(app, {
       repository: stores.repository,

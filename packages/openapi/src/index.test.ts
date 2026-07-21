@@ -93,5 +93,35 @@ describe("createOpenApiDocument", () => {
     expect(doc.components.schemas.DealRecord?.properties?.documentStatus).toEqual({ type: "string", enum: ["draft", "submitted", "cancelled"] });
     expect(doc.components.schemas.DealRecord?.properties?.ownerId).toEqual({ type: "string" });
     expect(doc.components.schemas.DealRecord?.required).toContain("ownerId");
+
+    expect(doc.components.schemas.DocumentCommandOperation).toEqual({
+      oneOf: [
+        { $ref: "#/components/schemas/DocumentCommandCreateOperation" },
+        { $ref: "#/components/schemas/DocumentCommandUpdateOperation" },
+        { $ref: "#/components/schemas/DocumentCommandDeleteOperation" }
+      ]
+    });
+    expect(doc.components.schemas.DocumentCommandCreateOperation).toMatchObject({
+      additionalProperties: false,
+      required: ["operation", "doctype", "data"],
+      properties: { operation: { const: "create" } }
+    });
+    expect(doc.components.schemas.DocumentCommandUpdateOperation).toMatchObject({
+      additionalProperties: false,
+      required: ["operation", "doctype", "id", "data", "expectedRevision"],
+      properties: { operation: { const: "update" }, expectedRevision: { minimum: 1, maximum: Number.MAX_SAFE_INTEGER } }
+    });
+    expect(doc.components.schemas.DocumentCommandDeleteOperation).toMatchObject({
+      additionalProperties: false,
+      required: ["operation", "doctype", "id", "expectedRevision"],
+      properties: { operation: { const: "delete" }, expectedRevision: { minimum: 1, maximum: Number.MAX_SAFE_INTEGER } }
+    });
+    expect(doc.components.schemas.DocumentCommandCompensation).toEqual({
+      oneOf: [
+        { $ref: "#/components/schemas/DocumentCommandCreateCompensation" },
+        { $ref: "#/components/schemas/DocumentCommandUpdateCompensation" },
+        { $ref: "#/components/schemas/DocumentCommandDeleteCompensation" }
+      ]
+    });
   });
 });

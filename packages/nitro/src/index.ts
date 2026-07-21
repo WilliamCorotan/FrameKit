@@ -2,7 +2,7 @@ import { defineEventHandler, getCookie, getQuery, getRouterParam, readBody, send
 import { assertSecureAuthSecret, bearerToken, type PasswordAuthService } from "@framekit/auth";
 import { FramekitError, type TenantContext } from "@framekit/core";
 import { createOpenApiDocument } from "@framekit/openapi";
-import type { FilterValue, FramekitRuntime, RuntimeRealtimeEvent } from "@framekit/runtime";
+import type { DocumentCommandRequest, FilterValue, FramekitRuntime, RuntimeRealtimeEvent } from "@framekit/runtime";
 
 export type NitroAdapterOptions = {
   basePath?: string;
@@ -595,6 +595,17 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return await runtime.upsertView(tenant, { doctype: body.doctype, type: body.type, fields: body.fields });
       }
 
+      const commandId = matchCommandPath(path, basePath);
+      if (method === "POST" && commandId) {
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        const body: unknown = (await readBody(event)) ?? {};
+        const idempotencyKey = event.req.headers.get("idempotency-key");
+        const request = idempotencyKey && body !== null && typeof body === "object" && !Array.isArray(body)
+          ? { ...body, idempotencyKey }
+          : body;
+        return await runtime.executeDocumentCommand(tenant, commandId, request as DocumentCommandRequest);
+      }
+
       const match = matchDocumentPath(path, basePath);
       if (!match) {
         throw new FramekitError("NOT_FOUND", "Route not found", 404);
@@ -693,6 +704,13 @@ function matchDocumentPath(path: string, basePath: string): { doctype: string; i
     return { doctype: parts[0] ?? "", id: parts[1], operation: parts[2] };
   }
   return undefined;
+}
+
+function matchCommandPath(path: string, basePath: string): string | undefined {
+  const prefix = `${basePath}/commands/`;
+  if (!path.startsWith(prefix)) return undefined;
+  const id = path.slice(prefix.length);
+  return id && !id.includes("/") ? decodeURIComponent(id) : undefined;
 }
 
 function matchOutboxPath(path: string, basePath: string): { id: string; action: "dispatch" | "fail" } | undefined {

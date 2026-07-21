@@ -6,7 +6,9 @@ export type OpenApiOptions = {
 };
 
 type JsonSchema = {
+  $ref?: string;
   type?: string | string[];
+  const?: string;
   format?: string;
   enum?: string[];
   properties?: Record<string, JsonSchema>;
@@ -15,6 +17,8 @@ type JsonSchema = {
   items?: JsonSchema;
   description?: string;
   minimum?: number;
+  maximum?: number;
+  oneOf?: JsonSchema[];
   minLength?: number;
   pattern?: string;
 };
@@ -67,6 +71,65 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
     OwnerTransferReceipt: {
       type: "object", required: ["id", "ownerId", "revision", "updatedAt"], additionalProperties: false,
       properties: { id: { type: "string" }, ownerId: { type: "string" }, revision: { type: "integer" }, updatedAt: { type: "string", format: "date-time" } }
+    },
+    DocumentCommandCreateCompensation: {
+      type: "object",
+      additionalProperties: false,
+      required: ["operation", "doctype", "data"],
+      properties: {
+        operation: { type: "string", const: "create" },
+        doctype: { type: "string" },
+        id: { type: "string" },
+        data: { type: "object", additionalProperties: true }
+      }
+    },
+    DocumentCommandUpdateCompensation: {
+      type: "object", additionalProperties: false, required: ["operation", "doctype", "id", "data", "expectedRevision"],
+      properties: {
+        operation: { type: "string", const: "update" }, doctype: { type: "string" }, id: { type: "string" },
+        data: { type: "object", additionalProperties: true }, expectedRevision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }
+      }
+    },
+    DocumentCommandDeleteCompensation: {
+      type: "object", additionalProperties: false, required: ["operation", "doctype", "id", "expectedRevision"],
+      properties: {
+        operation: { type: "string", const: "delete" }, doctype: { type: "string" }, id: { type: "string" },
+        expectedRevision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }
+      }
+    },
+    DocumentCommandCompensation: { oneOf: [ref("DocumentCommandCreateCompensation"), ref("DocumentCommandUpdateCompensation"), ref("DocumentCommandDeleteCompensation")] },
+    DocumentCommandCreateOperation: {
+      type: "object", additionalProperties: false, required: ["operation", "doctype", "data"],
+      properties: {
+        operation: { type: "string", const: "create" }, doctype: { type: "string" }, id: { type: "string" },
+        data: { type: "object", additionalProperties: true }, compensation: ref("DocumentCommandCompensation")
+      }
+    },
+    DocumentCommandUpdateOperation: {
+      type: "object", additionalProperties: false, required: ["operation", "doctype", "id", "data", "expectedRevision"],
+      properties: {
+        operation: { type: "string", const: "update" }, doctype: { type: "string" }, id: { type: "string" },
+        data: { type: "object", additionalProperties: true }, expectedRevision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+        compensation: ref("DocumentCommandCompensation")
+      }
+    },
+    DocumentCommandDeleteOperation: {
+      type: "object", additionalProperties: false, required: ["operation", "doctype", "id", "expectedRevision"],
+      properties: {
+        operation: { type: "string", const: "delete" }, doctype: { type: "string" }, id: { type: "string" },
+        expectedRevision: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER }, compensation: ref("DocumentCommandCompensation")
+      }
+    },
+    DocumentCommandOperation: { oneOf: [ref("DocumentCommandCreateOperation"), ref("DocumentCommandUpdateOperation"), ref("DocumentCommandDeleteOperation")] },
+    DocumentCommandResult: {
+      type: "object",
+      required: ["command", "mode", "replayed", "documents"],
+      properties: {
+        command: { type: "string" },
+        mode: { type: "string", enum: ["atomic", "saga"] },
+        replayed: { type: "boolean" },
+        documents: { type: "array", items: { type: ["object", "null"], additionalProperties: true } }
+      }
     },
     AuthUser: {
       type: "object",
@@ -191,6 +254,21 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         summary: "List applied migration records",
         tags: ["System"],
         responses: okResponse({ type: "array", items: { type: "object", additionalProperties: true } })
+      }
+    },
+    [`${basePath}/commands/{command}`]: {
+      post: {
+        operationId: "executeDocumentCommand",
+        summary: "Execute an approved bulk or cross-document command",
+        tags: ["Commands"],
+        parameters: [pathParam("command"), { name: "Idempotency-Key", in: "header", required: false, schema: { type: "string" } }],
+        requestBody: jsonBody({
+          type: "object",
+          additionalProperties: false,
+          required: ["operations"],
+          properties: { operations: { type: "array", items: ref("DocumentCommandOperation") } }
+        }, true),
+        responses: okResponse(ref("DocumentCommandResult"))
       }
     },
     [`${basePath}/realtime/events`]: {

@@ -1,5 +1,5 @@
 import { ofetch } from "ofetch";
-import { listDocTypes, type AppDefinition, type DocumentData, type DocumentRecord, type FieldDefinition, type OwnerTransferReceipt, type TenantContext } from "@framekit/core";
+import { listDocTypes, type AppDefinition, type DocumentCommandOperation, type DocumentData, type DocumentRecord, type FieldDefinition, type OwnerTransferReceipt, type TenantContext } from "@framekit/core";
 
 export type AuthUser = {
   id: string;
@@ -126,6 +126,15 @@ export type MutationRequestOptions = {
   signal?: AbortSignal;
 };
 
+export type { DocumentCommandOperation } from "@framekit/core";
+
+export type DocumentCommandResult = {
+  command: string;
+  mode: "atomic" | "saga";
+  replayed: boolean;
+  documents: Array<DocumentRecord | undefined>;
+};
+
 export type HealthResponse = {
   ok: true;
   app: string;
@@ -220,7 +229,8 @@ export const FRAMEKIT_HTTP_ENDPOINTS = [
   ["transition", "POST", "/api/doctypes/:doctype/:id/transition"],
   ["submit", "POST", "/api/doctypes/:doctype/:id/submit"],
   ["cancel", "POST", "/api/doctypes/:doctype/:id/cancel"],
-  ["transferOwner", "POST", "/api/doctypes/:doctype/:id/owner"]
+  ["transferOwner", "POST", "/api/doctypes/:doctype/:id/owner"],
+  ["executeDocumentCommand", "POST", "/api/commands/:command"]
 ] as const;
 
 export class FramekitClient {
@@ -531,6 +541,15 @@ export class FramekitClient {
 
   transferOwner(doctype: string, id: string, ownerId: string, options: MutationRequestOptions = {}): Promise<OwnerTransferReceipt> {
     return this.request(`/api/doctypes/${doctype}/${id}/owner`, { method: "POST", body: { ownerId }, headers: mutationHeaders(options), signal: options.signal });
+  }
+
+  executeDocumentCommand(command: string, operations: DocumentCommandOperation[], options: { idempotencyKey?: string; signal?: AbortSignal } = {}): Promise<DocumentCommandResult> {
+    return this.request(`/api/commands/${encodeURIComponent(command)}`, {
+      method: "POST",
+      body: { operations },
+      headers: options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : undefined,
+      signal: options.signal
+    });
   }
 
   private request<T>(path: string, options: { method?: string; body?: unknown; skipAuth?: boolean; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<T> {

@@ -73,6 +73,7 @@ GET  /api/diagnostics
 GET  /api/migrations
 POST /api/migrations/plan
 POST /api/migrations/apply
+POST /api/commands/{command}
 GET  /api/realtime/events
 GET  /api/realtime/stream
 GET  /api/openapi.json
@@ -81,6 +82,7 @@ GET  /api/openapi.json
 `/health/dependencies` runs adapter-provided dependency checks, for example Postgres, Redis, queues, or downstream services.
 
 Migration planning, executable apply/replay, drift rules, upgrade backfill, and rollback limits are documented in [Executable migrations](docs/migrations.md).
+Atomic bulk commands, cross-document sagas, idempotency, compensation, and recovery limits are documented in [Mutation consistency](docs/consistency.md).
 
 Auth lifecycle, provider login, audit, and admin APIs:
 
