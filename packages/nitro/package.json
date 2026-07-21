@@ -26,7 +26,7 @@
     "@framekit/core": "workspace:*",
     "@framekit/openapi": "workspace:*",
     "@framekit/runtime": "workspace:*",
-    "h3": "^2.0.1-rc.22"
+    "h3": "^2.0.1-rc.25"
   },
   "description": "Nitro integration for Framekit runtimes.",
   "files": [
