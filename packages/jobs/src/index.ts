@@ -182,6 +182,7 @@ export class ScheduledJobRunner {
   private timer?: ReturnType<typeof setInterval>;
   private readonly lastRuns = new Map<string, string>();
   private active?: Promise<void>;
+  private readonly activeRuns = new Set<Promise<string[]>>();
   private readonly runningJobs = new Set<string>();
   private closed = false;
   private closing?: Promise<void>;
@@ -192,18 +193,27 @@ export class ScheduledJobRunner {
 
   async runDue(now = new Date()): Promise<string[]> {
     if (this.closed) throw new Error("Scheduled job runner is closed");
+    const run = this.runDueBatch(now);
+    this.activeRuns.add(run);
+    try { return await run; } finally { this.activeRuns.delete(run); }
+  }
+
+  private async runDueBatch(now: Date): Promise<string[]> {
     const minute = now.toISOString().slice(0, 16);
     const due = this.registry.entries().filter((job) => job.schedule && cronMatches(job.schedule, now) && this.lastRuns.get(job.name) !== minute && !this.runningJobs.has(job.name));
+    const ran: string[] = [];
     for (const job of due) {
+      if (this.closed) break;
       this.runningJobs.add(job.name);
       try {
         await job.handler();
         this.lastRuns.set(job.name, minute);
+        ran.push(job.name);
       } finally {
         this.runningJobs.delete(job.name);
       }
     }
-    return due.map((job) => job.name);
+    return ran;
   }
 
   start(signal?: AbortSignal): void {
@@ -236,7 +246,7 @@ export class ScheduledJobRunner {
     const operation = (async () => {
       if (this.timer) clearInterval(this.timer);
       this.timer = undefined;
-      await this.active;
+      await Promise.all([...(this.active ? [this.active] : []), ...this.activeRuns]);
     })();
     this.closing = operation;
     try { await operation; } finally { if (this.closing === operation) this.closing = undefined; }
@@ -309,6 +319,7 @@ export class OutboxDispatcher {
   async runOnce(): Promise<OutboxDispatchResult> {
     if (this.closed) throw new Error("Outbox dispatcher is closed");
     if (this.active) return this.active;
+    this.controller ??= new AbortController();
     const active = dispatchOutboxEvents(this.runtime, this.tenant, this.handler, {
       ...this.options,
       signal: this.controller?.signal ?? this.options.signal
@@ -330,7 +341,7 @@ export class OutboxDispatcher {
     if (this.closed) throw new Error("Outbox dispatcher is closed");
     signal?.throwIfAborted();
     if (this.timer) return;
-    this.controller = new AbortController();
+    this.controller ??= new AbortController();
     if (signal) {
       this.abortSignal = signal;
       this.abortListener = () => { void this.close().catch(() => undefined); };

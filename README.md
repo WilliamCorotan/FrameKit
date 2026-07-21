@@ -347,7 +347,7 @@ pnpm audit:all
 Current verification status:
 
 - Full audit passes: lint, typecheck, tests, and build.
-- Unit/in-process suite passes locally: 11 files and 111 tests; 2 service-backed files and 13 tests skip without service environment variables.
+- Unit/in-process suite passes locally: 11 files and 113 tests; 2 service-backed files and 13 tests skip without service environment variables.
 - Coverage gates enforce at least 60% statements/functions/lines and 50% branches across public package source.
 - Production build passes for packages, Desk, and CRM example.
 - Split CI covers package-local tests, coverage, Node 22/24 exports, Postgres 16/17, Redis 7/8, built smoke, standalone consumption, browsers, CodeQL, dependency audit, and SBOM generation.

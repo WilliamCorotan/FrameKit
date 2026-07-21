@@ -226,6 +226,51 @@ describe("dispatchOutboxEvents", () => {
     expect(() => runner.start()).toThrow("closed");
     vi.useRealTimers();
   });
+
+  it("does not start later scheduled jobs after shutdown begins", async () => {
+    const registry = new ScheduledJobRegistry();
+    const events: string[] = [];
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    registry.register({ name: "first", schedule: "* * * * *", handler: async () => {
+      events.push("first:start");
+      await gate;
+      events.push("first:end");
+    } });
+    registry.register({ name: "second", schedule: "* * * * *", handler: () => { events.push("second:start"); } });
+    const runner = new ScheduledJobRunner(registry);
+    const run = runner.runDue(new Date("2026-07-21T00:00:00.000Z"));
+    await Promise.resolve();
+    const closing = runner.close();
+    releaseFirst();
+
+    await expect(run).resolves.toEqual(["first"]);
+    await expect(closing).resolves.toBeUndefined();
+    expect(events).toEqual(["first:start", "first:end"]);
+  });
+
+  it("aborts an in-flight outbox batch before another event starts", async () => {
+    const runtime = createJobsRuntime("Outbox shutdown");
+    await runtime.create(tenant, "customer", { name: "First" });
+    await runtime.create(tenant, "customer", { name: "Second" });
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    let handled = 0;
+    const dispatcher = new OutboxDispatcher(runtime, tenant, async () => {
+      handled += 1;
+      if (handled === 1) { markStarted(); await gate; }
+    });
+    const run = dispatcher.runOnce();
+    await started;
+    const closing = dispatcher.close();
+    releaseFirst();
+
+    await expect(run).rejects.toBeDefined();
+    await expect(closing).rejects.toBeDefined();
+    expect(handled).toBe(1);
+  });
 });
 
 function createJobsRuntime(name: string) {
