@@ -52,6 +52,8 @@ type DocumentRecord = {
   updatedAt: string;
 };
 
+type OwnerTransferReceipt = { id: string; ownerId: string; revision: number; updatedAt: string };
+
 type AuthUser = {
   id: string;
   email: string;
@@ -260,13 +262,23 @@ function App() {
     if (!active?.ownership || !selected) return;
     try {
       setStatus("Transferring owner…");
-      const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/owner`, {
+      const receipt = await fetchJson<OwnerTransferReceipt>(`/api/doctypes/${active.name}/${selected.id}/owner`, {
         method: "POST", body: { ownerId: ownerDraft }, token, expectedRevision: selected.revision
       });
-      setSelected(record);
-      setOwnerDraft(record.ownerId ?? "");
-      await refresh(active.name, query, page);
-      setStatus("Owner transferred");
+      setRecords((current) => current.filter((record) => record.id !== receipt.id));
+      setSelected(undefined);
+      setDraft({});
+      setOwnerDraft("");
+      try {
+        const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${receipt.id}`, { token });
+        setSelected(record);
+        setDraft(record.data);
+        setOwnerDraft(record.ownerId ?? "");
+        setRecords((current) => [record, ...current.filter((item) => item.id !== record.id)]);
+        setStatus("Owner transferred");
+      } catch {
+        setStatus("Owner transferred; document is no longer readable");
+      }
     } catch (error) {
       setStatus(errorMessage(error));
     }
@@ -393,6 +405,7 @@ function App() {
               <div>
                 <p className="eyebrow">{selected ? selected.id : "New document"}</p>
                 <h2>{active?.description ?? "Metadata-generated form"}</h2>
+                {selected ? <small>Revision {selected.revision}</small> : null}
               </div>
               <div className="editor-actions">
                 {selected?.documentStatus === "draft" ? <button onClick={() => void changeDocumentStatus("submit")}><Check size={16} /> Submit</button> : null}
