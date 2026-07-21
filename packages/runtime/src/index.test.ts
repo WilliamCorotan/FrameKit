@@ -87,11 +87,40 @@ describe("runtime document service", () => {
     ] })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
     await expect(runtime.get(commandTenant, record.name, "record-a")).resolves.toMatchObject({ revision: 1, data: { code: "A" } });
 
+    const createReplay = { operations: [{ operation: "create" as const, doctype: record.name, id: "replay-created", data: { code: "REPLAY-CREATE" } }], idempotencyKey: "replay-create-key" };
+    await runtime.executeDocumentCommand(commandTenant, "atomic-records", createReplay);
+    await runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [{ operation: "update", doctype: record.name, id: "replay-created", expectedRevision: 1, data: { code: "REPLAY-CREATE-UPDATED" } }] });
+    await runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [{ operation: "delete", doctype: record.name, id: "replay-created", expectedRevision: 2 }] });
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", createReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "replay-created", revision: 1, data: { code: "REPLAY-CREATE" } }] });
+    await expect(runtime.executeDocumentCommand(bob, "atomic-records", createReplay)).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+
+    await runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [{ operation: "create", doctype: record.name, id: "replay-updated", data: { code: "REPLAY-UPDATE" } }] });
+    const updateReplay = { operations: [{ operation: "update" as const, doctype: record.name, id: "replay-updated", expectedRevision: 1, data: { code: "REPLAY-UPDATED" } }], idempotencyKey: "replay-update-key" };
+    await runtime.executeDocumentCommand(commandTenant, "atomic-records", updateReplay);
+    await runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [{ operation: "delete", doctype: record.name, id: "replay-updated", expectedRevision: 2 }] });
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", updateReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "replay-updated", revision: 2, data: { code: "REPLAY-UPDATED" } }] });
+
+    await runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [{ operation: "create", doctype: record.name, id: "replay-deleted", data: { code: "REPLAY-DELETE" } }] });
+    const deleteReplay = { operations: [{ operation: "delete" as const, doctype: record.name, id: "replay-deleted", expectedRevision: 1 }], idempotencyKey: "replay-delete-key" };
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", deleteReplay)).resolves.toMatchObject({ replayed: false, documents: [{ id: "replay-deleted", revision: 1 }] });
+    const deleteAuditCount = (await runtime.auditTrail(commandTenant)).filter((event) => event.documentId === "replay-deleted").length;
+    const deleteOutboxCount = (await runtime.outboxEvents(commandTenant)).filter((event) => event.payload.id === "replay-deleted").length;
+    await expect(runtime.executeDocumentCommand(commandTenant, "atomic-records", deleteReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "replay-deleted", revision: 1, data: { code: "REPLAY-DELETE" } }] });
+    expect((await runtime.auditTrail(commandTenant)).filter((event) => event.documentId === "replay-deleted")).toHaveLength(deleteAuditCount);
+    expect((await runtime.outboxEvents(commandTenant)).filter((event) => event.payload.id === "replay-deleted")).toHaveLength(deleteOutboxCount);
+    await expect(runtime.executeDocumentCommand(bob, "atomic-records", deleteReplay)).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+
     const denied = createRuntime(commandApp, { commandRowPolicy: ({ operation }) => operation.operation !== "update" });
     await denied.executeDocumentCommand(commandTenant, "atomic-records", { operations: [{ operation: "create", doctype: record.name, id: "record-a", data: { code: "A" } }] });
     await expect(denied.executeDocumentCommand(commandTenant, "atomic-records", { operations: [
       { operation: "update", doctype: record.name, id: "record-a", expectedRevision: 1, data: { code: "blocked" } }
     ] })).rejects.toMatchObject({ code: "FORBIDDEN" });
+    let allowReplay = true;
+    const replayPolicy = createRuntime(commandApp, { commandRowPolicy: () => allowReplay });
+    const policyRequest = { operations: [{ operation: "create" as const, doctype: record.name, id: "policy-replay", data: { code: "POLICY" } }], idempotencyKey: "policy-replay-key" };
+    await replayPolicy.executeDocumentCommand(commandTenant, "atomic-records", policyRequest);
+    allowReplay = false;
+    await expect(replayPolicy.executeDocumentCommand(commandTenant, "atomic-records", policyRequest)).rejects.toMatchObject({ code: "DOCUMENT_NOT_FOUND" });
 
     const sagaRequest = { operations: [{
       operation: "create" as const, doctype: record.name, id: "saga-success", data: { code: "SAGA-SUCCESS" },
@@ -99,6 +128,14 @@ describe("runtime document service", () => {
     }], idempotencyKey: "saga-success-1" };
     await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", sagaRequest)).resolves.toMatchObject({ replayed: false });
     await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", sagaRequest)).resolves.toMatchObject({ replayed: true, documents: [{ id: "saga-success" }] });
+
+    await runtime.executeDocumentCommand(commandTenant, "atomic-records", { operations: [{ operation: "create", doctype: record.name, id: "saga-delete", data: { code: "SAGA-DELETE" } }] });
+    const sagaDelete = { operations: [{
+      operation: "delete" as const, doctype: record.name, id: "saga-delete", expectedRevision: 1,
+      compensation: { operation: "create" as const, doctype: record.name, id: "saga-delete", data: { code: "SAGA-DELETE" } }
+    }], idempotencyKey: "saga-delete-key" };
+    await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", sagaDelete)).resolves.toMatchObject({ replayed: false, documents: [{ id: "saga-delete", revision: 1 }] });
+    await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", sagaDelete)).resolves.toMatchObject({ replayed: true, documents: [{ id: "saga-delete", revision: 1, data: { code: "SAGA-DELETE" } }] });
 
     await expect(runtime.executeDocumentCommand(commandTenant, "saga-records", { operations: [
       {

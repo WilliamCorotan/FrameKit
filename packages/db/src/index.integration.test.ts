@@ -1000,6 +1000,28 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       ] })).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
       await expect(runtime.get(commandTenant, customerDocType.name, "command-customer")).resolves.toMatchObject({ revision: 1, data: { status: "active" } });
 
+      const createReplay = { operations: [{ operation: "create" as const, doctype: customerDocType.name, id: "pg-replay-create", data: { name: "Replay Create", external_id: "PG-REPLAY-CREATE" } }], idempotencyKey: "pg-replay-create-key" };
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", createReplay);
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "update", doctype: customerDocType.name, id: "pg-replay-create", expectedRevision: 1, data: { status: "paused" } }] });
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "delete", doctype: customerDocType.name, id: "pg-replay-create", expectedRevision: 2 }] });
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", createReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "pg-replay-create", revision: 1, data: { status: "active" } }] });
+
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "create", doctype: customerDocType.name, id: "pg-replay-update", data: { name: "Replay Update", external_id: "PG-REPLAY-UPDATE" } }] });
+      const updateReplay = { operations: [{ operation: "update" as const, doctype: customerDocType.name, id: "pg-replay-update", expectedRevision: 1, data: { status: "paused" } }], idempotencyKey: "pg-replay-update-key" };
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", updateReplay);
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "delete", doctype: customerDocType.name, id: "pg-replay-update", expectedRevision: 2 }] });
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", updateReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "pg-replay-update", revision: 2, data: { status: "paused" } }] });
+
+      await runtime.executeDocumentCommand(commandTenant, "customer-deal", { operations: [{ operation: "create", doctype: customerDocType.name, id: "pg-replay-delete", data: { name: "Replay Delete", external_id: "PG-REPLAY-DELETE" } }] });
+      const deleteReplay = { operations: [{ operation: "delete" as const, doctype: customerDocType.name, id: "pg-replay-delete", expectedRevision: 1 }], idempotencyKey: "pg-replay-delete-key" };
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", deleteReplay)).resolves.toMatchObject({ replayed: false, documents: [{ id: "pg-replay-delete", revision: 1 }] });
+      const deleteAuditCount = (await stores.audit.list(commandTenant)).filter((event) => event.documentId === "pg-replay-delete").length;
+      const deleteOutboxCount = (await stores.outbox.list(commandTenant)).filter((event) => event.payload.id === "pg-replay-delete").length;
+      await expect(runtime.executeDocumentCommand(commandTenant, "customer-deal", deleteReplay)).resolves.toMatchObject({ replayed: true, documents: [{ id: "pg-replay-delete", revision: 1, data: { status: "active" } }] });
+      expect((await stores.audit.list(commandTenant)).filter((event) => event.documentId === "pg-replay-delete")).toHaveLength(deleteAuditCount);
+      expect((await stores.outbox.list(commandTenant)).filter((event) => event.payload.id === "pg-replay-delete")).toHaveLength(deleteOutboxCount);
+      await expect(runtime.executeDocumentCommand({ ...commandTenant, userId: "pg-replay-reader" }, "customer-deal", deleteReplay)).rejects.toMatchObject({ code: "IDEMPOTENCY_KEY_REUSED" });
+
       const secureRequest = { operations: [{
         operation: "create" as const, doctype: securedDocType.name, id: "command-secure", data: { title: "Secure command", code: "COMMAND-SECURE" }
       }], idempotencyKey: "secure-command-1" };

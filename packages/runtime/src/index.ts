@@ -1147,12 +1147,14 @@ export class FramekitRuntime {
       const doctype = await this.getEffectiveDocType(tenant, operation.doctype);
       assertPermission(tenant, doctype, operation.operation);
       const prior = stored[index];
-      if (!prior || operation.operation === "delete") throw new FramekitError("COMMAND_REPLAY_UNVERIFIABLE", "Deleted or missing command results cannot be reauthorized.", 409);
-      const current = await this.repository.get(tenant, doctype, prior.id, { access: operation.operation === "create" ? "read" : "write" });
-      if (!current || !(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document: current }) ?? true)) {
+      if (!prior || prior.tenantId !== tenant.tenantId || prior.doctype !== doctype.name || (operation.id && prior.id !== operation.id)) {
+        throw new FramekitError("COMMAND_REPLAY_UNVERIFIABLE", "Stored command result does not match the reviewed operation target.", 409);
+      }
+      const access = operation.operation === "create" ? "read" : "write";
+      if (!hasRowAccess(tenant, doctype, access, prior.ownerId) || !(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document: structuredClone(prior) }) ?? true)) {
         throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${prior.id}" does not exist`, 404);
       }
-      authorized.push(prior);
+      authorized.push(structuredClone(prior));
     }
     return authorized;
   }

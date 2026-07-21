@@ -579,14 +579,16 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
           result = rowToRecord(rows[0]!);
         } else {
           const scope = rowPolicyScope(command.tenant, command.doctype, "write");
-          const rows = await tx<{ revision: number }[]>`
+          const rows = await tx<typeof framekitDocuments.$inferSelect[]>`
             delete from framekit_documents
             where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
               and id = ${command.document.id} and revision = ${command.expectedRevision!}
               and (${scope === "all"} or (${scope === "self"} and owner_id = ${command.tenant.userId}))
-            returning revision
+            returning tenant_id as "tenantId", doctype, id, revision, document_status as "documentStatus", owner_id as "ownerId", state, data,
+                      created_at as "createdAt", updated_at as "updatedAt"
           `;
           if (!rows[0]) await throwMutationWriteFailure(tx, command);
+          result = rowToRecord(rows[0]!);
           await tx`
             delete from framekit_document_unique_values
             where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name} and document_id = ${command.document.id}

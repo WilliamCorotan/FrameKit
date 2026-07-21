@@ -598,12 +598,12 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       const commandId = matchCommandPath(path, basePath);
       if (method === "POST" && commandId) {
         const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
-        const body = ((await readBody(event)) ?? {}) as Partial<DocumentCommandRequest>;
-        if (!Array.isArray(body.operations)) throw new FramekitError("VALIDATION_FAILED", "operations is required.", 422);
-        return await runtime.executeDocumentCommand(tenant, commandId, {
-          operations: body.operations,
-          idempotencyKey: event.req.headers.get("idempotency-key") ?? body.idempotencyKey
-        });
+        const body: unknown = (await readBody(event)) ?? {};
+        const idempotencyKey = event.req.headers.get("idempotency-key");
+        const request = idempotencyKey && body !== null && typeof body === "object" && !Array.isArray(body)
+          ? { ...body, idempotencyKey }
+          : body;
+        return await runtime.executeDocumentCommand(tenant, commandId, request as DocumentCommandRequest);
       }
 
       const match = matchDocumentPath(path, basePath);

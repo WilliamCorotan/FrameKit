@@ -15,6 +15,9 @@ describe("createNitroHandler", () => {
       id: "commands", name: "Commands", doctypes: [item], commands: [{
         id: "create-items", label: "Create items", permission: "items.bulk", mode: "atomic",
         doctypes: [item.name], operations: ["create"], maxOperations: 5
+      }, {
+        id: "create-items-saga", label: "Create items saga", permission: "items.bulk", mode: "saga",
+        doctypes: [item.name], operations: ["create", "delete"], maxOperations: 5
       }]
     })] }));
     const h3 = new H3();
@@ -32,6 +35,23 @@ describe("createNitroHandler", () => {
       method: "POST", headers: { "x-permissions": "items.write,items.bulk" },
       body: { operations: [{ operation: "create", doctype: item.name, data: [], expectedRevision: 1, typo: true }] }
     })).rejects.toMatchObject({ code: "INVALID_COMMAND_OPERATION" });
+    await expect(json(fetch, "/api/commands/create-items", {
+      method: "POST", headers: { "x-permissions": "items.write,items.bulk", "idempotency-key": "strict-atomic" },
+      body: { operations, unknownTopLevel: true }
+    })).rejects.toMatchObject({ code: "INVALID_COMMAND_OPERATION" });
+    await expect(json(fetch, "/api/commands/create-items-saga", {
+      method: "POST", headers: { "x-permissions": "items.write,items.bulk", "idempotency-key": "strict-saga" },
+      body: { operations: [{ ...operations[0], compensation: { operation: "delete", doctype: item.name, id: "item-1", expectedRevision: 1 } }], unknownTopLevel: true }
+    })).rejects.toMatchObject({ code: "INVALID_COMMAND_OPERATION" });
+    const headerOperations = [{ operation: "create", doctype: item.name, id: "item-header", data: { name: "Header wins" } }];
+    await expect(json(fetch, "/api/commands/create-items", {
+      method: "POST", headers: { "x-permissions": "items.write,items.bulk", "idempotency-key": "header-key" },
+      body: { operations: headerOperations, idempotencyKey: "body-key" }
+    })).resolves.toMatchObject({ replayed: false, documents: [{ id: "item-header" }] });
+    await expect(json(fetch, "/api/commands/create-items", {
+      method: "POST", headers: { "x-permissions": "items.write,items.bulk", "idempotency-key": "header-key" },
+      body: { operations: headerOperations, idempotencyKey: "different-body-key" }
+    })).resolves.toMatchObject({ replayed: true, documents: [{ id: "item-header" }] });
   });
 
   it("exposes submit and cancel document lifecycle commands", async () => {
