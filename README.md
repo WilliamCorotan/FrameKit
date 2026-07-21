@@ -140,6 +140,7 @@ Example login and authenticated request:
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
   -H 'content-type: application/json' \
+  -H 'origin: http://localhost:3000' \
   -d '{"email":"admin@example.com","password":"admin12345"}' \
   | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).token))')
 

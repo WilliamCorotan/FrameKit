@@ -89,7 +89,7 @@ describe("createNitroHandler", () => {
 
     const login = await fetch(new Request("http://localhost/api/auth/login", {
       method: "POST",
-      headers: { "content-type": "application/json", "x-tenant-id": "default" },
+      headers: { "content-type": "application/json", "x-tenant-id": "default", origin: "http://localhost" },
       body: JSON.stringify({ email: "admin@example.com", password: "admin12345" })
     }));
     const cookie = login.headers.getSetCookie()[0];
@@ -145,6 +145,11 @@ describe("createNitroHandler", () => {
     }));
     expect(denied.status).toBe(403);
     await expect(denied.json()).resolves.toMatchObject({ code: "CORS_ORIGIN_DENIED" });
+    const deniedActual = await fetch(new Request("http://internal/health", {
+      headers: { origin: "https://attacker.example" }
+    }));
+    expect(deniedActual.status).toBe(403);
+    await expect(deniedActual.json()).resolves.toMatchObject({ code: "CORS_ORIGIN_DENIED" });
 
     const noCorsH3 = new H3();
     noCorsH3.all("/**", createNitroHandler(runtime));
@@ -155,6 +160,99 @@ describe("createNitroHandler", () => {
     expect(() => createNitroHandler(runtime, { cors: { origins: ["*"], credentials: true } })).toThrow(
       "Credentialed CORS cannot use the wildcard origin"
     );
+  });
+
+  it("rejects login CSRF before password, provider, or refresh cookies are issued", async () => {
+    const runtime = createRuntime(defineApp({ name: "Login CSRF", modules: [] }));
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      userStore: new InMemoryUserStore([{
+        tenantId: "default",
+        id: "admin",
+        email: "admin@example.com",
+        name: "Admin",
+        passwordHash: await hashPassword("admin-password"),
+        roles: ["administrator"],
+        permissions: ["*"]
+      }]),
+      providers: [{
+        id: "test",
+        authenticate: async ({ tenantId }) => ({
+          providerId: "test",
+          subject: "admin-provider",
+          tenantId,
+          email: "admin@example.com"
+        })
+      }]
+    });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, {
+      auth,
+      cors: { origins: ["https://desk.example.test"], credentials: true }
+    }));
+    const fetch = toWebHandler(h3);
+    const formHeaders = (origin: string) => ({
+      "content-type": "application/x-www-form-urlencoded",
+      origin
+    });
+
+    const missingOrigin = await fetch(new Request("http://internal/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ email: "admin@example.com", password: "admin-password" })
+    }));
+    expect(missingOrigin.status).toBe(403);
+    expect(missingOrigin.headers.getSetCookie()).toEqual([]);
+    await expect(missingOrigin.json()).resolves.toMatchObject({ code: "CSRF_ORIGIN_REQUIRED" });
+
+    const attackerPassword = await fetch(new Request("http://internal/api/auth/login", {
+      method: "POST",
+      headers: formHeaders("https://attacker.example"),
+      body: new URLSearchParams({ email: "admin@example.com", password: "admin-password" })
+    }));
+    expect(attackerPassword.status).toBe(403);
+    expect(attackerPassword.headers.getSetCookie()).toEqual([]);
+
+    const attackerProvider = await fetch(new Request("http://internal/api/auth/providers/test/login", {
+      method: "POST",
+      headers: formHeaders("https://attacker.example"),
+      body: new URLSearchParams({ token: "provider-token" })
+    }));
+    expect(attackerProvider.status).toBe(403);
+    expect(attackerProvider.headers.getSetCookie()).toEqual([]);
+
+    const allowedPassword = await fetch(new Request("http://internal/api/auth/login", {
+      method: "POST",
+      headers: formHeaders("https://desk.example.test"),
+      body: new URLSearchParams({ email: "admin@example.com", password: "admin-password" })
+    }));
+    expect(allowedPassword.status).toBe(200);
+    expect(allowedPassword.headers.getSetCookie()[0]).toContain("framekit_session=");
+
+    const allowedProvider = await fetch(new Request("http://internal/api/auth/providers/test/login", {
+      method: "POST",
+      headers: formHeaders("https://desk.example.test"),
+      body: new URLSearchParams({ token: "provider-token" })
+    }));
+    expect(allowedProvider.status).toBe(200);
+    expect(allowedProvider.headers.getSetCookie()[0]).toContain("framekit_session=");
+
+    const cookie = allowedPassword.headers.getSetCookie()[0]!.split(";")[0]!;
+    const attackerRefresh = await fetch(new Request("http://internal/api/auth/refresh", {
+      method: "POST",
+      headers: { ...formHeaders("https://attacker.example"), cookie },
+      body: new URLSearchParams()
+    }));
+    expect(attackerRefresh.status).toBe(403);
+    expect(attackerRefresh.headers.getSetCookie()).toEqual([]);
+
+    const allowedRefresh = await fetch(new Request("http://internal/api/auth/refresh", {
+      method: "POST",
+      headers: { ...formHeaders("https://desk.example.test"), cookie },
+      body: new URLSearchParams()
+    }));
+    expect(allowedRefresh.status).toBe(200);
+    expect(allowedRefresh.headers.getSetCookie()[0]).toContain("framekit_session=");
   });
 
   it("enforces cookie CSRF origins and trusts proxy origin headers only when configured", async () => {
@@ -176,7 +274,7 @@ describe("createNitroHandler", () => {
     const fetch = toWebHandler(h3);
     const login = await fetch(new Request("http://internal/api/auth/login", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", origin: "http://internal" },
       body: JSON.stringify({ email: "admin@example.com", password: "admin-password" })
     }));
     const cookie = login.headers.getSetCookie()[0]!.split(";")[0]!;
@@ -260,7 +358,7 @@ describe("createNitroHandler", () => {
       expect(response.headers.get("cross-origin-resource-policy")).toBe("same-site");
       const login = await toWebHandler(productionH3)(new Request("https://app.example.test/api/auth/login", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", origin: "https://app.example.test" },
         body: JSON.stringify({ email: "ops@company.test", password: "production-test-password" })
       }));
       expect(login.headers.getSetCookie()[0]).toContain("Secure");
@@ -688,6 +786,7 @@ async function json<T = unknown>(
       headers: {
         "content-type": "application/json",
         "x-tenant-id": "default",
+        origin: "http://localhost",
         ...options.headers
       },
       body: options.body === undefined ? undefined : JSON.stringify(options.body)

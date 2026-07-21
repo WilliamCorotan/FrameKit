@@ -148,6 +148,9 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       }
 
       enforceCookieCsrf(event.req, authCookie, trustedOrigins, trustProxy);
+      if (isCookieIssuingAuthRoute(method, path, basePath)) {
+        enforceCookieIssuanceOrigin(event.req, authCookie, trustedOrigins, trustProxy);
+      }
 
       if (rateLimiter && !(await rateLimiter.allow({ key: requestKey(event.req, trustProxy), request: event.req, method, path }))) {
         statusCode = 429;
@@ -744,17 +747,11 @@ function applyCors(event: H3Event, cors: NormalizedCorsOptions | undefined, allo
   try {
     normalizedOrigin = normalizeOrigin(requestOrigin);
   } catch {
-    if (event.req.method === "OPTIONS") {
-      throw new FramekitError("CORS_ORIGIN_DENIED", "Request origin is not allowed.", 403);
-    }
-    return;
+    throw new FramekitError("CORS_ORIGIN_DENIED", "Request origin is not allowed.", 403);
   }
   const wildcard = cors.origins.has("*");
   if (!wildcard && !cors.origins.has(normalizedOrigin)) {
-    if (event.req.method === "OPTIONS") {
-      throw new FramekitError("CORS_ORIGIN_DENIED", "Request origin is not allowed.", 403);
-    }
-    return;
+    throw new FramekitError("CORS_ORIGIN_DENIED", "Request origin is not allowed.", 403);
   }
   event.res.headers.set("access-control-allow-origin", wildcard ? "*" : normalizedOrigin);
   event.res.headers.append("vary", "Origin");
@@ -779,9 +776,25 @@ function enforceCookieCsrf(
   if (!cookieValue(request.headers.get("cookie"), cookie.name)) {
     return;
   }
+  assertTrustedRequestOrigin(request, trustedOrigins, trustProxy, "Cookie-authenticated mutations");
+}
+
+function enforceCookieIssuanceOrigin(
+  request: Request,
+  cookie: Required<NitroAuthCookieOptions> | undefined,
+  trustedOrigins: Set<string>,
+  trustProxy: boolean
+): void {
+  if (!cookie) {
+    return;
+  }
+  assertTrustedRequestOrigin(request, trustedOrigins, trustProxy, "Cookie-establishing authentication requests");
+}
+
+function assertTrustedRequestOrigin(request: Request, trustedOrigins: Set<string>, trustProxy: boolean, operation: string): void {
   const rawOrigin = request.headers.get("origin");
   if (!rawOrigin) {
-    throw new FramekitError("CSRF_ORIGIN_REQUIRED", "Cookie-authenticated mutations require an Origin header.", 403);
+    throw new FramekitError("CSRF_ORIGIN_REQUIRED", `${operation} require an Origin header.`, 403);
   }
   let origin: string;
   try {
@@ -793,6 +806,15 @@ function enforceCookieCsrf(
     return;
   }
   throw new FramekitError("CSRF_ORIGIN_DENIED", "Request origin is not trusted.", 403);
+}
+
+function isCookieIssuingAuthRoute(method: string, path: string, basePath: string): boolean {
+  if (method !== "POST") {
+    return false;
+  }
+  return path === `${basePath}/auth/login`
+    || path === `${basePath}/auth/refresh`
+    || Boolean(matchProviderLoginPath(path, basePath));
 }
 
 function canonicalRequestOrigin(request: Request, trustProxy: boolean): string {

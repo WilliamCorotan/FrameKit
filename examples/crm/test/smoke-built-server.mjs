@@ -34,6 +34,7 @@ try {
 
   const login = await json(fetchHandler, "/api/auth/login", {
     method: "POST",
+    headers: { origin: "http://built.local" },
     body: {
       email: "smoke@framekit.test",
       password: "Built smoke bootstrap passphrase"
