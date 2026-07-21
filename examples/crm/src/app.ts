@@ -1,4 +1,4 @@
-import { hashPassword, InMemoryApiTokenStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
+import { InMemoryApiTokenStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
 import { createRuntime } from "@framekit/runtime";
 import {
@@ -16,6 +16,7 @@ import {
 } from "@framekit/db";
 import { InMemoryEventBus } from "@framekit/realtime";
 import { assertSecureProductionCredentials } from "@framekit/nitro";
+import { createBootstrapAdmin } from "./bootstrap.js";
 
 const environment = process.env.NODE_ENV ?? "development";
 const authSecret = process.env.FRAMEKIT_AUTH_SECRET ?? "development-secret-change-me";
@@ -267,15 +268,7 @@ async function createMutationUnitOfWork() {
 }
 
 async function createUserStore() {
-  const admin = {
-    id: "admin",
-    tenantId: "default",
-    email: bootstrapEmail,
-    name: "Framekit Admin",
-    passwordHash: await hashPassword(bootstrapPassword, "framekit-dev-salt"),
-    roles: ["administrator"],
-    permissions: ["*"]
-  };
+  const admin = await createBootstrapAdmin(bootstrapEmail, bootstrapPassword);
   if (!process.env.DATABASE_URL) {
     return new InMemoryUserStore([admin]);
   }
