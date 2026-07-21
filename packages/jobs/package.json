@@ -28,8 +28,10 @@
   },
   "description": "Framekit job queue and outbox helpers.",
   "files": [
-    "dist"
+    "dist",
+    "src/index.ts"
   ],
+  "engines": { "node": ">=22 <26" },
   "publishConfig": {
     "access": "public",
     "provenance": true

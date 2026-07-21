@@ -1,12 +1,90 @@
-import { describe, expect, it } from "vitest";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createExecutableMigrationArtifact, createRuntime, migrationChecksum } from "@framekit/runtime";
-import { runCli } from "./index.js";
+import { isValidSemVer, runCli } from "./index.js";
+import { isValidSemVer as isValidReleaseSemVer } from "../../../scripts/semver.mjs";
 
 describe("framekit CLI", () => {
+  it.each([
+    ["0.0.0", true], ["1.2.3", true], ["1.2.3-alpha.1", true], ["1.2.3+build.5", true],
+    ["1.2.3-alpha.1+build.5", true], ["01.2.3", false], ["1.02.3", false], ["1.2.03", false],
+    ["1.2.3-01", false], ["1.2.3-..", false], ["1.2.3-", false], ["1.2.3+", false], ["1.2.3+a..b", false]
+  ] as const)("validates strict SemVer 2.0 version %s", (version, valid) => {
+    expect(isValidSemVer(version)).toBe(valid);
+    expect(isValidReleaseSemVer(version)).toBe(valid);
+  });
+  it("creates a standalone server scaffold with published dependencies and a local TypeScript config", async () => {
+    await inTemporaryDirectory(async (directory) => {
+      await runCli(["create-app", "Standalone Notes"], { log: () => undefined });
+
+      const manifest = JSON.parse(await readFile(join(directory, "standalone-notes/package.json"), "utf8")) as {
+        dependencies: Record<string, string>;
+      };
+      for (const name of ["@framekit/auth", "@framekit/core", "@framekit/nitro", "@framekit/runtime"]) {
+        expect(manifest.dependencies[name]).toMatch(/^\^\d+\.\d+\.\d+/);
+      }
+      expect(Object.values(manifest.dependencies)).not.toContain("workspace:*");
+      expect(JSON.parse(await readFile(join(directory, "standalone-notes/tsconfig.json"), "utf8"))).not.toHaveProperty("extends");
+      expect(await readFile(join(directory, "standalone-notes/src/app.ts"), "utf8")).toContain("await hashPassword(bootstrapPassword)");
+      expect(await readFile(join(directory, "standalone-notes/start.mjs"), "utf8")).toContain("server.listen(port, host");
+      const smoke = await readFile(join(directory, "standalone-notes/test/standalone-smoke.mjs"), "utf8");
+      expect(smoke).toContain("Standalone get-by-id proof failed");
+      expect(smoke).toContain("Standalone update proof failed");
+      expect(smoke).toContain("Standalone delete proof expected 404");
+    });
+  });
+
+  it("keeps scaffold writes non-destructive unless force is explicit and dry-run never writes", async () => {
+    await inTemporaryDirectory(async (directory) => {
+      const logs: string[] = [];
+      await runCli(["create-app", "safe-app", "--dry-run"], { log: (message) => logs.push(message) });
+      await expect(readFile(join(directory, "safe-app/package.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(logs.some((message) => message.startsWith("Would create"))).toBe(true);
+
+      await runCli(["create-app", "safe-app"], { log: () => undefined });
+      const manifestPath = join(directory, "safe-app/package.json");
+      await writeFile(manifestPath, "user-owned-content\n");
+      await expect(runCli(["create-app", "safe-app"], { log: () => undefined })).rejects.toThrow("Refusing to overwrite");
+      expect(await readFile(manifestPath, "utf8")).toBe("user-owned-content\n");
+
+      await runCli(["create-app", "safe-app", "--force"], { log: () => undefined });
+      expect(JSON.parse(await readFile(manifestPath, "utf8"))).toMatchObject({ name: "safe-app" });
+    });
+  });
+
+  it("rejects scaffold names that could resolve to the current directory", async () => {
+    await expect(runCli(["create-app", "../"], { log: () => undefined })).rejects.toThrow("at least one letter or number");
+  });
+
+  it.each([{ options: [] as string[] }, { options: ["--dry-run"] }, { options: ["--force"] }])("rejects a symlinked target directory for options $options", async ({ options }) => {
+    await inTemporaryDirectory(async (directory) => {
+      const outside = await mkdtemp(join(tmpdir(), "framekit-cli-outside-"));
+      try {
+        await writeFile(join(outside, "sentinel"), "untouched\n");
+        await symlink(outside, join(directory, "linked-app"), "dir");
+        await expect(runCli(["create-app", "linked-app", ...options], { log: () => undefined })).rejects.toThrow("symbolic link");
+        expect(await readFile(join(outside, "sentinel"), "utf8")).toBe("untouched\n");
+        await expect(readFile(join(outside, "package.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      } finally {
+        await rm(outside, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it.each([{ options: [] as string[] }, { options: ["--dry-run"] }, { options: ["--force"] }])("rejects a symlinked scaffold file for options $options", async ({ options }) => {
+    await inTemporaryDirectory(async (directory) => {
+      const outside = join(directory, "outside-package.json");
+      await writeFile(outside, "user-owned-content\n");
+      await mkdir(join(directory, "linked-file-app"));
+      await symlink(outside, join(directory, "linked-file-app", "package.json"), "file");
+      await expect(runCli(["create-app", "linked-file-app", ...options], { log: () => undefined })).rejects.toThrow("symbolic link");
+      expect(await readFile(outside, "utf8")).toBe("user-owned-content\n");
+    });
+  });
+
   it("generates SDK types from an app module path", async () => {
     let stdout = "";
 
@@ -117,3 +195,15 @@ describe("framekit CLI", () => {
     }
   });
 });
+
+async function inTemporaryDirectory(run: (directory: string) => Promise<void>): Promise<void> {
+  const previous = process.cwd();
+  const directory = await mkdtemp(join(tmpdir(), "framekit-cli-"));
+  process.chdir(directory);
+  try {
+    await run(directory);
+  } finally {
+    process.chdir(previous);
+    await rm(directory, { recursive: true, force: true });
+  }
+}

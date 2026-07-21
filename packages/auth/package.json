@@ -26,8 +26,10 @@
   },
   "description": "Framekit authentication stores and services.",
   "files": [
-    "dist"
+    "dist",
+    "src/index.ts"
   ],
+  "engines": { "node": ">=22 <26" },
   "publishConfig": {
     "access": "public",
     "provenance": true
