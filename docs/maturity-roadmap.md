@@ -28,8 +28,8 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 
 | Component | Implementation | In place | Missing or incomplete |
 | --- | ---: | --- | --- |
-| Core metadata and domain model | 68% | DocTypes, modules, ten field types, permissions, hooks, workflows, naming, indexes, navigation, and views | Cross-reference invariants, child records, attachments, computed fields, decimal semantics, ownership/row permissions, localization, typed settings |
-| Runtime and command lifecycle | 60% | CRUD, validation, permissions, hooks, transitions, customization, audit, outbox, naming, realtime, and diagnostics | Atomic unit of work, optimistic concurrency, idempotency, submit/cancel commands, consistent hook validation, bulk/cross-document commands, start/stop/dispose lifecycle |
+| Core metadata and domain model | 76% | DocTypes, modules, field/link/index/naming/view/workflow invariants, dependency-cycle checks, permissions, hooks, naming, navigation, and views | Child records, attachments, computed fields, exact decimal semantics, ownership/row permissions, localization, typed settings |
+| Runtime and command lifecycle | 78% | CRUD, ordered validation/hooks, transitions, draft-submit-cancel lifecycle, post-submit immutability, atomic mutation unit of work, optimistic concurrency, idempotency, audit/outbox, naming, realtime, and diagnostics | Bulk/cross-document commands and complete start/stop/dispose lifecycle |
 | Data, query, and persistence | 50% | In-memory and Postgres adapters for documents and framework records; filters, sorting, projection, cursors, links, and uniqueness checks | Query pushdown, stable opaque cursors, adapter-enforced uniqueness, locking/revisions, atomic document/outbox persistence, load/performance evidence |
 | HTTP API and OpenAPI | 64% | Broad Nitro route surface, authenticated-by-default protected routes, operation permissions, OpenAPI 3.1, framework errors, request IDs, rate-limit and telemetry ports | Hardened CORS, version/compatibility policy, idempotency, pagination envelopes |
 | Authentication and IAM | 52% | Password sessions, cookies, refresh/logout/revocation, lockout, API tokens, roles, audit, provider port, OIDC introspection, forged-header and cross-tenant protection | CSRF model, secure production defaults, persistent identity links, authorization-code/PKCE, recovery/invites, MFA policy |
@@ -79,7 +79,7 @@ Exit criteria:
 
 ## Priority 2 - Production Maturity
 
-1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26)
+1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26) — bounded 1.0 contract implemented; deferred primitives are tracked by [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), [#41](https://github.com/WilliamCorotan/FrameKit/issues/41), and [#42](https://github.com/WilliamCorotan/FrameKit/issues/42).
 2. [#27 Add production lifecycle, observability, compatibility, and supply-chain gates](https://github.com/WilliamCorotan/FrameKit/issues/27)
 
 Exit criteria:
@@ -114,3 +114,5 @@ Reevaluation checks on 2026-07-21:
 ## Score Update Policy
 
 When an issue closes, update only the affected rows. A score should increase only when source behavior, focused tests, production-like verification, and user/operator documentation all support the new level. Functional code without integration evidence should not be scored as release-candidate complete.
+
+The accepted metadata/lifecycle contract and compatibility policy are maintained in [metadata-compatibility.md](metadata-compatibility.md).

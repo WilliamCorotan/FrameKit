@@ -6,6 +6,7 @@ type RecordItem = {
   id: string;
   doctype: string;
   state?: string;
+  documentStatus: "draft" | "submitted" | "cancelled";
   data: Record<string, unknown>;
   updatedAt: string;
 };
@@ -93,6 +94,11 @@ test("covers document list, create, edit, delete, pagination, search, and workfl
 
   await page.getByRole("button", { name: "Qualify" }).click();
   await expect(page.getByText("Transitioned")).toBeVisible();
+  await page.getByRole("button", { name: "Submit" }).click();
+  await expect(page.getByText("Submitted")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save" })).toBeDisabled();
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByText("Cancelled")).toBeVisible();
 
   await page.getByLabel("Filter records").fill("");
   for (let index = 0; index < 5; index += 1) {
@@ -211,6 +217,7 @@ async function mockDeskApi(page: Page) {
       id: "CUSTOMER-001",
       doctype: "customer",
       state: "Lead",
+      documentStatus: "draft",
       data: {
         name: "Northwind Traders",
         status: "active",
@@ -269,25 +276,31 @@ async function mockDeskApi(page: Page) {
         id: `CUSTOMER-${String(customers.length + 1).padStart(3, "0")}`,
         doctype: "customer",
         state: "Lead",
+        documentStatus: "draft" as const,
         data: body,
         updatedAt: now
       };
       customers.unshift(record);
       return json(route, record);
     }
-    const customerMatch = path.match(/^\/api\/doctypes\/customer\/([^/]+)(?:\/transition)?$/);
+    const customerMatch = path.match(/^\/api\/doctypes\/customer\/([^/]+)(?:\/(transition|submit|cancel))?$/);
     if (customerMatch && method === "PATCH" && body) {
       const record = customers.find((item) => item.id === customerMatch[1]);
       Object.assign(record!.data, body);
       return json(route, record);
     }
-    if (customerMatch && !path.endsWith("/transition") && method === "DELETE") {
+    if (customerMatch && !customerMatch[2] && method === "DELETE") {
       customers.splice(customers.findIndex((item) => item.id === customerMatch[1]), 1);
       return empty(route);
     }
-    if (customerMatch && path.endsWith("/transition") && method === "POST") {
+    if (customerMatch?.[2] === "transition" && method === "POST") {
       const record = customers.find((item) => item.id === customerMatch[1]);
       record!.state = "Qualified";
+      return json(route, record);
+    }
+    if (customerMatch?.[2] && ["submit", "cancel"].includes(customerMatch[2]) && method === "POST") {
+      const record = customers.find((item) => item.id === customerMatch[1]);
+      record!.documentStatus = customerMatch[2] === "submit" ? "submitted" : "cancelled";
       return json(route, record);
     }
 

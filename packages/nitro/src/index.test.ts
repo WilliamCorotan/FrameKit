@@ -6,6 +6,48 @@ import { createRuntime, migrationChecksum, type RealtimePublisher, type RuntimeR
 import { assertSecureProductionCredentials, createNitroHandler } from "./index.js";
 
 describe("createNitroHandler", () => {
+  it("exposes submit and cancel document lifecycle commands", async () => {
+    const invoice = defineDocType({
+      name: "invoice",
+      label: "Invoice",
+      fields: [{ name: "number", label: "Number", type: "text", required: true }],
+      permissions: [
+        { action: "create", permissions: ["invoice.write"] },
+        { action: "read", permissions: ["invoice.read"] },
+        { action: "update", permissions: ["invoice.write"] },
+        { action: "submit", permissions: ["invoice.submit"] },
+        { action: "cancel", permissions: ["invoice.cancel"] }
+      ]
+    });
+    const runtime = createRuntime(defineApp({
+      name: "Lifecycle",
+      modules: [defineModule({ id: "billing", name: "Billing", doctypes: [invoice] })]
+    }), { idGenerator: () => "invoice-1" });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { development: { allowHeaderIdentity: true } }));
+    const fetch = toWebHandler(h3);
+    const headers = {
+      "x-user-id": "accountant",
+      "x-permissions": "invoice.write,invoice.read,invoice.submit,invoice.cancel"
+    };
+
+    const created = await json<{ id: string; revision: number; documentStatus: string }>(fetch, "/api/doctypes/invoice", {
+      method: "POST", headers, body: { number: "INV-001" }
+    });
+    expect(created.documentStatus).toBe("draft");
+    const submitted = await json<{ revision: number; documentStatus: string }>(fetch, `/api/doctypes/invoice/${created.id}/submit`, {
+      method: "POST", headers: { ...headers, "if-match": String(created.revision) }
+    });
+    expect(submitted).toMatchObject({ revision: created.revision + 1, documentStatus: "submitted" });
+    await expect(json(fetch, `/api/doctypes/invoice/${created.id}`, {
+      method: "PATCH", headers, body: { number: "INV-002" }
+    })).rejects.toMatchObject({ code: "DOCUMENT_NOT_DRAFT" });
+    const cancelled = await json<{ revision: number; documentStatus: string }>(fetch, `/api/doctypes/invoice/${created.id}/cancel`, {
+      method: "POST", headers: { ...headers, "if-match": String(submitted.revision) }
+    });
+    expect(cancelled).toMatchObject({ revision: submitted.revision + 1, documentStatus: "cancelled" });
+  });
+
   it("emits telemetry hooks and applies the optional rate limiter", async () => {
     const runtime = createRuntime(defineApp({ name: "Ops", modules: [] }));
     const metrics: Array<{ statusCode: number; path: string }> = [];

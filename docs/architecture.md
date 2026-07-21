@@ -20,6 +20,8 @@ Framekit follows the Dependency Rule: source dependencies point inward.
 - Workflows: controlled status transitions per DocType.
 - Permissions: role and permission checks evaluated before commands.
 
+Metadata invariants, business-document status, lifecycle ordering, and version guarantees are specified in [Metadata and Document Compatibility](./metadata-compatibility.md).
+
 ## Hostability
 
 Nitro is the default server engine because it builds for Node, serverless, and edge-oriented targets. Framekit still exposes a fetch-compatible boundary through the Nitro adapter and keeps business behavior in framework services.

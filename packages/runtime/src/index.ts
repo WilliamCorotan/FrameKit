@@ -2,6 +2,7 @@ import {
   assertPermission,
   CustomFieldSchema,
   defineApp,
+  defineDocType,
   FramekitError,
   getDocType,
   hasAccess,
@@ -472,6 +473,8 @@ export class FramekitRuntime {
     if (effective.fields.some((field) => field.name === parsedField.name)) {
       throw new FramekitError("FIELD_EXISTS", `Field "${parsedField.name}" already exists on ${base.name}`, 409);
     }
+    defineDocType({ ...effective, fields: [...effective.fields, parsedField] });
+    if (parsedField.type === "link") getDocType(this.app, parsedField.linkTo!);
     return this.customization.addCustomField(tenant, {
       id: `${base.name}.${parsedField.name}`,
       tenantId: tenant.tenantId,
@@ -543,8 +546,9 @@ export class FramekitRuntime {
     const fingerprint = mutationFingerprint("create", doctype.name, input);
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
     if (replay) return replay;
-    const data = this.prepareInput(doctype, input, true);
-    await this.runHooks("beforeValidate", tenant, doctype, undefined, data);
+    const candidate = { ...input };
+    await this.runHooks("beforeValidate", tenant, doctype, undefined, candidate);
+    const data = this.prepareInput(doctype, candidate, true);
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data);
     const state = doctype.workflow?.initialState;
@@ -554,6 +558,7 @@ export class FramekitRuntime {
       doctype: doctype.name,
       tenantId: tenant.tenantId,
       revision: 1,
+      documentStatus: "draft",
       data,
       state,
       createdAt: timestamp,
@@ -588,7 +593,10 @@ export class FramekitRuntime {
     const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
     if (replay) return replay;
     const existing = await this.get(tenant, doctypeName, id);
-    const data = this.prepareInput(doctype, { ...existing.data, ...input }, false);
+    assertDraftDocument(existing, "update");
+    const candidate = { ...existing.data, ...input };
+    await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
+    const data = this.prepareInput(doctype, candidate, false, existing.data);
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data, id);
     const expectedRevision = options.expectedRevision ?? existing.revision;
@@ -622,6 +630,7 @@ export class FramekitRuntime {
     const fingerprint = mutationFingerprint("delete", doctype.name, { id, expectedRevision: options.expectedRevision });
     if ((await this.replayMutation(tenant, options.idempotencyKey, fingerprint)) !== undefined) return;
     const existing = await this.get(tenant, doctypeName, id);
+    assertDraftDocument(existing, "delete");
     const expectedRevision = options.expectedRevision ?? existing.revision;
     await this.runHooks("beforeDelete", tenant, doctype, existing, existing.data);
     const audit = this.createAuditEvent(tenant, "delete", existing);
@@ -658,6 +667,7 @@ export class FramekitRuntime {
       throw new FramekitError("WORKFLOW_NOT_DEFINED", `${doctype.name} does not define a workflow`, 400);
     }
     const existing = await this.get(tenant, doctypeName, id);
+    assertDraftDocument(existing, "transition");
     const currentState = existing.state ?? workflow.initialState;
     const transition = workflow.transitions.find((candidate) => candidate.action === action && candidate.from.includes(currentState));
     if (!transition) {
@@ -666,7 +676,11 @@ export class FramekitRuntime {
     if (!hasAccess(tenant, transition)) {
       throw new FramekitError("FORBIDDEN", `Missing permission to run transition "${action}"`, 403);
     }
-    const data = { ...existing.data, [workflow.field]: transition.to };
+    const candidate = { ...existing.data, [workflow.field]: transition.to };
+    await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
+    const data = this.prepareInput(doctype, candidate, false, candidate);
+    await this.assertLinksExist(tenant, doctype, data);
+    await this.assertUniqueFields(tenant, doctype, data, id);
     const updated: DocumentRecord = {
       ...existing,
       revision: existing.revision + 1,
@@ -697,7 +711,71 @@ export class FramekitRuntime {
     return saved;
   }
 
-  private prepareInput(doctype: DocTypeDefinition, input: DocumentData, inserting: boolean): DocumentData {
+  async submit(tenant: TenantContext, doctypeName: string, id: string, options: MutationOptions = {}): Promise<DocumentRecord> {
+    return this.changeDocumentStatus(tenant, doctypeName, id, "submit", "submitted", "beforeSubmit", "afterSubmit", options);
+  }
+
+  async cancel(tenant: TenantContext, doctypeName: string, id: string, options: MutationOptions = {}): Promise<DocumentRecord> {
+    return this.changeDocumentStatus(tenant, doctypeName, id, "cancel", "cancelled", "beforeCancel", "afterCancel", options);
+  }
+
+  private async changeDocumentStatus(
+    tenant: TenantContext,
+    doctypeName: string,
+    id: string,
+    action: "submit" | "cancel",
+    target: "submitted" | "cancelled",
+    beforeHook: "beforeSubmit" | "beforeCancel",
+    afterHook: "afterSubmit" | "afterCancel",
+    options: MutationOptions
+  ): Promise<DocumentRecord> {
+    const doctype = await this.getEffectiveDocType(tenant, doctypeName);
+    assertPermission(tenant, doctype, action);
+    requireExpectedRevisionForRetry(options);
+    const fingerprint = mutationFingerprint(action, doctype.name, { id, expectedRevision: options.expectedRevision });
+    const replay = await this.replayMutation(tenant, options.idempotencyKey, fingerprint);
+    if (replay) return replay;
+    const existing = await this.get(tenant, doctypeName, id);
+    const expectedStatus = action === "submit" ? "draft" : "submitted";
+    if (existing.documentStatus !== expectedStatus) {
+      throw new FramekitError("INVALID_DOCUMENT_STATUS", `Cannot ${action} ${doctype.name} "${id}" from ${existing.documentStatus}`, 409);
+    }
+    const candidate = { ...existing.data };
+    await this.runHooks("beforeValidate", tenant, doctype, existing, candidate);
+    const data = this.prepareInput(doctype, candidate, false, candidate);
+    await this.assertLinksExist(tenant, doctype, data);
+    await this.assertUniqueFields(tenant, doctype, data, id);
+    const expectedRevision = options.expectedRevision ?? existing.revision;
+    const updated: DocumentRecord = {
+      ...existing,
+      revision: existing.revision + 1,
+      documentStatus: target,
+      data,
+      updatedAt: this.now().toISOString()
+    };
+    await this.runHooks(beforeHook, tenant, doctype, updated, data);
+    const audit = this.createAuditEvent(tenant, action, updated);
+    const outbox = this.createOutboxEvent(tenant, target, updated);
+    const execution = this.mutations
+      ? await this.mutations.execute({
+          operation: "update",
+          tenant,
+          doctype,
+          document: updated,
+          expectedRevision,
+          idempotencyKey: options.idempotencyKey,
+          idempotencyFingerprint: fingerprint,
+          audit,
+          outbox,
+          afterWrite: () => this.runHooks(afterHook, tenant, doctype, updated, data)
+        })
+      : { document: await this.updateWithoutUnitOfWork(tenant, doctype, updated, data, expectedRevision, audit, outbox, afterHook), replayed: false };
+    const saved = execution.document!;
+    if (!execution.replayed) await this.publishDocumentEvent(tenant, target, saved);
+    return saved;
+  }
+
+  private prepareInput(doctype: DocTypeDefinition, input: DocumentData, inserting: boolean, protectedData: DocumentData = {}): DocumentData {
     const output: DocumentData = {};
     for (const field of doctype.fields) {
       const value = input[field.name] ?? field.default;
@@ -705,6 +783,7 @@ export class FramekitRuntime {
         throw new FramekitError("VALIDATION_FAILED", `Field "${field.label}" is required`, 422);
       }
       if (field.readOnly && !inserting) {
+        if (protectedData[field.name] !== undefined) output[field.name] = protectedData[field.name];
         continue;
       }
       if (value !== undefined) {
@@ -837,6 +916,7 @@ export class FramekitRuntime {
         id: document.id,
         doctype: document.doctype,
         revision: document.revision,
+        documentStatus: document.documentStatus,
         state: document.state,
         data: document.data
       },
@@ -869,7 +949,7 @@ export class FramekitRuntime {
     expectedRevision: number,
     audit: AuditEvent,
     outbox: OutboxEvent,
-    hook: "afterUpdate" | "afterTransition" = "afterUpdate"
+    hook: "afterUpdate" | "afterTransition" | "afterSubmit" | "afterCancel" = "afterUpdate"
   ): Promise<DocumentRecord> {
     const saved = await this.repository.update(tenant, doctype, document, { expectedRevision });
     await this.runHooks(hook, tenant, doctype, saved, data);
@@ -1392,6 +1472,12 @@ function mutationFingerprint(operation: string, doctype: string, value: unknown)
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
     return Object.fromEntries(Object.entries(candidate).sort(([left], [right]) => left.localeCompare(right)));
   });
+}
+
+function assertDraftDocument(document: DocumentRecord, action: string): void {
+  if (document.documentStatus !== "draft") {
+    throw new FramekitError("DOCUMENT_NOT_DRAFT", `Cannot ${action} ${document.doctype} "${document.id}" after submission`, 409);
+  }
 }
 
 function requireExpectedRevisionForRetry(options: MutationOptions): void {

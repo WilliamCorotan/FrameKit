@@ -15,6 +15,7 @@ export const fieldTypes = [
 
 export type FieldType = (typeof fieldTypes)[number];
 export type DocumentAction = "create" | "read" | "update" | "delete" | "submit" | "cancel" | "transition";
+export type DocumentStatus = "draft" | "submitted" | "cancelled";
 
 export const FieldSchema = z.object({
   name: z.string().min(1).regex(/^[a-z][a-z0-9_]*$/),
@@ -108,7 +109,11 @@ export const HookNames = [
   "beforeDelete",
   "afterDelete",
   "beforeTransition",
-  "afterTransition"
+  "afterTransition",
+  "beforeSubmit",
+  "afterSubmit",
+  "beforeCancel",
+  "afterCancel"
 ] as const;
 
 export type HookName = (typeof HookNames)[number];
@@ -127,6 +132,7 @@ export type DocumentRecord<TData extends DocumentData = DocumentData> = {
   doctype: string;
   tenantId: string;
   revision: number;
+  documentStatus: DocumentStatus;
   data: TData;
   state?: string;
   createdAt: string;
@@ -204,9 +210,7 @@ export function defineDocType(definition: z.input<typeof DocTypeSchema>): DocTyp
     }
     fieldNames.add(field.name);
   }
-  if (parsed.workflow && !parsed.workflow.states.includes(parsed.workflow.initialState)) {
-    throw new Error(`Workflow initial state "${parsed.workflow.initialState}" is not listed in states`);
-  }
+  assertDocTypeInvariants(parsed);
   return parsed;
 }
 
@@ -232,6 +236,7 @@ export function defineApp(definition: Omit<Partial<AppDefinition>, "modules"> & 
   });
   assertNoDuplicateDoctypes(app.modules);
   assertModuleDependencies(app.modules);
+  assertAppReferences(app);
   return app;
 }
 
@@ -290,11 +295,111 @@ function assertNoDuplicateDoctypes(modules: ModuleDefinition[]): void {
 }
 
 function assertModuleDependencies(modules: ModuleDefinition[]): void {
-  const ids = new Set(modules.map((module) => module.id));
+  const ids = new Set<string>();
   for (const module of modules) {
+    if (ids.has(module.id)) throw new Error(`Duplicate module id "${module.id}"`);
+    ids.add(module.id);
+  }
+  for (const module of modules) {
+    const dependencies = new Set<string>();
     for (const dependency of module.dependencies) {
+      if (dependencies.has(dependency)) throw new Error(`Module "${module.id}" declares duplicate dependency "${dependency}"`);
+      dependencies.add(dependency);
       if (!ids.has(dependency)) {
         throw new Error(`Module "${module.id}" requires missing dependency "${dependency}"`);
+      }
+      if (dependency === module.id) throw new Error(`Module "${module.id}" cannot depend on itself`);
+    }
+  }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string, path: string[]) => {
+    if (visiting.has(id)) throw new Error(`Module dependency cycle: ${[...path, id].join(" -> ")}`);
+    if (visited.has(id)) return;
+    visiting.add(id);
+    const module = modules.find((candidate) => candidate.id === id)!;
+    for (const dependency of module.dependencies) visit(dependency, [...path, id]);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const module of modules) visit(module.id, []);
+}
+
+function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
+  const fields = new Map(doctype.fields.map((field) => [field.name, field]));
+  for (const field of doctype.fields) {
+    if (field.type === "select") {
+      if (!field.options?.length) throw new Error(`Select field "${doctype.name}.${field.name}" requires options`);
+      if (new Set(field.options).size !== field.options.length) throw new Error(`Select field "${doctype.name}.${field.name}" has duplicate options`);
+      if (field.default !== undefined && !field.options.includes(String(field.default))) {
+        throw new Error(`Default for "${doctype.name}.${field.name}" is not a select option`);
+      }
+    } else if (field.options) {
+      throw new Error(`Only select fields may define options: "${doctype.name}.${field.name}"`);
+    }
+    if (field.type === "link" && !field.linkTo) throw new Error(`Link field "${doctype.name}.${field.name}" requires linkTo`);
+    if (field.type !== "link" && field.linkTo) throw new Error(`Only link fields may define linkTo: "${doctype.name}.${field.name}"`);
+    if (field.unique && field.type === "json") throw new Error(`JSON field "${doctype.name}.${field.name}" cannot be unique`);
+  }
+  const indexes = new Set<string>();
+  for (const index of doctype.indexes) {
+    if (new Set(index).size !== index.length) throw new Error(`Index on "${doctype.name}" repeats a field`);
+    for (const field of index) if (!fields.has(field)) throw new Error(`Index on "${doctype.name}" references unknown field "${field}"`);
+    const key = index.join("\u0000");
+    if (indexes.has(key)) throw new Error(`Duplicate index on "${doctype.name}": ${index.join(", ")}`);
+    indexes.add(key);
+  }
+  if (doctype.naming.field) {
+    const field = fields.get(doctype.naming.field);
+    if (!field) throw new Error(`Naming field "${doctype.naming.field}" does not exist on "${doctype.name}"`);
+    if (field.type !== "text") throw new Error(`Naming field "${doctype.name}.${field.name}" must be text`);
+    if (doctype.naming.series) throw new Error(`DocType "${doctype.name}" cannot combine field naming with a series`);
+  }
+  const viewIds = new Set<string>();
+  for (const view of doctype.views) {
+    if (view.doctype !== doctype.name) throw new Error(`View "${view.id}" belongs to "${view.doctype}", not "${doctype.name}"`);
+    if (viewIds.has(view.id)) throw new Error(`Duplicate view id "${view.id}" on "${doctype.name}"`);
+    viewIds.add(view.id);
+    if (new Set(view.fields).size !== view.fields.length) throw new Error(`View "${view.id}" repeats a field`);
+    for (const field of view.fields) if (!fields.has(field)) throw new Error(`View "${view.id}" references unknown field "${field}"`);
+  }
+  if (!doctype.workflow) return;
+  const workflow = doctype.workflow;
+  const workflowField = fields.get(workflow.field);
+  if (!workflowField) throw new Error(`Workflow field "${workflow.field}" does not exist on "${doctype.name}"`);
+  if (workflowField.type !== "select") throw new Error(`Workflow field "${doctype.name}.${workflow.field}" must be select`);
+  if (new Set(workflow.states).size !== workflow.states.length) throw new Error(`Workflow on "${doctype.name}" has duplicate states`);
+  const states = new Set(workflow.states);
+  if (!states.has(workflow.initialState)) throw new Error(`Workflow initial state "${workflow.initialState}" is not listed in states`);
+  for (const state of states) {
+    if (!workflowField.options?.includes(state)) throw new Error(`Workflow state "${state}" is not an option of "${doctype.name}.${workflow.field}"`);
+  }
+  const endpoints = new Set<string>();
+  for (const transition of workflow.transitions) {
+    if (!states.has(transition.to)) throw new Error(`Workflow transition "${transition.action}" targets unknown state "${transition.to}"`);
+    if (new Set(transition.from).size !== transition.from.length) throw new Error(`Workflow transition "${transition.action}" repeats a source state`);
+    for (const from of transition.from) {
+      if (!states.has(from)) throw new Error(`Workflow transition "${transition.action}" starts from unknown state "${from}"`);
+      const endpoint = `${transition.action}\u0000${from}`;
+      if (endpoints.has(endpoint)) throw new Error(`Workflow action "${transition.action}" is ambiguous from state "${from}"`);
+      endpoints.add(endpoint);
+    }
+  }
+}
+
+function assertAppReferences(app: AppDefinition): void {
+  const doctypes = new Map(app.modules.flatMap((module) => module.doctypes).map((doctype) => [doctype.name, doctype]));
+  for (const doctype of doctypes.values()) {
+    for (const field of doctype.fields) {
+      if (field.type === "link" && !doctypes.has(field.linkTo!)) {
+        throw new Error(`Link field "${doctype.name}.${field.name}" targets unknown DocType "${field.linkTo}"`);
+      }
+    }
+  }
+  for (const module of app.modules) {
+    for (const [hookName, hooks] of Object.entries(module.hooks ?? {})) {
+      for (const doctype of Object.keys(hooks ?? {})) {
+        if (!doctypes.has(doctype)) throw new Error(`Hook "${hookName}" in module "${module.id}" targets unknown DocType "${doctype}"`);
       }
     }
   }

@@ -664,6 +664,17 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         }
       };
     }
+    for (const operation of ["submit", "cancel"] as const) {
+      paths[`${itemPath}/${operation}`] = {
+        post: {
+          operationId: `${operation}${pascal(doctype.name)}`,
+          summary: `${operation === "submit" ? "Submit" : "Cancel"} a ${doctype.label} document`,
+          tags: [doctype.label],
+          parameters: [pathParam("id"), expectedRevisionParam(), idempotencyKeyParam()],
+          responses: okResponse(ref(recordName))
+        }
+      };
+    }
   }
 
   return {
@@ -769,12 +780,13 @@ function roleWriteSchema(creating: boolean): JsonSchema {
 function documentRecordSchema(dataSchema: JsonSchema): JsonSchema {
   return {
     type: "object",
-    required: ["id", "doctype", "tenantId", "revision", "data", "createdAt", "updatedAt"],
+    required: ["id", "doctype", "tenantId", "revision", "documentStatus", "data", "createdAt", "updatedAt"],
     properties: {
       id: { type: "string" },
       doctype: { type: "string" },
       tenantId: { type: "string" },
       revision: { type: "integer" },
+      documentStatus: { type: "string", enum: ["draft", "submitted", "cancelled"] },
       data: dataSchema,
       state: { type: "string" },
       createdAt: { type: "string", format: "date-time" },

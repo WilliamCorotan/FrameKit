@@ -44,6 +44,7 @@ type DocumentRecord = {
   id: string;
   doctype: string;
   state?: string;
+  documentStatus: "draft" | "submitted" | "cancelled";
   data: Record<string, unknown>;
   updatedAt: string;
 };
@@ -234,6 +235,20 @@ function App() {
     }
   }
 
+  async function changeDocumentStatus(action: "submit" | "cancel") {
+    if (!active || !selected) return;
+    try {
+      setStatus(action === "submit" ? "Submitting…" : "Cancelling…");
+      const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/${action}`, { method: "POST", token });
+      setSelected(record);
+      setDraft(record.data);
+      await refresh(active.name, query, page);
+      setStatus(action === "submit" ? "Submitted" : "Cancelled");
+    } catch (error) {
+      setStatus(errorMessage(error));
+    }
+  }
+
   async function removeDocument() {
     if (!active || !selected || !window.confirm(`Delete ${selected.id}? This cannot be undone.`)) {
       return;
@@ -260,7 +275,7 @@ function App() {
   const listFields = active ? orderedFields(active, listViewFields, active.fields.filter((field) => field.inList).map((field) => field.name)).slice(0, 4) : [];
   const formFields = active ? orderedFields(active, formViewFields, active.fields.map((field) => field.name)) : [];
   const availableTransitions =
-    active?.workflow && selected
+    active?.workflow && selected?.documentStatus === "draft"
       ? active.workflow.transitions.filter((transition) => transition.from.includes(selected.state ?? active.workflow!.initialState))
       : [];
 
@@ -357,8 +372,10 @@ function App() {
                 <h2>{active?.description ?? "Metadata-generated form"}</h2>
               </div>
               <div className="editor-actions">
-                {selected ? <button className="danger" onClick={() => void removeDocument()}><Trash2 size={16} /> Delete</button> : null}
-                <button className="primary" onClick={() => void save()}><Save size={16} /> Save</button>
+                {selected?.documentStatus === "draft" ? <button onClick={() => void changeDocumentStatus("submit")}><Check size={16} /> Submit</button> : null}
+                {selected?.documentStatus === "submitted" ? <button onClick={() => void changeDocumentStatus("cancel")}><Activity size={16} /> Cancel</button> : null}
+                {selected?.documentStatus === "draft" ? <button className="danger" onClick={() => void removeDocument()}><Trash2 size={16} /> Delete</button> : null}
+                <button className="primary" onClick={() => void save()} disabled={selected?.documentStatus !== undefined && selected.documentStatus !== "draft"}><Save size={16} /> Save</button>
               </div>
             </div>
 

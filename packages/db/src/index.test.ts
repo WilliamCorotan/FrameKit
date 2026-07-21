@@ -19,6 +19,7 @@ import {
 describe("db migration sql", () => {
   it("defines document and user tables", () => {
     expect(createDocumentTableSql()).toContain("framekit_documents");
+    expect(createDocumentTableSql()).toContain("document_status text not null default 'draft'");
     expect(createUserTableSql()).toContain("framekit_users");
     expect(createUserTableSql()).toContain("password_hash");
     expect(createUserTableSql()).toContain("disabled_at");

@@ -167,9 +167,9 @@ describe("runtime document service", () => {
 
     const doctype = app.modules[0]!.doctypes[0]!;
     const missingAndNull = [
-      { id: "missing", doctype: "deal", tenantId: tenant.tenantId, revision: 1, data: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
-      { id: "null", doctype: "deal", tenantId: tenant.tenantId, revision: 1, data: { amount: null }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
-      { id: "zero", doctype: "deal", tenantId: tenant.tenantId, revision: 1, data: { amount: 0 }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }
+      { id: "missing", doctype: "deal", tenantId: tenant.tenantId, revision: 1, documentStatus: "draft" as const, data: {}, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
+      { id: "null", doctype: "deal", tenantId: tenant.tenantId, revision: 1, documentStatus: "draft" as const, data: { amount: null }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" },
+      { id: "zero", doctype: "deal", tenantId: tenant.tenantId, revision: 1, documentStatus: "draft" as const, data: { amount: 0 }, createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z" }
     ];
     expect(applyFilters(missingAndNull, { amount: { lte: 0 } }, doctype).map((record) => record.id)).toEqual(["zero"]);
 
@@ -314,6 +314,63 @@ describe("runtime document service", () => {
     await expect(runtime.outboxEvents(tenant)).resolves.toEqual([expect.objectContaining({ payload: expect.objectContaining({ id: "b" }) })]);
   });
 
+  it("orders validation hooks and enforces draft, submit, and cancel semantics", async () => {
+    const hooks: string[] = [];
+    const invoice = defineDocType({
+      name: "invoice",
+      label: "Invoice",
+      naming: { field: "title" },
+      fields: [
+        { name: "title", label: "Title", type: "text", required: true },
+        { name: "system_code", label: "System Code", type: "text", readOnly: true, default: "LOCKED" }
+      ],
+      permissions: ["create", "read", "update", "delete", "submit", "cancel"].map((action) => ({
+        action: action as "create" | "read" | "update" | "delete" | "submit" | "cancel",
+        permissions: ["crm.customer"]
+      }))
+    });
+    const runtime = createRuntime(defineApp({
+      name: "Lifecycle",
+      modules: [defineModule({
+        id: "billing",
+        name: "Billing",
+        doctypes: [invoice],
+        hooks: {
+          beforeValidate: { invoice: [({ input }) => { hooks.push("beforeValidate"); if (typeof input?.title === "string") input.title = input.title.trim(); }] },
+          beforeInsert: { invoice: [() => { hooks.push("beforeInsert"); }] },
+          afterInsert: { invoice: [() => { hooks.push("afterInsert"); }] },
+          beforeUpdate: { invoice: [() => { hooks.push("beforeUpdate"); }] },
+          afterUpdate: { invoice: [() => { hooks.push("afterUpdate"); }] },
+          beforeSubmit: { invoice: [() => { hooks.push("beforeSubmit"); }] },
+          afterSubmit: { invoice: [() => { hooks.push("afterSubmit"); }] },
+          beforeCancel: { invoice: [() => { hooks.push("beforeCancel"); }] },
+          afterCancel: { invoice: [() => { hooks.push("afterCancel"); }] }
+        }
+      })]
+    }));
+
+    const created = await runtime.create(tenant, "invoice", { title: "  July Invoice  " });
+    expect(created).toMatchObject({ id: "july-invoice", documentStatus: "draft", data: { title: "July Invoice", system_code: "LOCKED" } });
+    expect(hooks).toEqual(["beforeValidate", "beforeInsert", "afterInsert"]);
+    const updated = await runtime.update(tenant, "invoice", created.id, { title: " Updated ", system_code: "FORGED" }, { expectedRevision: 1 });
+    expect(updated).toMatchObject({ revision: 2, data: { title: "Updated", system_code: "LOCKED" } });
+    const submitted = await runtime.submit(tenant, "invoice", created.id, { expectedRevision: 2, idempotencyKey: "submit-1" });
+    expect(submitted).toMatchObject({ revision: 3, documentStatus: "submitted" });
+    await expect(runtime.update(tenant, "invoice", created.id, { title: "Too Late" })).rejects.toMatchObject({ code: "DOCUMENT_NOT_DRAFT" });
+    await expect(runtime.delete(tenant, "invoice", created.id)).rejects.toMatchObject({ code: "DOCUMENT_NOT_DRAFT" });
+    await expect(runtime.submit(tenant, "invoice", created.id)).rejects.toMatchObject({ code: "INVALID_DOCUMENT_STATUS" });
+    const cancelled = await runtime.cancel(tenant, "invoice", created.id, { expectedRevision: 3 });
+    expect(cancelled).toMatchObject({ revision: 4, documentStatus: "cancelled" });
+    expect(hooks).toEqual([
+      "beforeValidate", "beforeInsert", "afterInsert",
+      "beforeValidate", "beforeUpdate", "afterUpdate",
+      "beforeValidate", "beforeSubmit", "afterSubmit",
+      "beforeValidate", "beforeCancel", "afterCancel"
+    ]);
+    expect((await runtime.auditTrail(tenant)).map((event) => event.action)).toEqual(expect.arrayContaining(["submit", "cancel"]));
+    expect((await runtime.outboxEvents(tenant)).map((event) => event.type)).toEqual(expect.arrayContaining(["invoice.submitted", "invoice.cancelled"]));
+  });
+
   it("runs workflow transitions", async () => {
     const app = defineApp({
       name: "CRM",
@@ -325,7 +382,10 @@ describe("runtime document service", () => {
             defineDocType({
               name: "deal",
               label: "Deal",
-              fields: [{ name: "title", label: "Title", type: "text", required: true }],
+              fields: [
+                { name: "title", label: "Title", type: "text", required: true },
+                { name: "stage", label: "Stage", type: "select", options: ["open", "won"] }
+              ],
               permissions: [{ action: "create", roles: ["sales_manager"] }, { action: "read", roles: ["sales_manager"] }, { action: "transition", roles: ["sales_manager"] }],
               workflow: {
                 field: "stage",
@@ -432,6 +492,14 @@ describe("runtime document service", () => {
 
     expect(created.data.region).toBe("apac");
     expect(metadata.modules[0]?.doctypes[0]?.fields.map((field) => field.name)).toContain("region");
+    await expect(runtime.addCustomField(tenant, {
+      doctype: "customer",
+      field: { name: "invalid_select", label: "Invalid", type: "select" }
+    })).rejects.toThrow("requires options");
+    await expect(runtime.addCustomField(tenant, {
+      doctype: "customer",
+      field: { name: "missing_link", label: "Missing", type: "link", linkTo: "unknown" }
+    })).rejects.toMatchObject({ code: "DOCTYPE_NOT_FOUND" });
   });
 
   it("stores tenant view metadata", async () => {
@@ -576,20 +644,18 @@ describe("runtime document service", () => {
     const replacementRecord = await replacementRuntime.applyMigration(tenant, replacementPlan, { allowDestructive: true });
     await expect(replacementRuntime.rollbackMigration(tenant, replacementRecord, { allowDestructive: true })).rejects.toMatchObject({ code: "IRREVERSIBLE_MIGRATION" });
 
-    const invalidLinks = defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+    expect(() => defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
       name: "order",
       label: "Order",
       fields: [{ name: "customer", label: "Customer", type: "link", linkTo: "missing" }]
-    })] })] });
-    await expect(createRuntime(current).planMigration(tenant, invalidLinks)).rejects.toMatchObject({ code: "INVALID_MIGRATION_METADATA" });
+    })] })] })).toThrow(/unknown DocType "missing"/);
 
-    const invalidViews = defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
+    expect(() => defineApp({ name: "Migration State", modules: [defineModule({ id: "crm", name: "CRM", doctypes: [defineDocType({
       name: "customer",
       label: "Customer",
       fields: [{ name: "name", label: "Name", type: "text" }],
       views: [{ id: "customer.list", doctype: "customer", type: "list", fields: ["missing"] }]
-    })] })] });
-    await expect(createRuntime(current).planMigration(tenant, invalidViews)).rejects.toMatchObject({ code: "INVALID_MIGRATION_METADATA" });
+    })] })] })).toThrow(/unknown field "missing"/);
   });
 
   it("generates predictable naming series", async () => {
