@@ -58,6 +58,25 @@ const dealDocType = defineDocType({
   ]
 });
 
+const approvalDocType = defineDocType({
+  name: "approval",
+  label: "Approval",
+  fields: [
+    { name: "title", label: "Title", type: "text", required: true },
+    { name: "status", label: "Status", type: "select", options: ["pending", "approved"], required: true }
+  ],
+  permissions: [
+    { action: "create", permissions: ["crm.approval"] },
+    { action: "read", permissions: ["crm.approval"] }
+  ],
+  workflow: {
+    field: "status",
+    initialState: "pending",
+    states: ["pending", "approved"],
+    transitions: [{ action: "approve", from: ["pending"], to: "approved" }]
+  }
+});
+
 const queryDocType = defineDocType({
   name: "query_record",
   label: "Query Record",
@@ -73,7 +92,7 @@ const queryDocType = defineDocType({
 
 const app = defineApp({
   name: "Postgres Integration",
-  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType] })]
+  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType] })]
 });
 
 describe.skipIf(!connectionString)("Postgres durable stores", () => {
@@ -148,6 +167,9 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
 
     await expect(runtime.create(tenant, "deal", { title: "First Deal" })).resolves.toMatchObject({ id: "DEAL-0001" });
     await expect(runtime.create(tenant, "deal", { title: "Second Deal" })).resolves.toMatchObject({ id: "DEAL-0002" });
+    const approval = await runtime.create(tenant, "approval", { title: "Persist initial workflow state" });
+    await expect(runtime.get(tenant, "approval", approval.id)).resolves.toMatchObject({ state: "pending", data: { status: "pending" } });
+    await expect(runtime.create(tenant, "approval", { title: "Conflicting state", status: "approved" })).rejects.toMatchObject({ code: "INVALID_INITIAL_STATE" });
 
     await expect(runtime.auditTrail(tenant)).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ action: "create", doctype: "customer", documentId: customer.id }),
@@ -173,7 +195,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
               ...customerDocType,
               fields: [...customerDocType.fields, { name: "segment", label: "Segment", type: "text" }]
             }),
-            dealDocType
+            dealDocType,
+            approvalDocType
           ]
         })
       ]

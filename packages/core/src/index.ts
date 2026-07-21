@@ -379,6 +379,9 @@ function assertDocTypeInvariants(doctype: DocTypeDefinition): void {
   const workflowField = fields.get(workflow.field);
   if (!workflowField) throw new Error(`Workflow field "${workflow.field}" does not exist on "${doctype.name}"`);
   if (workflowField.type !== "select") throw new Error(`Workflow field "${doctype.name}.${workflow.field}" must be select`);
+  if (workflowField.default !== undefined && workflowField.default !== workflow.initialState) {
+    throw new Error(`Workflow field default for "${doctype.name}.${workflow.field}" must match initial state "${workflow.initialState}"`);
+  }
   if (new Set(workflow.states).size !== workflow.states.length) throw new Error(`Workflow on "${doctype.name}" has duplicate states`);
   const states = new Set(workflow.states);
   if (!states.has(workflow.initialState)) throw new Error(`Workflow initial state "${workflow.initialState}" is not listed in states`);

@@ -9,6 +9,7 @@ Framekit 1.0 treats metadata as a versioned contract shared by core, runtime, pe
 - Indexes, naming fields, views, workflow fields, workflow states, transition endpoints, and hook DocType references must resolve without ambiguity.
 - Tenant custom fields are checked against the same field and link invariants before persistence.
 - Every document starts as `draft`, may be submitted once, and may then be cancelled once: `draft -> submitted -> cancelled`.
+- New workflow documents always persist the configured initial value in both lifecycle `state` and `data[workflow.field]`. Callers cannot select another initial value; a workflow-field default is optional, but when present it must equal the workflow initial state.
 - Update, delete, and workflow transition commands only accept draft documents. Submitted and cancelled records remain readable but immutable.
 - Submit and cancel are permission-checked, revision-aware, idempotency-aware atomic commands. They write the document, audit event, and outbox event together and invoke their lifecycle hooks.
 - Mutation ordering is `beforeValidate`, coercion/reference/unique validation, command-specific `before*`, atomic write, then command-specific `after*`. Read-only values already stored on a document cannot be overwritten by update input.

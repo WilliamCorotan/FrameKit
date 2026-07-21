@@ -384,7 +384,7 @@ describe("runtime document service", () => {
               label: "Deal",
               fields: [
                 { name: "title", label: "Title", type: "text", required: true },
-                { name: "stage", label: "Stage", type: "select", options: ["open", "won"] }
+                { name: "stage", label: "Stage", type: "select", options: ["open", "won"], required: true }
               ],
               permissions: [{ action: "create", roles: ["sales_manager"] }, { action: "read", roles: ["sales_manager"] }, { action: "transition", roles: ["sales_manager"] }],
               workflow: {

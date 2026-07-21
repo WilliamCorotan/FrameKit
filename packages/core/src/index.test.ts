@@ -48,6 +48,18 @@ describe("core metadata", () => {
     expect(() => defineDocType({
       name: "deal",
       label: "Deal",
+      fields: [{ name: "stage", label: "Stage", type: "select", options: ["open", "won"], default: "won" }],
+      workflow: { field: "stage", initialState: "open", states: ["open", "won"] }
+    })).toThrow(/must match initial state "open"/);
+    expect(defineDocType({
+      name: "deal",
+      label: "Deal",
+      fields: [{ name: "stage", label: "Stage", type: "select", options: ["open", "won"], default: "open" }],
+      workflow: { field: "stage", initialState: "open", states: ["open", "won"] }
+    }).workflow?.initialState).toBe("open");
+    expect(() => defineDocType({
+      name: "deal",
+      label: "Deal",
       fields: [{ name: "sequence", label: "Sequence", type: "number" }],
       naming: { field: "sequence" }
     })).toThrow(/must be text/);
