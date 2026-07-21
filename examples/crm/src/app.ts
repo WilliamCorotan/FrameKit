@@ -15,6 +15,18 @@ import {
   PostgresUserStore
 } from "@framekit/db";
 import { InMemoryEventBus } from "@framekit/realtime";
+import { assertSecureProductionCredentials } from "@framekit/nitro";
+
+const environment = process.env.NODE_ENV ?? "development";
+const authSecret = process.env.FRAMEKIT_AUTH_SECRET ?? "development-secret-change-me";
+const bootstrapEmail = process.env.FRAMEKIT_ADMIN_EMAIL ?? "admin@example.com";
+const bootstrapPassword = process.env.FRAMEKIT_ADMIN_PASSWORD ?? "admin12345";
+
+assertSecureProductionCredentials({
+  environment,
+  authSecret,
+  bootstrap: { email: bootstrapEmail, password: bootstrapPassword }
+});
 
 export const customerDocType = defineDocType({
   name: "customer",
@@ -136,7 +148,7 @@ export const runtime = createRuntime(app, {
   realtime: eventBus
 });
 export const auth = new PasswordAuthService({
-  secret: process.env.FRAMEKIT_AUTH_SECRET ?? "development-secret-change-me",
+  secret: authSecret,
   userStore,
   roleStore,
   apiTokenStore,
@@ -258,9 +270,9 @@ async function createUserStore() {
   const admin = {
     id: "admin",
     tenantId: "default",
-    email: process.env.FRAMEKIT_ADMIN_EMAIL ?? "admin@example.com",
+    email: bootstrapEmail,
     name: "Framekit Admin",
-    passwordHash: await hashPassword(process.env.FRAMEKIT_ADMIN_PASSWORD ?? "admin12345", "framekit-dev-salt"),
+    passwordHash: await hashPassword(bootstrapPassword, "framekit-dev-salt"),
     roles: ["administrator"],
     permissions: ["*"]
   };

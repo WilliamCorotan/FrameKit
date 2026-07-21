@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, type RuntimeRealtimeEvent } from "@framekit/runtime";
-import { createNitroHandler } from "./index.js";
+import { assertSecureProductionCredentials, createNitroHandler } from "./index.js";
 
 describe("createNitroHandler", () => {
   it("emits telemetry hooks and applies the optional rate limiter", async () => {
@@ -33,7 +33,7 @@ describe("createNitroHandler", () => {
     const fetch = toWebHandler(h3);
 
     const first = await fetch(new Request("http://localhost/health", { headers: { "x-forwarded-for": "203.0.113.10" } }));
-    const second = await fetch(new Request("http://localhost/health", { headers: { "x-forwarded-for": "203.0.113.10" } }));
+    const second = await fetch(new Request("http://localhost/health", { headers: { "x-forwarded-for": "203.0.113.11" } }));
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(429);
@@ -97,7 +97,7 @@ describe("createNitroHandler", () => {
     expect(cookie).toBeDefined();
     expect(cookie).toContain("fk_session=");
 
-    const cookieHeaders = { cookie: cookie!.split(";")[0]! };
+    const cookieHeaders = { cookie: cookie!.split(";")[0]!, origin: "http://localhost" };
     const me = await json<{ context: { userId: string } }>(fetch, "/api/auth/me", { headers: cookieHeaders });
     expect(me.context.userId).toBe("admin");
     await expect(json(fetch, "/api/auth/me", { headers: { authorization: `Bearer ${loginBody.token}` } })).resolves.toMatchObject({ context: { userId: "admin" } });
@@ -110,10 +110,169 @@ describe("createNitroHandler", () => {
 
     const logout = await fetch(new Request("http://localhost/api/auth/logout", {
       method: "POST",
-      headers: { cookie: refreshedCookie!.split(";")[0]! }
+      headers: { cookie: refreshedCookie!.split(";")[0]!, origin: "http://localhost" }
     }));
     expect(logout.status).toBe(204);
     expect(logout.headers.getSetCookie()[0]).toContain("Max-Age=0");
+  });
+
+  it("applies credentialed CORS only to allowlisted origins", async () => {
+    const runtime = createRuntime(defineApp({ name: "CORS", modules: [] }));
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, {
+      cors: { origins: ["https://desk.example.test"], credentials: true }
+    }));
+    const fetch = toWebHandler(h3);
+
+    const allowed = await fetch(new Request("http://internal/health", {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://desk.example.test",
+        "access-control-request-method": "GET"
+      }
+    }));
+    expect(allowed.status).toBe(204);
+    expect(allowed.headers.get("access-control-allow-origin")).toBe("https://desk.example.test");
+    expect(allowed.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(allowed.headers.get("vary")).toContain("Origin");
+
+    const denied = await fetch(new Request("http://internal/health", {
+      method: "OPTIONS",
+      headers: {
+        origin: "https://attacker.example",
+        "access-control-request-method": "GET"
+      }
+    }));
+    expect(denied.status).toBe(403);
+    await expect(denied.json()).resolves.toMatchObject({ code: "CORS_ORIGIN_DENIED" });
+
+    const noCorsH3 = new H3();
+    noCorsH3.all("/**", createNitroHandler(runtime));
+    const noCors = await toWebHandler(noCorsH3)(new Request("http://internal/health", {
+      headers: { origin: "https://desk.example.test" }
+    }));
+    expect(noCors.headers.get("access-control-allow-origin")).toBeNull();
+    expect(() => createNitroHandler(runtime, { cors: { origins: ["*"], credentials: true } })).toThrow(
+      "Credentialed CORS cannot use the wildcard origin"
+    );
+  });
+
+  it("enforces cookie CSRF origins and trusts proxy origin headers only when configured", async () => {
+    const runtime = createRuntime(defineApp({ name: "CSRF", modules: [] }));
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      userStore: new InMemoryUserStore([{
+        tenantId: "default",
+        id: "admin",
+        email: "admin@example.com",
+        name: "Admin",
+        passwordHash: await hashPassword("admin-password"),
+        roles: ["administrator"],
+        permissions: ["*"]
+      }])
+    });
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, { auth }));
+    const fetch = toWebHandler(h3);
+    const login = await fetch(new Request("http://internal/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "admin@example.com", password: "admin-password" })
+    }));
+    const cookie = login.headers.getSetCookie()[0]!.split(";")[0]!;
+
+    const missingOrigin = await fetch(new Request("http://internal/api/auth/logout", {
+      method: "POST",
+      headers: { cookie }
+    }));
+    expect(missingOrigin.status).toBe(403);
+    await expect(missingOrigin.json()).resolves.toMatchObject({ code: "CSRF_ORIGIN_REQUIRED" });
+
+    const spoofedProxy = await fetch(new Request("http://internal/api/auth/logout", {
+      method: "POST",
+      headers: {
+        cookie,
+        origin: "https://app.example.test",
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "app.example.test"
+      }
+    }));
+    expect(spoofedProxy.status).toBe(403);
+    await expect(spoofedProxy.json()).resolves.toMatchObject({ code: "CSRF_ORIGIN_DENIED" });
+
+    const proxyH3 = new H3();
+    proxyH3.all("/**", createNitroHandler(runtime, { auth, security: { trustProxy: true } }));
+    const trustedProxy = await toWebHandler(proxyH3)(new Request("http://internal/api/auth/logout", {
+      method: "POST",
+      headers: {
+        cookie,
+        origin: "https://app.example.test",
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "app.example.test"
+      }
+    }));
+    expect(trustedProxy.status).toBe(204);
+  });
+
+  it("uses production cookie and credential safeguards while keeping development explicit", async () => {
+    const runtime = createRuntime(defineApp({ name: "Production", modules: [] }));
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length",
+      userStore: new InMemoryUserStore([{
+        tenantId: "default",
+        id: "admin",
+        email: "ops@company.test",
+        name: "Admin",
+        passwordHash: await hashPassword("production-test-password"),
+        roles: ["administrator"],
+        permissions: ["*"]
+      }])
+    });
+    vi.stubEnv("NODE_ENV", "production");
+    try {
+      expect(() => createNitroHandler(runtime, { authCookie: { secure: false } })).toThrow(
+        "Session cookies must use Secure"
+      );
+      expect(() => createNitroHandler(runtime, { authCookie: { sameSite: "none", secure: false } })).toThrow(
+        "Session cookies must use Secure"
+      );
+      expect(() => createNitroHandler(runtime)).not.toThrow();
+
+      expect(() => assertSecureProductionCredentials({ authSecret: "development-secret-change-me" })).toThrow("FRAMEKIT_AUTH_SECRET");
+      expect(() => assertSecureProductionCredentials({
+        authSecret: "C8oY!6nq2Wz7Lk4pR9sV5xB3mJ1hT0uF",
+        bootstrap: { email: "admin@example.com", password: "A strong bootstrap passphrase" }
+      })).toThrow("bootstrap email");
+      expect(() => assertSecureProductionCredentials({
+        authSecret: "C8oY!6nq2Wz7Lk4pR9sV5xB3mJ1hT0uF",
+        bootstrap: { email: "ops@company.test", password: "A strong bootstrap passphrase" }
+      })).not.toThrow();
+
+      expect(() => createNitroHandler(runtime, {
+        cors: { origins: ["http://desk.example.test"], credentials: true }
+      })).toThrow("cors.origins must use HTTPS");
+
+      const productionH3 = new H3();
+      productionH3.all("/**", createNitroHandler(runtime, { auth }));
+      const response = await toWebHandler(productionH3)(new Request("https://app.example.test/health"));
+      expect(response.headers.get("strict-transport-security")).toContain("max-age=31536000");
+      expect(response.headers.get("permissions-policy")).toContain("camera=()");
+      expect(response.headers.get("cross-origin-resource-policy")).toBe("same-site");
+      const login = await toWebHandler(productionH3)(new Request("https://app.example.test/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: "ops@company.test", password: "production-test-password" })
+      }));
+      expect(login.headers.getSetCookie()[0]).toContain("Secure");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(() => assertSecureProductionCredentials({
+      environment: "development",
+      authSecret: "development-secret-change-me",
+      bootstrap: { email: "admin@example.com", password: "admin12345" }
+    })).not.toThrow();
   });
 
   it("requires authenticated identity, ignores forged identity headers, and enforces operations permissions", async () => {

@@ -14,9 +14,14 @@ Recommended production environment:
 
 - `DATABASE_URL`: Postgres connection string for document, auth, audit, customization, naming series, migration, and outbox stores.
 - `REDIS_URL`: Redis connection string for BullMQ-backed queues.
-- `FRAMEKIT_AUTH_SECRET`: high-entropy secret used to sign sessions.
-- `FRAMEKIT_ADMIN_EMAIL` and `FRAMEKIT_ADMIN_PASSWORD`: initial CRM admin seed credentials.
+- `FRAMEKIT_AUTH_SECRET`: at least 32 characters from a cryptographically random source, used to sign sessions.
+- `FRAMEKIT_ADMIN_EMAIL` and `FRAMEKIT_ADMIN_PASSWORD`: explicitly provisioned initial CRM admin credentials; example values are rejected.
+- `FRAMEKIT_ALLOWED_ORIGINS`: exact comma-separated HTTPS origins allowed to make credentialed browser requests.
+- `FRAMEKIT_COOKIE_SAME_SITE`: `lax` by default; use `none` only for an HTTPS cross-site Desk deployment.
+- `FRAMEKIT_TRUST_PROXY`: keep `false` unless a trusted proxy sanitizes and replaces forwarded host/protocol headers.
 - `NITRO_PRESET=node-server`: Node container output.
+
+Start from `.env.production.example` and supply its blank secret values through your deployment platform. The root `.env.example` contains development-only credentials and must not be promoted to production. `docker-compose.yml` refuses to start until the production credentials and origin allowlist are provided.
 
 Run `pnpm audit:all` before building the image. For durable deployments, run the app once with Postgres connectivity so store `migrate()` calls can create or update framework tables.
 
@@ -55,3 +60,5 @@ pnpm audit:all
 ```
 
 Add service-backed smoke checks for Postgres, Redis, and the built Nitro server before promoting a release candidate.
+
+See [Deployment Security](security.md) for the threat model, cookie/CSRF behavior, CORS rules, proxy trust boundary, and production checklist.
