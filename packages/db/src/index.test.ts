@@ -7,7 +7,7 @@ import {
   createCustomFieldTableSql,
   createDocumentTableSql,
   createMigrationTableSql,
-  migrationConversionCodeDigest,
+  migrationConversionArtifactDigest,
   createNamingSeriesTableSql,
   createOutboxTableSql,
   createPostgresMigrationSql,
@@ -15,7 +15,8 @@ import {
   createRoleTableSql,
   createSessionRevocationTableSql,
   createUserTableSql,
-  createViewTableSql
+  createViewTableSql,
+  PostgresMigrationStore
 } from "./index.js";
 
 describe("db migration sql", () => {
@@ -52,21 +53,20 @@ describe("db migration sql", () => {
     expect(createMigrationTableSql()).toContain("checksum");
   });
 
-  it("binds online conversion digests to the descriptor and implementation", async () => {
-    const descriptor = {
-      id: "customer-score-number",
-      version: 1,
-      doctype: "customer",
-      field: "score",
-      fromType: "text",
-      toType: "number"
-    };
-    const convert = (value: unknown) => Number(value);
-    const digest = await migrationConversionCodeDigest({ ...descriptor, convert });
+  it("hashes immutable conversion artifacts and rejects duplicate registry identities", async () => {
+    const artifactDigest = await migrationConversionArtifactDigest("compiled conversion module v1");
+    await expect(migrationConversionArtifactDigest("compiled conversion module v1")).resolves.toBe(artifactDigest);
+    await expect(migrationConversionArtifactDigest("compiled conversion module v2")).resolves.not.toBe(artifactDigest);
+    const artifact = { id: "customer-score-number", version: 1, artifactDigest, convert: (value: unknown) => Number(value) };
 
-    await expect(migrationConversionCodeDigest({ ...descriptor, convert })).resolves.toBe(digest);
-    await expect(migrationConversionCodeDigest({ ...descriptor, field: "other", convert })).resolves.not.toBe(digest);
-    await expect(migrationConversionCodeDigest({ ...descriptor, convert: () => 42 })).resolves.not.toBe(digest);
+    expect(() => new PostgresMigrationStore({
+      connectionString: "postgres://localhost/framekit_registry_validation",
+      conversionRegistry: [artifact, { ...artifact }]
+    })).toThrow(/registered more than once/);
+    expect(() => new PostgresMigrationStore({
+      connectionString: "postgres://localhost/framekit_registry_validation",
+      conversionRegistry: [{ ...artifact, id: "bound-conversion", convert: artifact.convert.bind(null) }]
+    })).toThrow(/native or bound function/);
   });
 
   it("generates executable SQL for JSON document migration plans", async () => {

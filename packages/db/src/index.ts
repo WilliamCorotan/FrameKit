@@ -22,7 +22,7 @@ import {
   type ListOptions,
   type MigrationChange,
   type MigrationConversion,
-  type MigrationConversionHook,
+  type MigrationConversionArtifact,
   type MigrationPlan,
   type MigrationRecord,
   type MigrationRollback,
@@ -270,6 +270,7 @@ export type PostgresMigrationStage = "statement" | "backfill" | "online_chunk" |
 
 export type PostgresMigrationStoreOptions = PostgresRepositoryOptions & {
   faultInjector?: (stage: PostgresMigrationStage, plan: MigrationPlan, statementIndex?: number) => void | Promise<void>;
+  conversionRegistry?: readonly MigrationConversionArtifact[];
 };
 
 export type PostgresRealtimeStage = "locked" | "inserted";
@@ -1447,8 +1448,10 @@ export class PostgresMigrationStore implements MigrationStore {
   private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
   private readonly faultInjector?: PostgresMigrationStoreOptions["faultInjector"];
+  private readonly conversionRegistry: ReadonlyMap<string, Readonly<MigrationConversionArtifact>>;
 
   constructor(options: PostgresMigrationStoreOptions) {
+    this.conversionRegistry = createOnlineConversionRegistry(options.conversionRegistry ?? []);
     this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
     this.db = drizzle(this.sql);
     this.faultInjector = options.faultInjector;
@@ -1561,7 +1564,7 @@ export class PostgresMigrationStore implements MigrationStore {
   async applyOnlinePlan(tenant: TenantContext, plan: MigrationPlan, options: OnlineMigrationOptions): Promise<MigrationRecord> {
     await validateMigrationPlan(plan);
     assertMigrationIdentity(tenant, plan.appName, plan);
-    const conversions = await validateOnlineConversions(plan, options.conversionHooks);
+    const conversions = validateOnlineConversions(plan, this.conversionRegistry);
     const conversionDigest = await onlineConversionDigest(conversions);
     validateOnlineOptions(plan, options);
     const attemptId = crypto.randomUUID();
@@ -1599,7 +1602,7 @@ export class PostgresMigrationStore implements MigrationStore {
           tenant,
           plan,
           options.lockTimeoutMs ?? 5_000,
-          async (sql) => this.transformOnlineChunk(sql, tenant, plan, conversions, options.conversionHooks, conversionDigest, chunkSize, attemptId)
+          async (sql) => this.transformOnlineChunk(sql, tenant, plan, conversions, this.conversionRegistry, conversionDigest, chunkSize, attemptId)
         ));
         if (transformed) break;
       }
@@ -1655,7 +1658,7 @@ export class PostgresMigrationStore implements MigrationStore {
     tenant: TenantContext,
     plan: MigrationPlan,
     conversions: MigrationConversion[],
-    hooks: MigrationConversionHook[],
+    registry: ReadonlyMap<string, Readonly<MigrationConversionArtifact>>,
     conversionDigest: string,
     chunkSize: number,
     attemptId: string
@@ -1668,7 +1671,7 @@ export class PostgresMigrationStore implements MigrationStore {
     await sql`update framekit_migration_runs set attempt_id = ${attemptId}, status = 'running', updated_at = now()
       where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id} and status <> 'completed'`;
     const conversion = conversions[run.checkpoint.conversionIndex]!;
-    const hook = hooks.find((candidate) => candidate.id === conversion.id && candidate.version === conversion.version)!;
+    const artifact = registry.get(onlineConversionIdentity(conversion.id, conversion.version))!;
     const rows = await sql<{ id: string; data: Record<string, unknown> }[]>`
       select id, data from framekit_documents
       where tenant_id = ${tenant.tenantId} and doctype = ${conversion.doctype}
@@ -1677,8 +1680,8 @@ export class PostgresMigrationStore implements MigrationStore {
       for update
     `;
     for (const row of rows) {
-      const first = await hook.convert(structuredClone(row.data[conversion.field]), structuredClone(row.data));
-      const second = await hook.convert(structuredClone(row.data[conversion.field]), structuredClone(row.data));
+      const first = await artifact.convert(structuredClone(row.data[conversion.field]), structuredClone(row.data), immutableOnlineParameters(conversion.parameters));
+      const second = await artifact.convert(structuredClone(row.data[conversion.field]), structuredClone(row.data), immutableOnlineParameters(conversion.parameters));
       assertOnlineConversionValue(conversion, first, row.id);
       assertOnlineConversionValue(conversion, second, row.id);
       if (stableOnlineJson(first) !== stableOnlineJson(second)) {
@@ -2131,7 +2134,10 @@ function isoTimestamp(value: Date | string): string {
   return typeof value === "string" ? new Date(value).toISOString() : value.toISOString();
 }
 
-async function validateOnlineConversions(plan: MigrationPlan, hooks: MigrationConversionHook[]): Promise<MigrationConversion[]> {
+function validateOnlineConversions(
+  plan: MigrationPlan,
+  registry: ReadonlyMap<string, Readonly<MigrationConversionArtifact>>
+): MigrationConversion[] {
   const conversions = plan.conversions ?? [];
   const typeChanges = plan.changes.filter((change) => change.kind === "change_field_type");
   if (conversions.length !== typeChanges.length) {
@@ -2143,41 +2149,43 @@ async function validateOnlineConversions(plan: MigrationPlan, hooks: MigrationCo
     if (conversionIdentities.has(identity)) throw new FramekitError("DUPLICATE_MIGRATION_CONVERSION", `Conversion descriptor ${identity} is registered more than once.`, 422);
     conversionIdentities.add(identity);
   }
-  const hookIdentities = new Set<string>();
-  for (const hook of hooks) {
-    const identity = `${hook.id}@${hook.version}`;
-    if (hookIdentities.has(identity)) throw new FramekitError("DUPLICATE_MIGRATION_CONVERSION", `Conversion hook ${identity} is registered more than once.`, 422);
-    hookIdentities.add(identity);
-  }
   for (const conversion of conversions) {
-    const matches = hooks.filter((candidate) => candidate.id === conversion.id && candidate.version === conversion.version);
-    const hook = matches[0];
-    if (!hook) throw new FramekitError("MISSING_MIGRATION_CONVERSION", `Conversion hook ${conversion.id}@${conversion.version} is not registered.`, 422);
-    const derivedDigest = await migrationConversionCodeDigest({ ...conversion, convert: hook.convert });
-    if (hook.codeDigest !== derivedDigest || conversion.codeDigest !== derivedDigest) {
-      throw new FramekitError("MIGRATION_CONVERSION_DRIFT", `Conversion hook ${conversion.id}@${conversion.version} does not match the reviewed code digest.`, 409);
+    const artifact = registry.get(onlineConversionIdentity(conversion.id, conversion.version));
+    if (!artifact) throw new FramekitError("MISSING_MIGRATION_CONVERSION", `Conversion artifact ${conversion.id}@${conversion.version} is not registered.`, 422);
+    if (artifact.artifactDigest !== conversion.artifactDigest) {
+      throw new FramekitError("MIGRATION_CONVERSION_DRIFT", `Conversion artifact ${conversion.id}@${conversion.version} does not match the reviewed artifact digest.`, 409);
     }
   }
   return conversions;
 }
 
-export async function migrationConversionCodeDigest(
-  conversion: Omit<MigrationConversion, "codeDigest"> & Pick<MigrationConversionHook, "convert">
-): Promise<string> {
-  const descriptor = {
-    id: conversion.id,
-    version: conversion.version,
-    doctype: conversion.doctype,
-    field: conversion.field,
-    fromType: conversion.fromType,
-    toType: conversion.toType
-  };
-  const source = Function.prototype.toString.call(conversion.convert);
-  const bytes = new TextEncoder().encode(stableOnlineJson({ descriptor, source }));
+export async function migrationConversionArtifactDigest(artifact: string | Uint8Array): Promise<string> {
+  const bytes = typeof artifact === "string" ? new TextEncoder().encode(artifact) : Uint8Array.from(artifact);
   const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   let binary = "";
   for (const byte of digest) binary += String.fromCharCode(byte);
   return `sha256:${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")}`;
+}
+
+function createOnlineConversionRegistry(
+  artifacts: readonly MigrationConversionArtifact[]
+): ReadonlyMap<string, Readonly<MigrationConversionArtifact>> {
+  const registry = new Map<string, Readonly<MigrationConversionArtifact>>();
+  for (const artifact of artifacts) {
+    const identity = onlineConversionIdentity(artifact.id, artifact.version);
+    if (registry.has(identity)) throw new FramekitError("DUPLICATE_MIGRATION_CONVERSION", `Conversion artifact ${identity} is registered more than once.`, 422);
+    if (!artifact.id || !Number.isSafeInteger(artifact.version) || artifact.version < 1 || !/^sha256:[A-Za-z0-9_-]{43}$/.test(artifact.artifactDigest)) {
+      throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion artifact ${identity} requires a positive version and SHA-256 artifact digest.`, 422);
+    }
+    const source = Function.prototype.toString.call(artifact.convert);
+    if (source.includes("[native code]")) throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion artifact ${identity} cannot use a native or bound function.`, 422);
+    registry.set(identity, Object.freeze({ ...artifact }));
+  }
+  return registry;
+}
+
+function onlineConversionIdentity(id: string, version: number): string {
+  return `${id}@${version}`;
 }
 
 function validateOnlineOptions(plan: MigrationPlan, options: OnlineMigrationOptions): void {
@@ -2248,6 +2256,16 @@ function assertJsonSafeOnlineValue(value: unknown, path = "value", ancestors = n
     return;
   }
   throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} is not JSON-safe.`, 422);
+}
+
+function immutableOnlineParameters(parameters: MigrationConversion["parameters"]): MigrationConversion["parameters"] {
+  const cloned = structuredClone(parameters);
+  const freeze = (value: MigrationConversion["parameters"]): MigrationConversion["parameters"] => {
+    if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+    for (const item of Array.isArray(value) ? value : Object.values(value)) freeze(item);
+    return Object.freeze(value) as MigrationConversion["parameters"];
+  };
+  return freeze(cloned);
 }
 
 function assertOnlineConversionValue(conversion: MigrationConversion, value: unknown, documentId: string): void {

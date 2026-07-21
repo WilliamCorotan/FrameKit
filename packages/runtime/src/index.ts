@@ -201,8 +201,11 @@ export type MigrationConversion = {
   field: string;
   fromType: string;
   toType: string;
-  codeDigest: string;
+  parameters: MigrationConversionParameters;
+  artifactDigest: string;
 };
+
+export type MigrationConversionParameters = null | boolean | number | string | MigrationConversionParameters[] | { [key: string]: MigrationConversionParameters };
 
 export type MigrationApproval = {
   approver: string;
@@ -211,11 +214,11 @@ export type MigrationApproval = {
   outcome: "approved" | "rejected";
 };
 
-export type MigrationConversionHook = {
+export type MigrationConversionArtifact = {
   id: string;
   version: number;
-  codeDigest: string;
-  convert(value: unknown, document: Readonly<Record<string, unknown>>): unknown | Promise<unknown>;
+  artifactDigest: string;
+  convert(value: unknown, document: Readonly<Record<string, unknown>>, parameters: MigrationConversionParameters): unknown | Promise<unknown>;
 };
 
 export type OnlineMigrationCheckpoint = {
@@ -242,7 +245,6 @@ export type OnlineMigrationRun = {
 
 export type OnlineMigrationOptions = {
   approval: MigrationApproval;
-  conversionHooks: MigrationConversionHook[];
   chunkSize?: number;
   lockTimeoutMs?: number;
   maxRetries?: number;
@@ -1838,9 +1840,10 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
       const key = `${conversion.doctype}.${conversion.field}`;
       if (!conversion.id || !Number.isSafeInteger(conversion.version) || conversion.version < 1 ||
           !identifier.test(conversion.doctype) || !identifier.test(conversion.field) ||
-          !conversion.fromType || !conversion.toType || !conversion.codeDigest || conversionKeys.has(key)) {
-        throw new FramekitError("INVALID_MIGRATION_CONVERSION", "Migration conversion metadata must be versioned, uniquely target a field, and include a code digest.", 422);
+          !conversion.fromType || !conversion.toType || !/^sha256:[A-Za-z0-9_-]{43}$/.test(conversion.artifactDigest) || conversionKeys.has(key)) {
+        throw new FramekitError("INVALID_MIGRATION_CONVERSION", "Migration conversion metadata must be versioned, uniquely target a field, and include a SHA-256 artifact digest.", 422);
       }
+      assertMigrationConversionParameters(conversion.parameters, conversion.id);
       conversionKeys.add(key);
       const change = plan.changes.find((candidate) => candidate.kind === "change_field_type" && candidate.doctype === conversion.doctype && candidate.field === conversion.field);
       if (!change || change.from !== conversion.fromType || change.to !== conversion.toType) {
@@ -1855,6 +1858,34 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
       actual: plan.checksum
     });
   }
+}
+
+function assertMigrationConversionParameters(value: unknown, conversionId: string, path = "parameters", ancestors = new WeakSet<object>()): asserts value is MigrationConversionParameters {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number" && Number.isFinite(value)) return;
+  if (!value || typeof value !== "object") throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion ${conversionId} ${path} must be canonical JSON.`, 422);
+  if (ancestors.has(value)) throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion ${conversionId} ${path} must not be circular.`, 422);
+  ancestors.add(value);
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0 || Object.getOwnPropertyNames(value).length !== value.length + 1) {
+      throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion ${conversionId} ${path} must be a dense plain JSON array.`, 422);
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor?.enumerable || !("value" in descriptor)) throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion ${conversionId} ${path} must contain only enumerable plain data.`, 422);
+      assertMigrationConversionParameters(descriptor.value, conversionId, `${path}[${index}]`, ancestors);
+    }
+  } else {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null || Object.getOwnPropertySymbols(value).length > 0) {
+      throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion ${conversionId} ${path} must be a plain JSON object.`, 422);
+    }
+    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+      if (!descriptor.enumerable || !("value" in descriptor)) throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion ${conversionId} ${path}.${key} must be enumerable plain data.`, 422);
+      assertMigrationConversionParameters(descriptor.value, conversionId, `${path}.${key}`, ancestors);
+    }
+  }
+  ancestors.delete(value);
 }
 
 export function createExecutableMigrationArtifact(plan: MigrationPlan): ExecutableMigrationArtifact {

@@ -11,7 +11,7 @@ import {
   PostgresCustomizationStore,
   PostgresDocumentRepository,
   PostgresMigrationStore,
-  migrationConversionCodeDigest,
+  migrationConversionArtifactDigest,
   PostgresMutationUnitOfWork,
   type PostgresMutationStage,
   PostgresNamingSeriesStore,
@@ -497,9 +497,19 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     const numberDocType = defineDocType({ ...textDocType, fields: [{ name: "score", label: "Score", type: "number" }] });
     const currentApp = defineApp({ name: "Online Migration", modules: [defineModule({ id: "online", name: "Online", doctypes: [textDocType] })] });
     const targetApp = defineApp({ name: "Online Migration", modules: [defineModule({ id: "online", name: "Online", doctypes: [numberDocType] })] });
+    const artifactDigest = await migrationConversionArtifactDigest("fixture://online-record-score-number/v1");
+    const invalidArtifactDigest = await migrationConversionArtifactDigest("fixture://online-record-score-invalid-date/v1");
+    const convertScore = (value: unknown, _document: Readonly<Record<string, unknown>>, parameters: unknown) =>
+      Number(value) + Number((parameters as { offset?: number }).offset ?? 0);
+    const invalidConvert = () => new Date("2026-07-21T00:00:00.000Z");
+    const conversionRegistry = [
+      { id: "online-record-score-number", version: 1, artifactDigest, convert: convertScore },
+      { id: "online-record-score-invalid-date", version: 1, artifactDigest: invalidArtifactDigest, convert: invalidConvert }
+    ];
     let interruptOnce = true;
     const onlineStore = new PostgresMigrationStore({
       connectionString: connectionString!,
+      conversionRegistry,
       faultInjector: (stage) => {
         if (stage === "online_chunk" && interruptOnce) {
           interruptOnce = false;
@@ -514,6 +524,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     let gateOnce = true;
     const gatedStore = new PostgresMigrationStore({
       connectionString: connectionString!,
+      conversionRegistry,
       faultInjector: async (stage) => {
         if (stage === "online_chunk" && gateOnce) {
           gateOnce = false;
@@ -522,6 +533,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
         }
       }
     });
+    const peerStore = new PostgresMigrationStore({ connectionString: connectionString!, conversionRegistry });
     try {
       await onlineStore.migrate();
       await sql`delete from framekit_migration_runs where tenant_id = any(${tenantIds})`;
@@ -537,18 +549,18 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       }
       const planned = await createRuntime(currentApp, { idGenerator: () => "online-v1" }).planMigration(onlineTenant, targetApp);
       const isolatedPlanned = await createRuntime(currentApp, { idGenerator: () => "online-isolated" }).planMigration(isolatedTenant, targetApp);
-      const convertScore = (value: unknown) => Number(value);
       const conversionDescriptor = {
         id: "online-record-score-number",
         version: 1,
         doctype: textDocType.name,
         field: "score",
         fromType: "text",
-        toType: "number"
+        toType: "number",
+        parameters: { offset: 0 }
       };
       const conversion = {
         ...conversionDescriptor,
-        codeDigest: await migrationConversionCodeDigest({ ...conversionDescriptor, convert: convertScore })
+        artifactDigest
       };
       const unsignedPlan = { ...planned, conversions: [conversion] };
       const plan = { ...unsignedPlan, checksum: await migrationChecksum(unsignedPlan) };
@@ -558,13 +570,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
         approvedAt: "2026-07-21T00:00:00.000Z",
         outcome: "approved" as const
       };
-      const hook = { id: conversion.id, version: conversion.version, codeDigest: conversion.codeDigest, convert: convertScore };
-      const options = { approval, conversionHooks: [hook], chunkSize: 2, maxRetries: 0 };
-
-      await expect(onlineStore.applyOnlinePlan(onlineTenant, plan, {
-        ...options,
-        conversionHooks: [hook, { ...hook }]
-      })).rejects.toMatchObject({ code: "DUPLICATE_MIGRATION_CONVERSION" });
+      const options = { approval, chunkSize: 2, maxRetries: 0 };
 
       const rejectedUnsigned = { ...isolatedPlanned, id: "online-rejected", conversions: [conversion] };
       const rejectedPlan = { ...rejectedUnsigned, checksum: await migrationChecksum(rejectedUnsigned) };
@@ -582,23 +588,16 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
         approval: rejectedApproval
       });
 
-      const invalidConvert = () => new Date("2026-07-21T00:00:00.000Z");
-      const invalidDescriptor = { ...conversionDescriptor, id: "online-record-score-invalid-date" };
+      const invalidDescriptor = { ...conversionDescriptor, id: "online-record-score-invalid-date", parameters: null };
       const invalidConversion = {
         ...invalidDescriptor,
-        codeDigest: await migrationConversionCodeDigest({ ...invalidDescriptor, convert: invalidConvert })
+        artifactDigest: invalidArtifactDigest
       };
       const invalidUnsigned = { ...isolatedPlanned, id: "online-invalid-json", conversions: [invalidConversion] };
       const invalidPlan = { ...invalidUnsigned, checksum: await migrationChecksum(invalidUnsigned) };
       await expect(onlineStore.applyOnlinePlan(isolatedTenant, invalidPlan, {
         ...options,
-        approval: { ...approval, planDigest: invalidPlan.checksum },
-        conversionHooks: [{
-          id: invalidConversion.id,
-          version: invalidConversion.version,
-          codeDigest: invalidConversion.codeDigest,
-          convert: invalidConvert
-        }]
+        approval: { ...approval, planDigest: invalidPlan.checksum }
       })).rejects.toMatchObject({ code: "INVALID_MIGRATION_CONVERSION_VALUE" });
 
       await expect(onlineStore.applyOnlinePlan(onlineTenant, plan, options)).rejects.toThrow("injected online interruption");
@@ -607,31 +606,18 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
         checkpoint: { conversionIndex: 0, processed: 0 },
         approval
       });
-      await expect(onlineStore.applyOnlinePlan(onlineTenant, plan, {
-        ...options,
-        conversionHooks: [{ ...hook, convert: () => 999 }]
-      })).rejects.toMatchObject({ code: "MIGRATION_CONVERSION_DRIFT" });
-      const driftedDescriptor = { ...conversionDescriptor, version: 2 };
-      const driftedConversion = {
-        ...driftedDescriptor,
-        codeDigest: await migrationConversionCodeDigest({ ...driftedDescriptor, convert: convertScore })
-      };
+      const driftedConversion = { ...conversion, parameters: { offset: 100 } };
       const driftedUnsigned = { ...plan, conversions: [driftedConversion] };
       const driftedPlan = { ...driftedUnsigned, checksum: await migrationChecksum(driftedUnsigned) };
+      expect(driftedPlan.checksum).not.toBe(plan.checksum);
       await expect(onlineStore.applyOnlinePlan(onlineTenant, driftedPlan, {
         ...options,
-        approval: { ...approval, planDigest: driftedPlan.checksum },
-        conversionHooks: [{
-          id: driftedConversion.id,
-          version: driftedConversion.version,
-          codeDigest: driftedConversion.codeDigest,
-          convert: convertScore
-        }]
+        approval: { ...approval, planDigest: driftedPlan.checksum }
       })).rejects.toMatchObject({ code: "MIGRATION_PLAN_DRIFT" });
 
       const concurrent = await Promise.all([
         onlineStore.applyOnlinePlan(onlineTenant, plan, options),
-        stores.migrations.applyOnlinePlan(onlineTenant, plan, options)
+        peerStore.applyOnlinePlan(onlineTenant, plan, options)
       ]);
       expect(concurrent[1]).toEqual(concurrent[0]);
       const converted = await sql<{ id: string; score: number; revision: number }[]>`
@@ -665,7 +651,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       };
       const completingApply = gatedStore.applyOnlinePlan(timeoutTenant, timeoutPlan, timeoutOptions);
       await chunkEntered;
-      await expect(stores.migrations.applyOnlinePlan(timeoutTenant, timeoutPlan, timeoutOptions)).rejects.toMatchObject({
+      await expect(peerStore.applyOnlinePlan(timeoutTenant, timeoutPlan, timeoutOptions)).rejects.toMatchObject({
         code: "MIGRATION_LOCK_TIMEOUT"
       });
       releaseChunk();
@@ -680,6 +666,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       await sql`delete from framekit_documents where tenant_id = any(${tenantIds})`;
       await (onlineStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
       await (gatedStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
+      await (peerStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
     }
   });
 
