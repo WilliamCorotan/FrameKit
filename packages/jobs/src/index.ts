@@ -261,6 +261,7 @@ export async function dispatchOutboxEvents(
   handler: OutboxDispatchHandler,
   options: OutboxDispatchOptions = {}
 ): Promise<OutboxDispatchResult> {
+  options.signal?.throwIfAborted();
   const ownerId = options.ownerId ?? `worker-${crypto.randomUUID()}`;
   const maxAttempts = options.maxAttempts ?? 5;
   const events = await runtime.claimOutboxEvents(tenant, {
@@ -320,9 +321,12 @@ export class OutboxDispatcher {
     if (this.closed) throw new Error("Outbox dispatcher is closed");
     if (this.active) return this.active;
     this.controller ??= new AbortController();
+    const signal = this.options.signal
+      ? AbortSignal.any([this.controller.signal, this.options.signal])
+      : this.controller.signal;
     const active = dispatchOutboxEvents(this.runtime, this.tenant, this.handler, {
       ...this.options,
-      signal: this.controller?.signal ?? this.options.signal
+      signal
     });
     this.active = active;
     try {

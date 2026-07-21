@@ -271,6 +271,34 @@ describe("dispatchOutboxEvents", () => {
     await expect(closing).rejects.toBeDefined();
     expect(handled).toBe(1);
   });
+
+  it("does not claim outbox events for pre-aborted dispatches", async () => {
+    const runtime = createJobsRuntime("Pre-aborted outbox");
+    await runtime.create(tenant, "customer", { name: "Pending" });
+    const controller = new AbortController();
+    controller.abort("cancel before claim");
+    const handler = vi.fn();
+
+    await expect(dispatchOutboxEvents(runtime, tenant, handler, { signal: controller.signal })).rejects.toBeDefined();
+    expect(handler).not.toHaveBeenCalled();
+    expect(await runtime.outboxEvents(tenant)).toEqual([expect.objectContaining({ status: "pending", attempts: 0 })]);
+
+    const dispatcher = new OutboxDispatcher(runtime, tenant, handler, { signal: controller.signal });
+    await expect(dispatcher.runOnce()).rejects.toBeDefined();
+    expect(handler).not.toHaveBeenCalled();
+    expect(await runtime.outboxEvents(tenant)).toEqual([expect.objectContaining({ status: "pending", attempts: 0 })]);
+    await dispatcher.close();
+  });
+
+  it("does not start a scheduled runner from a pre-aborted signal", async () => {
+    const runner = new ScheduledJobRunner(new ScheduledJobRegistry(), 5);
+    const controller = new AbortController();
+    controller.abort("cancel before start");
+    expect(() => runner.start(controller.signal)).toThrow();
+    expect(await runner.health()).toMatchObject({ details: { running: false } });
+    runner.start();
+    await runner.close();
+  });
 });
 
 function createJobsRuntime(name: string) {
