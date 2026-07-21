@@ -1276,7 +1276,7 @@ async function validateOidcIdToken(payload: JWTPayload, nonceHash: string, clien
   if (typeof payload.nonce !== "string" || !constantEqual(await hashOpaqueToken(payload.nonce), nonceHash)) {
     throw new FramekitError("OIDC_NONCE_MISMATCH", "OIDC ID token nonce did not match the authorization request.", 401);
   }
-  if (Array.isArray(payload.aud) && payload.aud.length > 1 && payload.azp !== clientId) {
+  if ((payload.azp !== undefined && payload.azp !== clientId) || (Array.isArray(payload.aud) && payload.aud.length > 1 && payload.azp !== clientId)) {
     throw new FramekitError("OIDC_AUTHORIZED_PARTY_MISMATCH", "OIDC ID token authorized party did not match the client id.", 401);
   }
 }

@@ -351,6 +351,8 @@ describe("PasswordAuthService", () => {
     let nonce = "";
     let expectedChallenge = "";
     let forgeSignature = false;
+    let audience: string | string[] = "framekit";
+    let authorizedParty: string | undefined;
     const fetcher: typeof fetch = async (input, init) => {
       const url = String(input);
       if (url.endsWith("/.well-known/openid-configuration")) return Response.json({
@@ -362,8 +364,8 @@ describe("PasswordAuthService", () => {
         const body = new URLSearchParams(String(init?.body));
         const challenge = base64Url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(body.get("code_verifier")!)));
         expect(challenge).toBe(expectedChallenge);
-        const idToken = forgeSignature ? "forged.jwt.signature" : await new SignJWT({ email: "admin@example.com", nonce }).setProtectedHeader({ alg: "RS256", kid: "test-key" })
-          .setIssuer(issuer).setAudience("framekit").setSubject("external-admin").setIssuedAt().setExpirationTime("5m").sign(privateKey);
+        const idToken = forgeSignature ? "forged.jwt.signature" : await new SignJWT({ email: "admin@example.com", nonce, ...(authorizedParty ? { azp: authorizedParty } : {}) }).setProtectedHeader({ alg: "RS256", kid: "test-key" })
+          .setIssuer(issuer).setAudience(audience).setSubject("external-admin").setIssuedAt().setExpirationTime("5m").sign(privateKey);
         return Response.json({ id_token: idToken, token_type: "Bearer" });
       }
       throw new Error(`Unexpected OIDC request ${url}`);
@@ -386,6 +388,22 @@ describe("PasswordAuthService", () => {
     const state = authorization.searchParams.get("state")!;
     await expect(auth.completeProviderAuthorization("oidc", { code: "authorization-code", state })).resolves.toMatchObject({ session: { context: { userId: "u1", tenantId: "t1" } }, returnTo: "/desk" });
     await expect(auth.completeProviderAuthorization("oidc", { code: "replay", state })).rejects.toMatchObject({ code: "OIDC_STATE_INVALID" });
+
+    const completeAudienceCase = async (nextAudience: string | string[], azp: string | undefined, code: string) => {
+      audience = nextAudience;
+      authorizedParty = azp;
+      const startedCase = await auth.beginProviderAuthorization("oidc", { tenantId: "t1" });
+      const url = new URL(startedCase.authorizationUrl);
+      nonce = url.searchParams.get("nonce")!;
+      expectedChallenge = url.searchParams.get("code_challenge")!;
+      return auth.completeProviderAuthorization("oidc", { code, state: url.searchParams.get("state")! });
+    };
+    await expect(completeAudienceCase("framekit", undefined, "single-no-azp")).resolves.toMatchObject({ session: { context: { userId: "u1" } } });
+    await expect(completeAudienceCase("framekit", "framekit", "single-matching-azp")).resolves.toMatchObject({ session: { context: { userId: "u1" } } });
+    await expect(completeAudienceCase("framekit", "different-client", "single-wrong-azp")).rejects.toMatchObject({ code: "OIDC_AUTHORIZED_PARTY_MISMATCH" });
+    await expect(completeAudienceCase(["framekit", "another-api"], undefined, "multi-no-azp")).rejects.toMatchObject({ code: "OIDC_AUTHORIZED_PARTY_MISMATCH" });
+    await expect(completeAudienceCase(["framekit", "another-api"], "different-client", "multi-wrong-azp")).rejects.toMatchObject({ code: "OIDC_AUTHORIZED_PARTY_MISMATCH" });
+    await expect(completeAudienceCase(["framekit", "another-api"], "framekit", "multi-matching-azp")).resolves.toMatchObject({ session: { context: { userId: "u1" } } });
 
     const nonceAttack = await auth.beginProviderAuthorization("oidc", { tenantId: "t1" });
     const nonceAttackUrl = new URL(nonceAttack.authorizationUrl);
