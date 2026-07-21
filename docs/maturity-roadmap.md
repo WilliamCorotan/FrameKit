@@ -18,7 +18,7 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 
 ## Overall Assessment
 
-- Component-average implementation: **83%**.
+- Component-average implementation: **84%**.
 - Functional breadth: approximately **89%**.
 - Production readiness: approximately **79%**.
 - Current stage: **beta**.
@@ -33,7 +33,7 @@ The estimates are evidence-based engineering judgments, not line coverage or iss
 | Data, query, and persistence | 84% | In-memory and Postgres adapters, pushed-down filters/sorts/projections, opaque cursors, durable uniqueness, revisions, locking, and atomic document/outbox persistence | Load/performance evidence, sharding/partition guidance, broader physical schema modeling |
 | HTTP API and OpenAPI | 82% | Secure routing defaults, broad Nitro/OpenAPI surface, operation permissions, idempotency, request IDs, rate limiting, telemetry ports, and split health probes | Version negotiation, pagination envelopes, generated error schemas |
 | Authentication and IAM | 78% | Password sessions, cookies, refresh/logout/revocation, lockout, API tokens, roles, durable audit and identity links, OIDC discovery/JWKS authorization-code/PKCE, single-use invitations and recovery, forged-header and cross-tenant protection | Native WebAuthn/TOTP enrollment and step-up assurance policy; provider-enforced MFA is the current production scope |
-| Schema evolution | 85% | Executable HTTP/CLI contract, schema fingerprints, full DocType diffs, checksums, destructive and irreversible guards, advisory locking, drift/replay policy, atomic Postgres apply/rollback, and legacy uniqueness backfill | Operator-authored conversion hooks, online/zero-downtime strategies, physical-schema inspection beyond managed indexes, and approval/audit workflows |
+| Schema evolution | 94% | Executable HTTP/CLI contract, schema fingerprints, full DocType diffs, checksums, destructive and irreversible guards, atomic apply/rollback, versioned deterministic conversion hooks, durable approval evidence, resumable chunk checkpoints, bounded tenant/app locking, drift/replay guards, and legacy uniqueness backfill | Physical-schema inspection beyond managed indexes, automated dual-read/write rollout coordination, and production-scale migration performance evidence |
 | Jobs, events, and realtime | 85% | BullMQ queues/workers, atomic outbox leases, retry/backoff/dead-letter behavior, idempotency keys, scheduling, Postgres fanout/replay, SSE, lifecycle and cancellation | Operational load evidence, poison-message tooling, richer scheduler persistence |
 | Desk and admin UI | 82% | Metadata lists/forms, workflows, auth administration, customization, operations screens, real-stack Chromium/Firefox journeys, accessibility checks | Richer field errors, keyboard depth, visual regression policy |
 | SDK, CLI, and developer experience | 75% | Broad HTTP parity, generated model types, scaffolding, migration commands, packed standalone consumer proof | Typed/retriable errors, upgrade/config workflows, packaged Desk template |
@@ -76,6 +76,7 @@ Exit criteria:
 
 1. [#26 Deepen metadata invariants and business document semantics](https://github.com/WilliamCorotan/FrameKit/issues/26) — bounded 1.0 contract and [#41 ownership/row policies](https://github.com/WilliamCorotan/FrameKit/issues/41) implemented; deferred primitives are tracked by [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), and [#42](https://github.com/WilliamCorotan/FrameKit/issues/42).
 2. [#27 Add production lifecycle, observability, compatibility, and supply-chain gates](https://github.com/WilliamCorotan/FrameKit/issues/27) — implemented by this change; closes when merged.
+3. [#46 Add approved, resumable online schema conversions](https://github.com/WilliamCorotan/FrameKit/issues/46)
 
 Exit criteria:
 
@@ -91,6 +92,7 @@ Exit criteria:
 3. Nitro and H3 remain pre-release dependencies; upgrades require explicit compatibility evidence.
 4. OpenTelemetry adapters are exporter-neutral and tested for redaction, but production sampling, alerting, and SLOs remain operator responsibilities.
 5. Community support is best-effort; there is no commercial incident-response commitment.
+6. Online conversion state is durable and resumable; physical-schema drift outside managed indexes and automated compatibility-window coordination remain incomplete.
 
 ## Verification Snapshot
 

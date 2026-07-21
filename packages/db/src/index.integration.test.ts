@@ -487,6 +487,109 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     }
   });
 
+  it("resumes approved online conversions with durable checkpoints and isolated concurrent operators", async () => {
+    const onlineTenant = { ...tenant, tenantId: "pg_online_migration_tenant" };
+    const isolatedTenant = { ...tenant, tenantId: "pg_online_migration_isolated" };
+    const tenantIds = [onlineTenant.tenantId, isolatedTenant.tenantId];
+    const textDocType = defineDocType({ name: "online_record", label: "Online Record", fields: [{ name: "score", label: "Score", type: "text" }] });
+    const numberDocType = defineDocType({ ...textDocType, fields: [{ name: "score", label: "Score", type: "number" }] });
+    const currentApp = defineApp({ name: "Online Migration", modules: [defineModule({ id: "online", name: "Online", doctypes: [textDocType] })] });
+    const targetApp = defineApp({ name: "Online Migration", modules: [defineModule({ id: "online", name: "Online", doctypes: [numberDocType] })] });
+    let interruptOnce = true;
+    const onlineStore = new PostgresMigrationStore({
+      connectionString: connectionString!,
+      faultInjector: (stage) => {
+        if (stage === "online_chunk" && interruptOnce) {
+          interruptOnce = false;
+          throw new Error("injected online interruption");
+        }
+      }
+    });
+    try {
+      await onlineStore.migrate();
+      await sql`delete from framekit_migration_runs where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_migrations where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_documents where tenant_id = any(${tenantIds})`;
+      for (const tenantId of tenantIds) {
+        await sql`
+          insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+          values (${tenantId}, ${textDocType.name}, 'row-1', 1, null, ${sql.json({ score: "10" })}, now(), now()),
+                 (${tenantId}, ${textDocType.name}, 'row-2', 1, null, ${sql.json({ score: "20" })}, now(), now()),
+                 (${tenantId}, ${textDocType.name}, 'row-3', 1, null, ${sql.json({ score: "30" })}, now(), now())
+        `;
+      }
+      const planned = await createRuntime(currentApp, { idGenerator: () => "online-v1" }).planMigration(onlineTenant, targetApp);
+      const conversion = {
+        id: "online-record-score-number",
+        version: 1,
+        doctype: textDocType.name,
+        field: "score",
+        fromType: "text",
+        toType: "number",
+        codeDigest: "sha256:reviewed-online-record-score-v1"
+      };
+      const unsignedPlan = { ...planned, conversions: [conversion] };
+      const plan = { ...unsignedPlan, checksum: await migrationChecksum(unsignedPlan) };
+      const approval = {
+        approver: "release-manager@example.test",
+        planDigest: plan.checksum,
+        approvedAt: "2026-07-21T00:00:00.000Z",
+        outcome: "approved" as const
+      };
+      const hook = { ...conversion, convert: (value: unknown) => Number(value) };
+      const options = { approval, conversionHooks: [hook], chunkSize: 2, maxRetries: 0 };
+
+      await expect(onlineStore.applyOnlinePlan(onlineTenant, plan, options)).rejects.toThrow("injected online interruption");
+      await expect(onlineStore.getOnlineRun(onlineTenant, plan.appName, plan.id)).resolves.toMatchObject({
+        status: "failed",
+        checkpoint: { conversionIndex: 0, processed: 0 },
+        approval
+      });
+      await expect(onlineStore.applyOnlinePlan(onlineTenant, plan, {
+        ...options,
+        conversionHooks: [{ ...hook, codeDigest: "sha256:changed-code" }]
+      })).rejects.toMatchObject({ code: "MIGRATION_CONVERSION_DRIFT" });
+      const driftedUnsigned = { ...plan, conversions: [{ ...conversion, version: 2, codeDigest: "sha256:reviewed-online-record-score-v2" }] };
+      const driftedPlan = { ...driftedUnsigned, checksum: await migrationChecksum(driftedUnsigned) };
+      await expect(onlineStore.applyOnlinePlan(onlineTenant, driftedPlan, {
+        ...options,
+        approval: { ...approval, planDigest: driftedPlan.checksum },
+        conversionHooks: [{ ...driftedPlan.conversions[0]!, convert: (value: unknown) => Number(value) }]
+      })).rejects.toMatchObject({ code: "MIGRATION_PLAN_DRIFT" });
+
+      const concurrent = await Promise.all([
+        onlineStore.applyOnlinePlan(onlineTenant, plan, options),
+        stores.migrations.applyOnlinePlan(onlineTenant, plan, options)
+      ]);
+      expect(concurrent[1]).toEqual(concurrent[0]);
+      const converted = await sql<{ id: string; score: number; revision: number }[]>`
+        select id, (data ->> 'score')::int as score, revision from framekit_documents
+        where tenant_id = ${onlineTenant.tenantId} and doctype = ${textDocType.name} order by id
+      `;
+      expect(converted).toEqual([
+        { id: "row-1", score: 10, revision: 2 },
+        { id: "row-2", score: 20, revision: 2 },
+        { id: "row-3", score: 30, revision: 2 }
+      ]);
+      const isolated = await sql<{ scores: string[]; revisions: number[] }[]>`
+        select array_agg(data ->> 'score' order by id) as scores, array_agg(revision order by id) as revisions
+        from framekit_documents where tenant_id = ${isolatedTenant.tenantId} and doctype = ${textDocType.name}
+      `;
+      expect(isolated[0]).toEqual({ scores: ["10", "20", "30"], revisions: [1, 1, 1] });
+      await expect(onlineStore.getOnlineRun(onlineTenant, plan.appName, plan.id)).resolves.toMatchObject({
+        status: "completed",
+        checkpoint: { conversionIndex: 1, processed: 3 },
+        approval
+      });
+      await expect(onlineStore.getOnlineRun(onlineTenant, "Other App", plan.id)).resolves.toBeUndefined();
+    } finally {
+      await sql`delete from framekit_migration_runs where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_migrations where tenant_id = any(${tenantIds})`;
+      await sql`delete from framekit_documents where tenant_id = any(${tenantIds})`;
+      await (onlineStore as unknown as { sql: { end(options?: { timeout?: number }): Promise<void> } }).sql.end({ timeout: 1 });
+    }
+  });
+
   it("pushes list operations into parameterized SQL with in-memory parity", async () => {
     const memory = new InMemoryDocumentRepository();
     const timestamp = "2026-07-06T00:00:00.000Z";

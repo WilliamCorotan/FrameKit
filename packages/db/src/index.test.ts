@@ -44,6 +44,9 @@ describe("db migration sql", () => {
     expect(createViewTableSql()).toContain("framekit_views");
     expect(createNamingSeriesTableSql()).toContain("framekit_naming_series");
     expect(createMigrationTableSql()).toContain("framekit_migrations");
+    expect(createMigrationTableSql()).toContain("framekit_migration_runs");
+    expect(createMigrationTableSql()).toContain("conversion_digest");
+    expect(createMigrationTableSql()).toContain("approval jsonb not null");
     expect(createMigrationTableSql()).toContain("checksum");
   });
 

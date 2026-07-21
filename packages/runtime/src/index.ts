@@ -190,7 +190,62 @@ export type MigrationPlan = {
   toUniqueConstraints: Array<{ doctype: string; field: string }>;
   createdAt: string;
   changes: MigrationChange[];
+  conversions?: MigrationConversion[];
   checksum: string;
+};
+
+export type MigrationConversion = {
+  id: string;
+  version: number;
+  doctype: string;
+  field: string;
+  fromType: string;
+  toType: string;
+  codeDigest: string;
+};
+
+export type MigrationApproval = {
+  approver: string;
+  planDigest: string;
+  approvedAt: string;
+  outcome: "approved" | "rejected";
+};
+
+export type MigrationConversionHook = {
+  id: string;
+  version: number;
+  codeDigest: string;
+  convert(value: unknown, document: Readonly<Record<string, unknown>>): unknown | Promise<unknown>;
+};
+
+export type OnlineMigrationCheckpoint = {
+  conversionIndex: number;
+  lastDocumentId?: string;
+  processed: number;
+};
+
+export type OnlineMigrationRun = {
+  tenantId: string;
+  appName: string;
+  migrationId: string;
+  planDigest: string;
+  conversionDigest: string;
+  status: "pending" | "running" | "failed" | "completed";
+  checkpoint: OnlineMigrationCheckpoint;
+  approval: MigrationApproval;
+  error?: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+};
+
+export type OnlineMigrationOptions = {
+  approval: MigrationApproval;
+  conversionHooks: MigrationConversionHook[];
+  chunkSize?: number;
+  lockTimeoutMs?: number;
+  maxRetries?: number;
+  appliedAt?: string;
 };
 
 export type MigrationRecord = MigrationPlan & {
@@ -206,6 +261,8 @@ export type MigrationStore = LifecycleResource & {
   list(tenant: TenantContext, options?: { appName?: string }): Promise<MigrationRecord[]>;
   record(tenant: TenantContext, migration: MigrationRecord): Promise<MigrationRecord>;
   applyPlan?(tenant: TenantContext, plan: MigrationPlan, options?: { allowDestructive?: boolean; appliedAt?: string }): Promise<MigrationRecord>;
+  applyOnlinePlan?(tenant: TenantContext, plan: MigrationPlan, options: OnlineMigrationOptions): Promise<MigrationRecord>;
+  getOnlineRun?(tenant: TenantContext, appName: string, migrationId: string): Promise<OnlineMigrationRun | undefined>;
   rollback?(tenant: TenantContext, migration: MigrationRecord, options?: { allowDestructive?: boolean; id?: string; appliedAt?: string }): Promise<MigrationRecord>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
@@ -1734,7 +1791,7 @@ function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollba
   }
 }
 
-export async function migrationChecksum(plan: Pick<MigrationPlan, "tenantId" | "appName" | "fromSchemaChecksum" | "toSchemaChecksum" | "fromUniqueConstraints" | "toUniqueConstraints" | "changes">): Promise<string> {
+export async function migrationChecksum(plan: Pick<MigrationPlan, "tenantId" | "appName" | "fromSchemaChecksum" | "toSchemaChecksum" | "fromUniqueConstraints" | "toUniqueConstraints" | "changes" | "conversions">): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableJson({
     tenantId: plan.tenantId,
     appName: plan.appName,
@@ -1742,7 +1799,8 @@ export async function migrationChecksum(plan: Pick<MigrationPlan, "tenantId" | "
     toSchemaChecksum: plan.toSchemaChecksum,
     fromUniqueConstraints: plan.fromUniqueConstraints,
     toUniqueConstraints: plan.toUniqueConstraints,
-    changes: plan.changes
+    changes: plan.changes,
+    ...(plan.conversions ? { conversions: plan.conversions } : {})
   })));
   return base64Url(new Uint8Array(digest));
 }
@@ -1771,6 +1829,22 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
     }
     if (change.rollback && change.rollback.destructive !== migrationChangeIsDestructive(change.rollback)) {
       throw new FramekitError("INVALID_MIGRATION_PLAN", `Rollback for ${change.kind} has an invalid destructive classification.`, 422);
+    }
+  }
+  if (plan.conversions) {
+    const conversionKeys = new Set<string>();
+    for (const conversion of plan.conversions) {
+      const key = `${conversion.doctype}.${conversion.field}`;
+      if (!conversion.id || !Number.isSafeInteger(conversion.version) || conversion.version < 1 ||
+          !identifier.test(conversion.doctype) || !identifier.test(conversion.field) ||
+          !conversion.fromType || !conversion.toType || !conversion.codeDigest || conversionKeys.has(key)) {
+        throw new FramekitError("INVALID_MIGRATION_CONVERSION", "Migration conversion metadata must be versioned, uniquely target a field, and include a code digest.", 422);
+      }
+      conversionKeys.add(key);
+      const change = plan.changes.find((candidate) => candidate.kind === "change_field_type" && candidate.doctype === conversion.doctype && candidate.field === conversion.field);
+      if (!change || change.from !== conversion.fromType || change.to !== conversion.toType) {
+        throw new FramekitError("INVALID_MIGRATION_CONVERSION", `Conversion ${conversion.id} does not match its field type change.`, 422);
+      }
     }
   }
   const expectedChecksum = await migrationChecksum(plan);
