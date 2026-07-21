@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, validateMigrationPlan, type MigrationPlan as RuntimeMigrationPlan } from "../../runtime/src/index.js";
 import { ofetch } from "ofetch";
-import { createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitClient, generateSdkTypes, type MigrationPlan } from "./index.js";
+import {
+  createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitCancelledError, FramekitClient, FramekitConflictError,
+  FramekitServerError, FramekitValidationError, generateSdkTypes, upgradeFramekitClientConfig, type MigrationPlan
+} from "./index.js";
 
 vi.mock("ofetch", () => ({ ofetch: vi.fn() }));
 
@@ -14,7 +17,7 @@ afterEach(() => {
 describe("generateSdkTypes", () => {
   it("keeps the explicit HTTP endpoint matrix in parity with every public client method", () => {
     const methods = Object.getOwnPropertyNames(FramekitClient.prototype)
-      .filter((name) => !["constructor", "headers", "request"].includes(name))
+      .filter((name) => !["constructor", "execute", "headers", "request"].includes(name))
       .sort();
 
     expect(FRAMEKIT_HTTP_ENDPOINTS.map(([method]) => method).sort()).toEqual(methods);
@@ -136,6 +139,70 @@ describe("generateSdkTypes", () => {
     expect(generated).toContain("amount?: number;");
     expect(generated).toContain('stage?: "open" | "won";');
     expect(generated).toContain('export type DealWorkflowAction = "win";');
+    expect(generated).toContain("FramekitValidationError");
+    expect(generated).toContain("FramekitClientConfigV2");
+  });
+
+  it("maps OpenAPI failures into typed errors with request identity", async () => {
+    vi.mocked(ofetch).mockRejectedValue(httpFailure(422, "VALIDATION_FAILED", "email is invalid", { field: "email" }, { "x-request-id": "request-42" }));
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3 } });
+
+    const error = await client.get("customer", "one").catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(FramekitValidationError);
+    expect(error).toMatchObject({ status: 422, code: "VALIDATION_FAILED", details: { field: "email" }, requestId: "request-42" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries transient safe requests, honors Retry-After, and bounds attempts", async () => {
+    vi.useFakeTimers();
+    vi.mocked(ofetch)
+      .mockRejectedValueOnce(httpFailure(503, "UNAVAILABLE", "retry", undefined, { "retry-after": "1" }))
+      .mockResolvedValueOnce({ ok: true, app: "Retry" } as never);
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 2, baseDelayMs: 10, maxDelayMs: 2_000 } });
+
+    const result = client.health();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toMatchObject({ ok: true });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("never implicitly retries conflicts or non-idempotent mutations", async () => {
+    const conflict = httpFailure(409, "REVISION_CONFLICT", "stale");
+    vi.mocked(ofetch).mockRejectedValue(conflict);
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3, baseDelayMs: 0 } });
+
+    await expect(client.get("customer", "one")).rejects.toBeInstanceOf(FramekitConflictError);
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+    vi.mocked(ofetch).mockReset().mockRejectedValue(httpFailure(503, "UNAVAILABLE", "retry"));
+    await expect(client.create("customer", { name: "Unsafe" })).rejects.toBeInstanceOf(FramekitServerError);
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+
+    vi.mocked(ofetch).mockReset().mockRejectedValueOnce(httpFailure(503, "UNAVAILABLE", "retry")).mockResolvedValueOnce({ id: "one" } as never);
+    await expect(client.create("customer", { name: "Safe" }, { idempotencyKey: "create-one" })).resolves.toMatchObject({ id: "one" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels retry waits with AbortSignal", async () => {
+    vi.mocked(ofetch).mockRejectedValue(httpFailure(503, "UNAVAILABLE", "retry", undefined, { "retry-after": "60" }));
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3 } });
+    const controller = new AbortController();
+    const result = client.health({ signal: controller.signal });
+    await Promise.resolve();
+    controller.abort("stop");
+    await expect(result).rejects.toBeInstanceOf(FramekitCancelledError);
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("upgrades versioned configuration deterministically without enabling retries", () => {
+    expect(upgradeFramekitClientConfig({ version: 1, baseUrl: "https://app.example" })).toEqual({
+      config: { version: 2, baseUrl: "https://app.example" },
+      diagnostics: [{ code: "UPGRADED_V1", message: "SDK config version 1 upgraded to version 2 with retries disabled by default." }]
+    });
+    expect(upgradeFramekitClientConfig({ baseUrl: "https://app.example" }).diagnostics[0]?.code).toBe("ASSUMED_V1");
+    expect(() => upgradeFramekitClientConfig({ version: 3, baseUrl: "https://app.example" } as never)).toThrow("Unsupported");
   });
 
   it("parses server-sent realtime events from the SDK stream helper", async () => {
@@ -179,3 +246,7 @@ describe("generateSdkTypes", () => {
     expect(fetchMock.mock.calls[0]?.[1]?.headers).not.toMatchObject({ authorization: expect.any(String) });
   });
 });
+
+function httpFailure(status: number, code: string, message: string, details?: unknown, headers: Record<string, string> = {}) {
+  return { message, response: { status, headers: new Headers(headers), _data: { error: true, code, message, details } } };
+}

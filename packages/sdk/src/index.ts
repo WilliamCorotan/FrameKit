@@ -50,13 +50,54 @@ export type AuthAuditEvent = {
 
 export type IssuedLifecycleToken = { token: string; expiresAt: string };
 
-export type FramekitClientOptions = {
+type FramekitClientBaseConfig = {
   baseUrl: string;
   tenant?: Partial<TenantContext>;
   token?: string;
   authMode?: "bearer" | "cookie";
   credentials?: RequestCredentials;
 };
+
+export type FramekitRetryPolicy = {
+  /** Total attempts, including the first request. Must be between 1 and 5. */
+  maxAttempts: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+};
+
+export type FramekitClientConfigV1 = FramekitClientBaseConfig & { version: 1 };
+export type FramekitClientConfigV2 = FramekitClientBaseConfig & { version: 2; retry?: FramekitRetryPolicy };
+export type FramekitClientOptions = FramekitClientConfigV1 | FramekitClientConfigV2 | (FramekitClientBaseConfig & { version?: undefined; retry?: FramekitRetryPolicy });
+export type FramekitConfigUpgradeDiagnostic = { code: "ASSUMED_V1" | "UPGRADED_V1"; message: string };
+export type FramekitConfigUpgradeResult = { config: FramekitClientConfigV2; diagnostics: FramekitConfigUpgradeDiagnostic[] };
+export const FRAMEKIT_SDK_CONFIG_VERSION = 2 as const;
+
+export class FramekitSdkError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly status: number | undefined,
+    readonly details: unknown,
+    readonly requestId: string | undefined,
+    readonly retryAfterMs: number | undefined,
+    options?: ErrorOptions
+  ) {
+    super(message, options);
+    this.name = new.target.name;
+  }
+}
+
+export class FramekitValidationError extends FramekitSdkError {}
+export class FramekitAuthenticationError extends FramekitSdkError {}
+export class FramekitAuthorizationError extends FramekitSdkError {}
+export class FramekitNotFoundError extends FramekitSdkError {}
+export class FramekitConflictError extends FramekitSdkError {}
+export class FramekitRateLimitError extends FramekitSdkError {}
+export class FramekitServerError extends FramekitSdkError {}
+export class FramekitTransportError extends FramekitSdkError {}
+export class FramekitCancelledError extends FramekitSdkError {}
+
+export type FramekitRequestOptions = { signal?: AbortSignal };
 
 export type ListDocumentsOptions = {
   search?: string;
@@ -69,6 +110,7 @@ export type ListDocumentsOptions = {
     field: string;
     direction?: "asc" | "desc";
   };
+  signal?: AbortSignal;
 };
 
 export type ListDocumentsPage<TData extends DocumentData = DocumentData> = {
@@ -79,6 +121,7 @@ export type ListDocumentsPage<TData extends DocumentData = DocumentData> = {
 export type MutationRequestOptions = {
   expectedRevision?: number;
   idempotencyKey?: string;
+  signal?: AbortSignal;
 };
 
 export type HealthResponse = {
@@ -183,22 +226,25 @@ export class FramekitClient {
   private readonly tenant: Partial<TenantContext>;
   private readonly authMode: "bearer" | "cookie";
   private readonly credentials?: RequestCredentials;
+  private readonly retry?: Required<FramekitRetryPolicy>;
   private token?: string;
 
   constructor(options: FramekitClientOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/$/, "");
-    this.tenant = options.tenant ?? {};
-    this.authMode = options.authMode ?? "bearer";
-    this.credentials = options.credentials ?? (this.authMode === "cookie" ? "include" : undefined);
-    this.token = options.token;
+    const { config } = upgradeFramekitClientConfig(options);
+    this.baseUrl = config.baseUrl.replace(/\/$/, "");
+    this.tenant = config.tenant ?? {};
+    this.authMode = config.authMode ?? "bearer";
+    this.credentials = config.credentials ?? (this.authMode === "cookie" ? "include" : undefined);
+    this.token = config.token;
+    this.retry = normalizeRetryPolicy(config.retry);
   }
 
-  health(): Promise<HealthResponse> {
-    return this.request("/health/live", { skipAuth: true });
+  health(options: FramekitRequestOptions = {}): Promise<HealthResponse> {
+    return this.request("/health/live", { skipAuth: true, signal: options.signal });
   }
 
-  dependencyHealth(): Promise<DependencyHealthResponse> {
-    return this.request("/health/ready", { skipAuth: true });
+  dependencyHealth(options: FramekitRequestOptions = {}): Promise<DependencyHealthResponse> {
+    return this.request("/health/ready", { skipAuth: true, signal: options.signal });
   }
 
   meta<T = unknown>(): Promise<T> {
@@ -430,55 +476,74 @@ export class FramekitClient {
   }
 
   async listPage<TData extends DocumentData = DocumentData>(doctype: string, options: ListDocumentsOptions = {}): Promise<ListDocumentsPage<TData>> {
-    const response = await ofetch.raw<DocumentRecord<TData>[]>(this.baseUrl + `/api/doctypes/${doctype}${listQuery(options)}`, {
-      headers: this.headers(),
-      credentials: this.credentials
-    });
+    const response = await this.execute(
+      () => ofetch.raw<DocumentRecord<TData>[]>(this.baseUrl + `/api/doctypes/${doctype}${listQuery(options)}`, {
+        headers: this.headers(), credentials: this.credentials, retry: 0, signal: options.signal
+      }),
+      "GET", {}, options.signal
+    );
     return {
       items: response._data ?? [],
       nextCursor: response.headers.get("x-next-cursor") ?? undefined
     };
   }
 
-  get<TData extends DocumentData = DocumentData>(doctype: string, id: string): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}/${id}`);
+  get<TData extends DocumentData = DocumentData>(doctype: string, id: string, options: FramekitRequestOptions = {}): Promise<DocumentRecord<TData>> {
+    return this.request(`/api/doctypes/${doctype}/${id}`, { signal: options.signal });
   }
 
   create<TData extends DocumentData = DocumentData>(doctype: string, data: TData, options: Omit<MutationRequestOptions, "expectedRevision"> = {}): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}`, { method: "POST", body: data, headers: mutationHeaders(options) });
+    return this.request(`/api/doctypes/${doctype}`, { method: "POST", body: data, headers: mutationHeaders(options), signal: options.signal });
   }
 
   update<TData extends DocumentData = DocumentData>(doctype: string, id: string, data: Partial<TData>, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}/${id}`, { method: "PATCH", body: data, headers: mutationHeaders(options) });
+    return this.request(`/api/doctypes/${doctype}/${id}`, { method: "PATCH", body: data, headers: mutationHeaders(options), signal: options.signal });
   }
 
   delete(doctype: string, id: string, options: MutationRequestOptions = {}): Promise<void> {
-    return this.request(`/api/doctypes/${doctype}/${id}`, { method: "DELETE", headers: mutationHeaders(options) });
+    return this.request(`/api/doctypes/${doctype}/${id}`, { method: "DELETE", headers: mutationHeaders(options), signal: options.signal });
   }
 
   transition<TData extends DocumentData = DocumentData>(doctype: string, id: string, action: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}/${id}/transition`, { method: "POST", body: { action }, headers: mutationHeaders(options) });
+    return this.request(`/api/doctypes/${doctype}/${id}/transition`, { method: "POST", body: { action }, headers: mutationHeaders(options), signal: options.signal });
   }
 
   submit<TData extends DocumentData = DocumentData>(doctype: string, id: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}/${id}/submit`, { method: "POST", headers: mutationHeaders(options) });
+    return this.request(`/api/doctypes/${doctype}/${id}/submit`, { method: "POST", headers: mutationHeaders(options), signal: options.signal });
   }
 
   cancel<TData extends DocumentData = DocumentData>(doctype: string, id: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
-    return this.request(`/api/doctypes/${doctype}/${id}/cancel`, { method: "POST", headers: mutationHeaders(options) });
+    return this.request(`/api/doctypes/${doctype}/${id}/cancel`, { method: "POST", headers: mutationHeaders(options), signal: options.signal });
   }
 
   transferOwner(doctype: string, id: string, ownerId: string, options: MutationRequestOptions = {}): Promise<OwnerTransferReceipt> {
-    return this.request(`/api/doctypes/${doctype}/${id}/owner`, { method: "POST", body: { ownerId }, headers: mutationHeaders(options) });
+    return this.request(`/api/doctypes/${doctype}/${id}/owner`, { method: "POST", body: { ownerId }, headers: mutationHeaders(options), signal: options.signal });
   }
 
-  private request<T>(path: string, options: { method?: string; body?: unknown; skipAuth?: boolean; headers?: Record<string, string> } = {}): Promise<T> {
-    return ofetch<T>(this.baseUrl + path, {
-      method: options.method,
-      body: options.body as Record<string, unknown> | undefined,
-      headers: { ...this.headers(options.skipAuth), ...options.headers },
-      credentials: this.credentials
-    });
+  private request<T>(path: string, options: { method?: string; body?: unknown; skipAuth?: boolean; headers?: Record<string, string>; signal?: AbortSignal } = {}): Promise<T> {
+    const method = options.method ?? "GET";
+    const headers = { ...this.headers(options.skipAuth), ...options.headers };
+    return this.execute(() => ofetch<T>(this.baseUrl + path, {
+      method, body: options.body as Record<string, unknown> | undefined, headers,
+      credentials: this.credentials, retry: 0, signal: options.signal
+    }), method, headers, options.signal);
+  }
+
+  private async execute<T>(request: () => Promise<T>, method: string, headers: Record<string, string>, signal?: AbortSignal): Promise<T> {
+    const retrySafe = isRetrySafe(method, headers);
+    const maxAttempts = retrySafe ? (this.retry?.maxAttempts ?? 1) : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (signal?.aborted) throw cancelledError(signal.reason);
+      try {
+        return await request();
+      } catch (cause) {
+        const error = toFramekitSdkError(cause, signal);
+        if (attempt >= maxAttempts || !isRetryable(error)) throw error;
+        const exponential = (this.retry?.baseDelayMs ?? 100) * 2 ** (attempt - 1);
+        await abortableDelay(Math.min(error.retryAfterMs ?? exponential, this.retry?.maxDelayMs ?? 5_000), signal);
+      }
+    }
+    throw new FramekitTransportError("Request attempts exhausted.", "REQUEST_ATTEMPTS_EXHAUSTED", undefined, undefined, undefined, undefined);
   }
 
   private headers(skipAuth = false): Record<string, string> {
@@ -499,9 +564,23 @@ export function createClient(options: FramekitClientOptions): FramekitClient {
   return new FramekitClient(options);
 }
 
+export function upgradeFramekitClientConfig(input: FramekitClientOptions): FramekitConfigUpgradeResult {
+  const version = input.version;
+  if (version !== undefined && version !== 1 && version !== 2) {
+    throw new Error(`Unsupported Framekit SDK config version: ${String(version)}. Upgrade with a client that supports that version first.`);
+  }
+  const diagnostics: FramekitConfigUpgradeDiagnostic[] = [];
+  if (version === undefined) diagnostics.push({ code: "ASSUMED_V1", message: "Unversioned SDK config was interpreted as version 1; persist version: 2 after reviewing retry policy." });
+  if (version === 1) diagnostics.push({ code: "UPGRADED_V1", message: "SDK config version 1 upgraded to version 2 with retries disabled by default." });
+  const { version: _version, ...values } = input;
+  return { config: { ...values, version: 2 }, diagnostics };
+}
+
 export function generateSdkTypes(app: AppDefinition): string {
   const lines: string[] = [
     "import type { DocumentRecord } from \"@framekit/core\";",
+    "export { FramekitSdkError, FramekitValidationError, FramekitAuthenticationError, FramekitAuthorizationError, FramekitNotFoundError, FramekitConflictError, FramekitRateLimitError, FramekitServerError, FramekitTransportError, FramekitCancelledError } from \"@framekit/sdk\";",
+    "export type { FramekitClientConfigV1, FramekitClientConfigV2, FramekitRetryPolicy } from \"@framekit/sdk\";",
     ""
   ];
   for (const doctype of listDocTypes(app)) {
@@ -554,6 +633,75 @@ function mutationHeaders(options: MutationRequestOptions): Record<string, string
     ...(options.expectedRevision === undefined ? {} : { "if-match": String(options.expectedRevision) }),
     ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {})
   };
+}
+
+function normalizeRetryPolicy(policy: FramekitRetryPolicy | undefined): Required<FramekitRetryPolicy> | undefined {
+  if (!policy) return undefined;
+  if (!Number.isInteger(policy.maxAttempts) || policy.maxAttempts < 1 || policy.maxAttempts > 5) {
+    throw new Error("retry.maxAttempts must be an integer between 1 and 5.");
+  }
+  const baseDelayMs = policy.baseDelayMs ?? 100;
+  const maxDelayMs = policy.maxDelayMs ?? 5_000;
+  if (!Number.isFinite(baseDelayMs) || baseDelayMs < 0 || !Number.isFinite(maxDelayMs) || maxDelayMs < baseDelayMs) {
+    throw new Error("Retry delays must be finite, non-negative, and maxDelayMs must be at least baseDelayMs.");
+  }
+  return { maxAttempts: policy.maxAttempts, baseDelayMs, maxDelayMs };
+}
+
+function isRetrySafe(method: string, headers: Record<string, string>): boolean {
+  return ["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase()) || Boolean(headers["idempotency-key"]);
+}
+
+function isRetryable(error: FramekitSdkError): boolean {
+  return error instanceof FramekitTransportError || error instanceof FramekitRateLimitError || [408, 425, 500, 502, 503, 504].includes(error.status ?? 0);
+}
+
+function toFramekitSdkError(cause: unknown, signal?: AbortSignal): FramekitSdkError {
+  if (cause instanceof FramekitSdkError) return cause;
+  if (signal?.aborted || (cause instanceof Error && cause.name === "AbortError")) return cancelledError(signal?.reason ?? cause);
+  const candidate = cause as { response?: { status?: number; headers?: Headers; _data?: unknown }; data?: unknown; message?: string };
+  const status = candidate.response?.status;
+  const payload = (candidate.response?._data ?? candidate.data) as { code?: unknown; message?: unknown; details?: unknown } | undefined;
+  const code = typeof payload?.code === "string" ? payload.code : status ? `HTTP_${status}` : "TRANSPORT_ERROR";
+  const message = typeof payload?.message === "string" ? payload.message : candidate.message ?? "Framekit request failed.";
+  const requestId = candidate.response?.headers?.get("x-request-id") ?? undefined;
+  const retryAfterMs = parseRetryAfter(candidate.response?.headers?.get("retry-after"));
+  const args = [message, code, status, payload?.details, requestId, retryAfterMs, { cause }] as const;
+  if (status === 400 || status === 422) return new FramekitValidationError(...args);
+  if (status === 401) return new FramekitAuthenticationError(...args);
+  if (status === 403) return new FramekitAuthorizationError(...args);
+  if (status === 404) return new FramekitNotFoundError(...args);
+  if (status === 409) return new FramekitConflictError(...args);
+  if (status === 429) return new FramekitRateLimitError(...args);
+  if (status && status >= 500) return new FramekitServerError(...args);
+  return new FramekitTransportError(...args);
+}
+
+function cancelledError(reason: unknown): FramekitCancelledError {
+  return new FramekitCancelledError("Framekit request was cancelled.", "REQUEST_CANCELLED", undefined, reason, undefined, undefined, { cause: reason });
+}
+
+function parseRetryAfter(value: string | null | undefined): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const date = Date.parse(value);
+  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(cancelledError(signal.reason));
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(cancelledError(signal?.reason));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function tsType(field: FieldDefinition): string {

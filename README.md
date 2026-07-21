@@ -197,6 +197,8 @@ await client.authAudit();
 await client.logout();
 ```
 
+SDK failures are typed and preserve server status, code, details, and request identity. Retries are opt-in and limited to safe/idempotent operations; see [SDK errors, retries, and configuration upgrades](docs/sdk-errors-and-retries.md).
+
 Provider login uses the same session shape after an app registers an auth provider:
 
 ```ts
