@@ -1410,7 +1410,11 @@ function compileDocumentFilters(doctype: DocTypeDefinition, filters: ListOptions
     if (operator.ne !== undefined) {
       conditions.push(operator.ne === null
         ? or(drizzleSql`not (${framekitDocuments.data} ? ${field})`, drizzleSql`${framekitDocuments.data} -> ${field} <> 'null'::jsonb` )!
-        : ne(text, String(operator.ne)));
+        : or(
+            drizzleSql`not (${framekitDocuments.data} ? ${field})`,
+            drizzleSql`${framekitDocuments.data} -> ${field} = 'null'::jsonb`,
+            ne(text, String(operator.ne))
+          )!);
     }
     if (operator.in !== undefined) {
       conditions.push(operator.in.length === 0 ? drizzleSql`false` : or(...operator.in.map((value) => equalityFilter(field, text, value)))!);
@@ -1431,7 +1435,11 @@ function compileDocumentFilters(doctype: DocTypeDefinition, filters: ListOptions
 
 function equalityFilter(field: string, text: SQL<string>, value: unknown): SQL {
   if (value === null) return drizzleSql`${framekitDocuments.data} -> ${field} = 'null'::jsonb`;
-  return eq(text, String(value));
+  return and(
+    drizzleSql`${framekitDocuments.data} ? ${field}`,
+    drizzleSql`${framekitDocuments.data} -> ${field} <> 'null'::jsonb`,
+    eq(text, String(value))
+  )!;
 }
 
 function containsPattern(value: string): string {

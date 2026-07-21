@@ -260,6 +260,48 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     const postgresNext = await stores.repository.listPage(tenant, queryDocType, nextOptions);
     expect(postgresNext).toEqual(await memory.listPage(tenant, queryDocType, nextOptions));
     expect(postgresNext.items.map((record) => record.id)).toEqual(["query-03", "query-04"]);
+
+    const adversarialFixtures = [
+      { id: "query-missing", data: { status: "edge" } },
+      { id: "query-null", data: { name: null, score: null, status: "edge" } },
+      { id: "query-empty", data: { name: "", score: "", status: "edge" } },
+      { id: "query-zero", data: { name: "zero", score: 0, status: "edge" } },
+      { id: "query-unicode-bmp", data: { name: "\uE000", status: "unicode" } },
+      { id: "query-unicode-supplementary", data: { name: "\u{10000}", status: "unicode" } }
+    ];
+    for (const fixture of adversarialFixtures) {
+      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
+      await memory.create(tenant, queryDocType, record);
+      await sql`
+        insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+        values (${record.tenantId}, ${record.doctype}, ${record.id}, 1, null, ${sql.json(record.data)}, ${record.createdAt}, ${record.updatedAt})
+      `;
+    }
+    const equalityShapes: Array<{ options: ListOptions; ids: string[] }> = [
+      { options: { filters: { status: "edge", name: { eq: null } }, sort: { field: "id", direction: "asc" } }, ids: ["query-null"] },
+      { options: { filters: { status: "edge", name: { eq: "" } }, sort: { field: "id", direction: "asc" } }, ids: ["query-empty"] },
+      { options: { filters: { status: "edge", name: { ne: "" } }, sort: { field: "id", direction: "asc" } }, ids: ["query-missing", "query-null", "query-zero"] },
+      { options: { filters: { status: "edge", name: { in: [null, ""] } }, sort: { field: "id", direction: "asc" } }, ids: ["query-empty", "query-null"] },
+      { options: { filters: { status: "edge", name: { isNull: true } }, sort: { field: "id", direction: "asc" } }, ids: ["query-empty", "query-missing", "query-null"] },
+      { options: { filters: { status: "edge", score: { lte: 0 } }, sort: { field: "id", direction: "asc" } }, ids: ["query-zero"] }
+    ];
+    for (const shape of equalityShapes) {
+      const postgresPage = await stores.repository.listPage(tenant, queryDocType, shape.options);
+      expect(postgresPage).toEqual(await memory.listPage(tenant, queryDocType, shape.options));
+      expect(postgresPage.items.map((record) => record.id)).toEqual(shape.ids);
+    }
+
+    const unicodeOptions = { filters: { status: "unicode" }, sort: { field: "name", direction: "asc" } as const, limit: 1 };
+    const unicodeFirst = await stores.repository.listPage(tenant, queryDocType, unicodeOptions);
+    expect(unicodeFirst).toEqual(await memory.listPage(tenant, queryDocType, unicodeOptions));
+    expect(unicodeFirst.items.map((record) => record.id)).toEqual(["query-unicode-bmp"]);
+    const unicodeNextOptions = { ...unicodeOptions, cursor: unicodeFirst.nextCursor };
+    expect(await stores.repository.listPage(tenant, queryDocType, unicodeNextOptions)).toEqual(await memory.listPage(tenant, queryDocType, unicodeNextOptions));
+
+    await expect(stores.repository.listPage(tenant, queryDocType, { filters: { name: { contains: 42 } } as never })).rejects.toMatchObject({ code: "INVALID_QUERY", statusCode: 422 });
+    const forgedNumericCursor = btoa(JSON.stringify({ v: 1, field: "score", direction: "asc", value: "10", id: "query-02" }))
+      .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    await expect(stores.repository.listPage(tenant, queryDocType, { sort: { field: "score", direction: "asc" }, cursor: forgedNumericCursor })).rejects.toMatchObject({ code: "INVALID_CURSOR", statusCode: 422 });
     await expect(stores.repository.listPage(tenant, queryDocType, { sort: { field: "metadata", direction: "asc" } })).rejects.toMatchObject({ code: "UNSUPPORTED_QUERY_SHAPE" });
   });
 

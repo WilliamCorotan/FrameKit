@@ -1392,6 +1392,27 @@ function coerceFieldValue(doctype: string, field: string, type: string, value: u
 }
 
 export function validateListOptions(doctype: DocTypeDefinition, options: ListOptions = {}): void {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new FramekitError("INVALID_QUERY", "Document query options must be an object", 422);
+  }
+  if (options.search !== undefined && typeof options.search !== "string") {
+    throw new FramekitError("INVALID_QUERY", "search must be a string", 422);
+  }
+  if (options.filters !== undefined && (!options.filters || typeof options.filters !== "object" || Array.isArray(options.filters))) {
+    throw new FramekitError("INVALID_QUERY", "filters must be an object", 422);
+  }
+  if (options.sort !== undefined && (
+    !options.sort || typeof options.sort !== "object" || Array.isArray(options.sort) ||
+    typeof options.sort.field !== "string" || ![undefined, "asc", "desc"].includes(options.sort.direction)
+  )) {
+    throw new FramekitError("INVALID_QUERY", "sort must contain a field and an asc or desc direction", 422);
+  }
+  if (options.cursor !== undefined && typeof options.cursor !== "string") {
+    throw new FramekitError("INVALID_QUERY", "cursor must be a string", 422);
+  }
+  if (options.fields !== undefined && (!Array.isArray(options.fields) || !options.fields.every((field) => typeof field === "string"))) {
+    throw new FramekitError("INVALID_QUERY", "fields must be an array of field names", 422);
+  }
   if (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 1_000)) {
     throw new FramekitError("INVALID_LIMIT", "limit must be an integer between 1 and 1000", 422);
   }
@@ -1403,8 +1424,8 @@ export function validateListOptions(doctype: DocTypeDefinition, options: ListOpt
     if (!validFields.has(field)) {
       throw new FramekitError("UNKNOWN_FILTER_FIELD", `Unknown filter field "${field}" for ${doctype.name}`, 422);
     }
-    assertFilterShape(doctype.name, field, filter);
     const fieldDefinition = doctype.fields.find((candidate) => candidate.name === field);
+    assertFilterShape(doctype.name, field, filter, fieldDefinition?.type);
     if (fieldDefinition?.type === "json" && !isJsonNullFilter(filter)) {
       throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `JSON field "${field}" only supports isNull filtering`, 422);
     }
@@ -1495,16 +1516,17 @@ function matchesFilter(actual: unknown, expected: FilterValue, fieldType?: strin
     if ("contains" in expected && expected.contains !== undefined && !String(actual ?? "").toLowerCase().includes(expected.contains.toLowerCase())) {
       return false;
     }
-    if ("gt" in expected && expected.gt !== undefined && !(compareValues(actual, expected.gt, fieldType) > 0)) {
+    const missingNumericValue = (fieldType === "number" || fieldType === "currency") && (actual === undefined || actual === null || actual === "");
+    if ("gt" in expected && expected.gt !== undefined && (missingNumericValue || !(compareValues(actual, expected.gt, fieldType) > 0))) {
       return false;
     }
-    if ("gte" in expected && expected.gte !== undefined && !(compareValues(actual, expected.gte, fieldType) >= 0)) {
+    if ("gte" in expected && expected.gte !== undefined && (missingNumericValue || !(compareValues(actual, expected.gte, fieldType) >= 0))) {
       return false;
     }
-    if ("lt" in expected && expected.lt !== undefined && !(compareValues(actual, expected.lt, fieldType) < 0)) {
+    if ("lt" in expected && expected.lt !== undefined && (missingNumericValue || !(compareValues(actual, expected.lt, fieldType) < 0))) {
       return false;
     }
-    if ("lte" in expected && expected.lte !== undefined && !(compareValues(actual, expected.lte, fieldType) <= 0)) {
+    if ("lte" in expected && expected.lte !== undefined && (missingNumericValue || !(compareValues(actual, expected.lte, fieldType) <= 0))) {
       return false;
     }
     return true;
@@ -1515,18 +1537,49 @@ function matchesFilter(actual: unknown, expected: FilterValue, fieldType?: strin
   return sameValue(actual, expected);
 }
 
-function assertFilterShape(doctype: string, field: string, filter: FilterValue): void {
-  if (!isFilterOperator(filter)) {
+function assertFilterShape(doctype: string, field: string, filter: FilterValue, fieldType?: string): void {
+  const invalid = (message: string): never => {
+    throw new FramekitError("INVALID_QUERY", `${doctype}.${field} ${message}`, 422);
+  };
+  if (Array.isArray(filter)) {
+    if (!filter.every(isFilterPrimitive)) invalid("array filters must contain only scalar values");
     return;
   }
+  if (!isFilterOperator(filter)) return;
   const allowed = new Set(["eq", "ne", "in", "contains", "gt", "gte", "lt", "lte", "isNull"]);
   const unknown = Object.keys(filter).filter((key) => !allowed.has(key));
   if (unknown.length > 0) {
-    throw new FramekitError("UNKNOWN_FILTER_OPERATOR", `Unknown filter operator for ${doctype}.${field}: ${unknown.join(", ")}`, 422);
+    invalid(`contains unknown filter operators: ${unknown.join(", ")}`);
   }
+  if (Object.keys(filter).length === 0) invalid("filter operator object must not be empty");
   if (filter.in !== undefined && !Array.isArray(filter.in)) {
-    throw new FramekitError("INVALID_FILTER", `${doctype}.${field}.in must be an array`, 422);
+    invalid("in filter must be an array");
   }
+  if (filter.in?.some((value) => !isFilterPrimitive(value))) invalid("in filter must contain only scalar values");
+  if (filter.contains !== undefined && typeof filter.contains !== "string") invalid("contains filter must be a string");
+  if (filter.isNull !== undefined && typeof filter.isNull !== "boolean") invalid("isNull filter must be a boolean");
+  for (const operator of ["eq", "ne", "gt", "gte", "lt", "lte"] as const) {
+    const value = filter[operator];
+    if (value !== undefined && !isFilterPrimitive(value)) invalid(`${operator} filter must be a scalar value`);
+  }
+  for (const operator of ["gt", "gte", "lt", "lte"] as const) {
+    const value = filter[operator];
+    if (value !== undefined && typeof value !== "string" && (typeof value !== "number" || !Number.isFinite(value))) {
+      invalid(`${operator} filter must be a string or finite number`);
+    }
+  }
+  if (fieldType === "number" || fieldType === "currency") {
+    for (const operator of ["gt", "gte", "lt", "lte"] as const) {
+      const value = filter[operator];
+      if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
+        invalid(`${operator} filter must be a finite number`);
+      }
+    }
+  }
+}
+
+function isFilterPrimitive(value: unknown): value is FilterPrimitive {
+  return value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
 
 function isFilterOperator(value: unknown): value is FilterOperator {
@@ -1538,14 +1591,24 @@ function isJsonNullFilter(value: FilterValue): boolean {
 }
 
 function sameValue(left: unknown, right: unknown): boolean {
+  if (left === undefined) return false;
+  if (left === null || right === null) return left === right;
   return String(left) === String(right);
 }
 
 function compareValues(left: unknown, right: unknown, fieldType?: string): number {
   if (fieldType === "number" || fieldType === "currency") return Number(left) - Number(right);
-  const leftValue = String(left ?? "");
-  const rightValue = String(right ?? "");
-  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
+  return compareCodePoints(String(left ?? ""), String(right ?? ""));
+}
+
+/** Matches PostgreSQL UTF-8 byte ordering under the C collation. */
+function compareCodePoints(left: string, right: string): number {
+  const leftPoints = Array.from(left, (character) => character.codePointAt(0)!);
+  const rightPoints = Array.from(right, (character) => character.codePointAt(0)!);
+  for (let index = 0; index < Math.min(leftPoints.length, rightPoints.length); index += 1) {
+    if (leftPoints[index] !== rightPoints[index]) return leftPoints[index]! - rightPoints[index]!;
+  }
+  return leftPoints.length - rightPoints.length;
 }
 
 function filterPrimitive(value: unknown): FilterPrimitive {
@@ -1561,7 +1624,7 @@ export function sortRecords(records: DocumentRecord[], sort: ListOptions["sort"]
   return [...records].sort((left, right) => {
     const primary = compareValues(sortableValue(left, sort.field), sortableValue(right, sort.field), fieldType);
     if (primary !== 0) return direction * primary;
-    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+    return compareCodePoints(left.id, right.id);
   });
 }
 
@@ -1621,6 +1684,14 @@ export function decodeDocumentCursor(cursor: string, sort: ListOptions["sort"], 
   if (field?.type === "json") {
     throw new FramekitError("UNSUPPORTED_QUERY_SHAPE", `Sorting JSON field "${field.name}" is not supported`, 422);
   }
+  const expectedValueType = field?.type === "number" || field?.type === "currency"
+    ? "number"
+    : field?.type === "boolean"
+      ? "boolean"
+      : "string";
+  if (typeof candidate.value !== expectedValueType || (expectedValueType === "number" && !Number.isFinite(candidate.value))) {
+    throw new FramekitError("INVALID_CURSOR", "Cursor value does not match the requested sort field", 422);
+  }
   return candidate as DocumentCursor;
 }
 
@@ -1628,7 +1699,7 @@ function recordAfterCursor(record: DocumentRecord, cursor: DocumentCursor, docty
   const fieldType = doctype?.fields.find((field) => field.name === cursor.field)?.type;
   const primary = compareValues(sortableValue(record, cursor.field), cursor.value, fieldType);
   const directed = cursor.direction === "asc" ? primary : -primary;
-  return directed > 0 || (directed === 0 && record.id > cursor.id);
+  return directed > 0 || (directed === 0 && compareCodePoints(record.id, cursor.id) > 0);
 }
 
 function normalizeSort(sort: ListOptions["sort"]): { field: string; direction: "asc" | "desc" } {

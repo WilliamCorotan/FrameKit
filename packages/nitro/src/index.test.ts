@@ -663,6 +663,13 @@ describe("createNitroHandler", () => {
 
     const filtered = await json<Array<{ id: string }>>(fetch, `/api/doctypes/customer?filters=${encodeURIComponent(JSON.stringify({ name: { contains: "cm" } }))}`, { headers });
     expect(filtered).toHaveLength(1);
+    await expect(json(fetch, `/api/doctypes/customer?filters=${encodeURIComponent(JSON.stringify({ name: { contains: 42 } }))}`, { headers }))
+      .rejects.toMatchObject({ code: "INVALID_QUERY" });
+
+    const forgedCursor = btoa(JSON.stringify({ v: 1, field: "name", direction: "asc", value: 42, id: created.id }))
+      .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    await expect(json(fetch, `/api/doctypes/customer?sort=name:asc&cursor=${encodeURIComponent(forgedCursor)}`, { headers }))
+      .rejects.toMatchObject({ code: "INVALID_CURSOR" });
 
     const projectedResponse = await fetch(new Request("http://localhost/api/doctypes/customer?sort=name:asc&fields=name&limit=1", { headers }));
     const projected = await projectedResponse.json() as Array<{ id: string; data: Record<string, unknown> }>;
