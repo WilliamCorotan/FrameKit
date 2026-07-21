@@ -233,6 +233,7 @@ export type OnlineMigrationRun = {
   status: "pending" | "running" | "failed" | "completed";
   checkpoint: OnlineMigrationCheckpoint;
   approval: MigrationApproval;
+  attemptId?: string;
   error?: string;
   startedAt: string;
   updatedAt: string;

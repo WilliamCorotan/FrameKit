@@ -1550,7 +1550,7 @@ export class PostgresMigrationStore implements MigrationStore {
     const rows = await this.sql<OnlineMigrationRunSqlRow[]>`
       select tenant_id as "tenantId", app_name as "appName", migration_id as "migrationId",
              plan_digest as "planDigest", conversion_digest as "conversionDigest", status, checkpoint,
-             approval, error, started_at as "startedAt", updated_at as "updatedAt", completed_at as "completedAt"
+             approval, attempt_id as "attemptId", error, started_at as "startedAt", updated_at as "updatedAt", completed_at as "completedAt"
       from framekit_migration_runs
       where tenant_id = ${tenant.tenantId} and app_name = ${appName} and migration_id = ${migrationId}
       limit 1
@@ -1561,24 +1561,29 @@ export class PostgresMigrationStore implements MigrationStore {
   async applyOnlinePlan(tenant: TenantContext, plan: MigrationPlan, options: OnlineMigrationOptions): Promise<MigrationRecord> {
     await validateMigrationPlan(plan);
     assertMigrationIdentity(tenant, plan.appName, plan);
-    const conversions = validateOnlineConversions(plan, options.conversionHooks);
+    const conversions = await validateOnlineConversions(plan, options.conversionHooks);
     const conversionDigest = await onlineConversionDigest(conversions);
     validateOnlineOptions(plan, options);
+    const attemptId = crypto.randomUUID();
     const checkpoint = { conversionIndex: 0, processed: 0 };
     await this.withOnlineLock(tenant, plan, options.lockTimeoutMs ?? 5_000, async (sql) => {
       const existing = await selectOnlineRun(sql, tenant.tenantId, plan.appName, plan.id);
       if (existing) {
         assertOnlineRunMatches(existing, plan, conversionDigest);
+        if (existing.approval.outcome === "rejected") throw new FramekitError("MIGRATION_APPROVAL_REJECTED", "Rejected online migration evidence is terminal; create a distinct reviewed plan and run identity.", 409);
+        if (stableOnlineJson(existing.approval) !== stableOnlineJson(options.approval)) throw new FramekitError("MIGRATION_APPROVAL_DRIFT", "Resume approval does not match the stored approval evidence.", 409);
+        await sql`update framekit_migration_runs set attempt_id = ${attemptId}, updated_at = now()
+          where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id} and status <> 'completed'`;
         return;
       }
       await sql`
         insert into framekit_migration_runs (
           tenant_id, app_name, migration_id, plan_digest, conversion_digest, status, checkpoint,
-          approval, error, started_at, updated_at
+          approval, attempt_id, error, started_at, updated_at
         ) values (
           ${tenant.tenantId}, ${plan.appName}, ${plan.id}, ${plan.checksum}, ${conversionDigest},
           ${options.approval.outcome === "approved" ? "pending" : "failed"}, ${JSON.stringify(checkpoint)}::jsonb,
-          ${JSON.stringify(options.approval)}::jsonb, ${options.approval.outcome === "approved" ? null : "Migration approval was rejected."}, now(), now()
+          ${JSON.stringify(options.approval)}::jsonb, ${options.approval.outcome === "approved" ? attemptId : null}, ${options.approval.outcome === "approved" ? null : "Migration approval was rejected."}, now(), now()
         )
       `;
     });
@@ -1594,7 +1599,7 @@ export class PostgresMigrationStore implements MigrationStore {
           tenant,
           plan,
           options.lockTimeoutMs ?? 5_000,
-          async (sql) => this.transformOnlineChunk(sql, tenant, plan, conversions, options.conversionHooks, conversionDigest, chunkSize)
+          async (sql) => this.transformOnlineChunk(sql, tenant, plan, conversions, options.conversionHooks, conversionDigest, chunkSize, attemptId)
         ));
         if (transformed) break;
       }
@@ -1602,6 +1607,7 @@ export class PostgresMigrationStore implements MigrationStore {
         const run = await selectOnlineRun(sql, tenant.tenantId, plan.appName, plan.id);
         if (!run) throw new FramekitError("MIGRATION_RUN_MISSING", "Online migration run state is missing.", 409);
         assertOnlineRunMatches(run, plan, conversionDigest);
+        if (run.approval.outcome === "rejected") throw new FramekitError("MIGRATION_APPROVAL_REJECTED", "Rejected online migration evidence is terminal.", 409);
         const prior = await selectAppliedMigration(sql, tenant.tenantId, plan.appName, plan.id);
         if (prior) {
           if (prior.checksum !== plan.checksum) throw new FramekitError("MIGRATION_ID_CONFLICT", `Migration ID "${plan.id}" was already applied with a different checksum.`, 409);
@@ -1630,11 +1636,16 @@ export class PostgresMigrationStore implements MigrationStore {
         return record;
       });
     } catch (error) {
-      await this.sql`
-        update framekit_migration_runs set status = 'failed', error = ${errorMessage(error)}, updated_at = now()
-        where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id}
-          and plan_digest = ${plan.checksum} and conversion_digest = ${conversionDigest}
-      `;
+      if (!(error instanceof FramekitError && error.code === "MIGRATION_LOCK_TIMEOUT")) {
+        await this.withOnlineLock(tenant, plan, options.lockTimeoutMs ?? 5_000, async (sql) => {
+          const applied = await selectAppliedMigration(sql, tenant.tenantId, plan.appName, plan.id);
+          if (applied) return;
+          await sql`update framekit_migration_runs set status = 'failed', error = ${errorMessage(error)}, updated_at = now()
+            where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id}
+              and plan_digest = ${plan.checksum} and conversion_digest = ${conversionDigest}
+              and attempt_id = ${attemptId} and status <> 'completed'`;
+        });
+      }
       throw error;
     }
   }
@@ -1646,12 +1657,16 @@ export class PostgresMigrationStore implements MigrationStore {
     conversions: MigrationConversion[],
     hooks: MigrationConversionHook[],
     conversionDigest: string,
-    chunkSize: number
+    chunkSize: number,
+    attemptId: string
   ): Promise<boolean> {
     const run = await selectOnlineRun(sql, tenant.tenantId, plan.appName, plan.id);
     if (!run) throw new FramekitError("MIGRATION_RUN_MISSING", "Online migration run state is missing.", 409);
     assertOnlineRunMatches(run, plan, conversionDigest);
+    if (run.approval.outcome === "rejected") throw new FramekitError("MIGRATION_APPROVAL_REJECTED", "Rejected online migration evidence is terminal.", 409);
     if (run.status === "completed" || run.checkpoint.conversionIndex >= conversions.length) return true;
+    await sql`update framekit_migration_runs set attempt_id = ${attemptId}, status = 'running', updated_at = now()
+      where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id} and status <> 'completed'`;
     const conversion = conversions[run.checkpoint.conversionIndex]!;
     const hook = hooks.find((candidate) => candidate.id === conversion.id && candidate.version === conversion.version)!;
     const rows = await sql<{ id: string; data: Record<string, unknown> }[]>`
@@ -1682,11 +1697,14 @@ export class PostgresMigrationStore implements MigrationStore {
       ...(finishedConversion || rows.length === 0 ? {} : { lastDocumentId: rows.at(-1)!.id }),
       processed: run.checkpoint.processed + rows.length
     };
-    await sql`
+    const updated = await sql<{ migrationId: string }[]>`
       update framekit_migration_runs set status = 'running', checkpoint = ${JSON.stringify(nextCheckpoint)}::jsonb,
         error = null, updated_at = now()
       where tenant_id = ${tenant.tenantId} and app_name = ${plan.appName} and migration_id = ${plan.id}
+        and attempt_id = ${attemptId} and checkpoint = ${JSON.stringify(run.checkpoint)}::jsonb and status <> 'completed'
+      returning migration_id as "migrationId"
     `;
+    if (!updated[0]) throw new FramekitError("MIGRATION_ATTEMPT_SUPERSEDED", "Online migration checkpoint ownership changed; retry the run.", 409);
     return nextCheckpoint.conversionIndex >= conversions.length;
   }
 
@@ -2003,12 +2021,14 @@ create table if not exists framekit_migration_runs (
   status text not null,
   checkpoint jsonb not null,
   approval jsonb not null,
+  attempt_id text,
   error text,
   started_at timestamptz not null,
   updated_at timestamptz not null,
   completed_at timestamptz,
   constraint framekit_migration_runs_identity unique (tenant_id, app_name, migration_id)
 );
+alter table framekit_migration_runs add column if not exists attempt_id text;
 create index if not exists framekit_migration_runs_status on framekit_migration_runs (tenant_id, app_name, status, updated_at);
 `;
 }
@@ -2087,7 +2107,8 @@ type MigrationSqlRow = {
   appliedAt: Date | string;
 };
 
-type OnlineMigrationRunSqlRow = Omit<OnlineMigrationRun, "startedAt" | "updatedAt" | "completedAt" | "error"> & {
+type OnlineMigrationRunSqlRow = Omit<OnlineMigrationRun, "startedAt" | "updatedAt" | "completedAt" | "error" | "attemptId"> & {
+  attemptId: string | null;
   error: string | null;
   startedAt: Date | string;
   updatedAt: Date | string;
@@ -2095,11 +2116,12 @@ type OnlineMigrationRunSqlRow = Omit<OnlineMigrationRun, "startedAt" | "updatedA
 };
 
 function onlineMigrationSqlRowToRun(row: OnlineMigrationRunSqlRow): OnlineMigrationRun {
-  const { completedAt, error, ...rest } = row;
+  const { completedAt, error, attemptId, ...rest } = row;
   return {
     ...rest,
     startedAt: isoTimestamp(row.startedAt),
     updatedAt: isoTimestamp(row.updatedAt),
+    ...(attemptId ? { attemptId } : {}),
     ...(error ? { error } : {}),
     ...(completedAt ? { completedAt: isoTimestamp(completedAt) } : {})
   };
@@ -2109,20 +2131,53 @@ function isoTimestamp(value: Date | string): string {
   return typeof value === "string" ? new Date(value).toISOString() : value.toISOString();
 }
 
-function validateOnlineConversions(plan: MigrationPlan, hooks: MigrationConversionHook[]): MigrationConversion[] {
+async function validateOnlineConversions(plan: MigrationPlan, hooks: MigrationConversionHook[]): Promise<MigrationConversion[]> {
   const conversions = plan.conversions ?? [];
   const typeChanges = plan.changes.filter((change) => change.kind === "change_field_type");
   if (conversions.length !== typeChanges.length) {
     throw new FramekitError("MISSING_MIGRATION_CONVERSION", "Every field type change requires exactly one versioned conversion.", 422);
   }
+  const conversionIdentities = new Set<string>();
   for (const conversion of conversions) {
-    const hook = hooks.find((candidate) => candidate.id === conversion.id && candidate.version === conversion.version);
+    const identity = `${conversion.id}@${conversion.version}`;
+    if (conversionIdentities.has(identity)) throw new FramekitError("DUPLICATE_MIGRATION_CONVERSION", `Conversion descriptor ${identity} is registered more than once.`, 422);
+    conversionIdentities.add(identity);
+  }
+  const hookIdentities = new Set<string>();
+  for (const hook of hooks) {
+    const identity = `${hook.id}@${hook.version}`;
+    if (hookIdentities.has(identity)) throw new FramekitError("DUPLICATE_MIGRATION_CONVERSION", `Conversion hook ${identity} is registered more than once.`, 422);
+    hookIdentities.add(identity);
+  }
+  for (const conversion of conversions) {
+    const matches = hooks.filter((candidate) => candidate.id === conversion.id && candidate.version === conversion.version);
+    const hook = matches[0];
     if (!hook) throw new FramekitError("MISSING_MIGRATION_CONVERSION", `Conversion hook ${conversion.id}@${conversion.version} is not registered.`, 422);
-    if (hook.codeDigest !== conversion.codeDigest) {
+    const derivedDigest = await migrationConversionCodeDigest({ ...conversion, convert: hook.convert });
+    if (hook.codeDigest !== derivedDigest || conversion.codeDigest !== derivedDigest) {
       throw new FramekitError("MIGRATION_CONVERSION_DRIFT", `Conversion hook ${conversion.id}@${conversion.version} does not match the reviewed code digest.`, 409);
     }
   }
   return conversions;
+}
+
+export async function migrationConversionCodeDigest(
+  conversion: Omit<MigrationConversion, "codeDigest"> & Pick<MigrationConversionHook, "convert">
+): Promise<string> {
+  const descriptor = {
+    id: conversion.id,
+    version: conversion.version,
+    doctype: conversion.doctype,
+    field: conversion.field,
+    fromType: conversion.fromType,
+    toType: conversion.toType
+  };
+  const source = Function.prototype.toString.call(conversion.convert);
+  const bytes = new TextEncoder().encode(stableOnlineJson({ descriptor, source }));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  let binary = "";
+  for (const byte of digest) binary += String.fromCharCode(byte);
+  return `sha256:${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "")}`;
 }
 
 function validateOnlineOptions(plan: MigrationPlan, options: OnlineMigrationOptions): void {
@@ -2159,7 +2214,44 @@ function stableOnlineJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function assertJsonSafeOnlineValue(value: unknown, path = "value", ancestors = new WeakSet<object>()): void {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (Number.isFinite(value)) return;
+    throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must be a finite JSON number.`, 422);
+  }
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must not contain circular references.`, 422);
+    ancestors.add(value);
+    if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0 || Object.getOwnPropertyNames(value).length !== value.length + 1) {
+      throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must be a plain JSON array.`, 422);
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor?.enumerable || !("value" in descriptor)) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must be a dense plain-data JSON array.`, 422);
+      assertJsonSafeOnlineValue(descriptor.value, `${path}[${index}]`, ancestors);
+    }
+    ancestors.delete(value);
+    return;
+  }
+  if (value && typeof value === "object") {
+    if (ancestors.has(value)) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must not contain circular references.`, 422);
+    ancestors.add(value);
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must be a plain JSON object.`, 422);
+    if (Object.getOwnPropertySymbols(value).length > 0) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} must not contain symbol properties.`, 422);
+    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+      if (!descriptor.enumerable || !("value" in descriptor)) throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path}.${key} must be enumerable plain data.`, 422);
+      assertJsonSafeOnlineValue(descriptor.value, `${path}.${key}`, ancestors);
+    }
+    ancestors.delete(value);
+    return;
+  }
+  throw new FramekitError("INVALID_MIGRATION_CONVERSION_VALUE", `${path} is not JSON-safe.`, 422);
+}
+
 function assertOnlineConversionValue(conversion: MigrationConversion, value: unknown, documentId: string): void {
+  assertJsonSafeOnlineValue(value, `${conversion.id}@${conversion.version} document ${documentId}`);
   let compatible = value === null;
   switch (conversion.toType) {
     case "number":
@@ -2174,11 +2266,6 @@ function assertOnlineConversionValue(conversion: MigrationConversion, value: unk
       break;
     default:
       compatible ||= typeof value === "string";
-  }
-  try {
-    if (value !== undefined) JSON.stringify(value);
-  } catch {
-    compatible = false;
   }
   if (!compatible) {
     throw new FramekitError(
@@ -2229,7 +2316,7 @@ async function selectOnlineRun(
   const rows = await sql<OnlineMigrationRunSqlRow[]>`
     select tenant_id as "tenantId", app_name as "appName", migration_id as "migrationId",
            plan_digest as "planDigest", conversion_digest as "conversionDigest", status, checkpoint,
-           approval, error, started_at as "startedAt", updated_at as "updatedAt", completed_at as "completedAt"
+           approval, attempt_id as "attemptId", error, started_at as "startedAt", updated_at as "updatedAt", completed_at as "completedAt"
     from framekit_migration_runs
     where tenant_id = ${tenantId} and app_name = ${appName} and migration_id = ${migrationId}
     limit 1
@@ -2263,8 +2350,8 @@ async function insertAppliedMigration(sql: postgres.TransactionSql, record: Migr
 
 async function markOnlineRunCompleted(sql: postgres.TransactionSql, tenantId: string, appName: string, migrationId: string): Promise<void> {
   await sql`
-    update framekit_migration_runs set status = 'completed', error = null, updated_at = now(), completed_at = now()
-    where tenant_id = ${tenantId} and app_name = ${appName} and migration_id = ${migrationId}
+    update framekit_migration_runs set status = 'completed', attempt_id = null, error = null, updated_at = now(), completed_at = now()
+    where tenant_id = ${tenantId} and app_name = ${appName} and migration_id = ${migrationId} and status <> 'completed'
   `;
 }
 

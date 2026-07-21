@@ -7,6 +7,7 @@ import {
   createCustomFieldTableSql,
   createDocumentTableSql,
   createMigrationTableSql,
+  migrationConversionCodeDigest,
   createNamingSeriesTableSql,
   createOutboxTableSql,
   createPostgresMigrationSql,
@@ -46,8 +47,26 @@ describe("db migration sql", () => {
     expect(createMigrationTableSql()).toContain("framekit_migrations");
     expect(createMigrationTableSql()).toContain("framekit_migration_runs");
     expect(createMigrationTableSql()).toContain("conversion_digest");
+    expect(createMigrationTableSql()).toContain("attempt_id text");
     expect(createMigrationTableSql()).toContain("approval jsonb not null");
     expect(createMigrationTableSql()).toContain("checksum");
+  });
+
+  it("binds online conversion digests to the descriptor and implementation", async () => {
+    const descriptor = {
+      id: "customer-score-number",
+      version: 1,
+      doctype: "customer",
+      field: "score",
+      fromType: "text",
+      toType: "number"
+    };
+    const convert = (value: unknown) => Number(value);
+    const digest = await migrationConversionCodeDigest({ ...descriptor, convert });
+
+    await expect(migrationConversionCodeDigest({ ...descriptor, convert })).resolves.toBe(digest);
+    await expect(migrationConversionCodeDigest({ ...descriptor, field: "other", convert })).resolves.not.toBe(digest);
+    await expect(migrationConversionCodeDigest({ ...descriptor, convert: () => 42 })).resolves.not.toBe(digest);
   });
 
   it("generates executable SQL for JSON document migration plans", async () => {
