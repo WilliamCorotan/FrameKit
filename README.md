@@ -40,7 +40,7 @@ pnpm dev:desk
 
 The Desk usually runs at `http://localhost:5173`. If that port is occupied, Vite will choose the next available port.
 
-Default CRM login:
+Development-only CRM login:
 
 ```json
 { "email": "admin@example.com", "password": "admin12345" }
@@ -140,6 +140,7 @@ Example login and authenticated request:
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:3000/api/auth/login \
   -H 'content-type: application/json' \
+  -H 'origin: http://localhost:3000' \
   -d '{"email":"admin@example.com","password":"admin12345"}' \
   | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).token))')
 
@@ -286,10 +287,11 @@ When `DATABASE_URL` is set, the CRM example uses Postgres for:
 Nitro can also emit provider-specific outputs through `NITRO_PRESET`. Keep long-running work behind queue/outbox ports for serverless deployments.
 
 See [docs/deployment.md](docs/deployment.md).
+See [docs/security.md](docs/security.md) before exposing a deployment to untrusted traffic.
 
 ## Environment
 
-Copy `.env.example` when running a durable deployment:
+Copy `.env.example` only for local development. Production deployments start from `.env.production.example` and provision blank secrets through the deployment platform:
 
 ```bash
 cp .env.example .env
@@ -300,9 +302,10 @@ Important variables:
 ```txt
 DATABASE_URL=postgresql://framekit:framekit@localhost:5432/framekit
 REDIS_URL=redis://localhost:6379
-FRAMEKIT_AUTH_SECRET=replace-with-at-least-16-characters
-FRAMEKIT_ADMIN_EMAIL=admin@example.com
-FRAMEKIT_ADMIN_PASSWORD=admin12345
+FRAMEKIT_AUTH_SECRET=<provision-at-least-32-random-characters>
+FRAMEKIT_ALLOWED_ORIGINS=https://desk.example.com
+FRAMEKIT_ADMIN_EMAIL=ops@your-company.example
+FRAMEKIT_ADMIN_PASSWORD=<provision-with-a-secret-manager>
 VITE_FRAMEKIT_API_URL=http://localhost:3000
 ```
 
@@ -319,6 +322,7 @@ The scaffold includes:
 - `routes/[...].ts`
 - `src/app.ts`
 - `.env.example`
+- `.env.production.example`
 - `Dockerfile`
 - A starter `Note` DocType
 

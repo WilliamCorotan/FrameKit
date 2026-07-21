@@ -9,8 +9,10 @@ if (!existsSync(serverEntry)) {
   throw new Error("Built CRM server not found. Run `pnpm --filter @framekit/example-crm build` before `smoke:built`.");
 }
 
-process.env.FRAMEKIT_ADMIN_EMAIL = "admin@example.com";
-process.env.FRAMEKIT_ADMIN_PASSWORD = "admin12345";
+process.env.FRAMEKIT_AUTH_SECRET = "BuiltSmoke!9qL2vN7xK4mR8sW5cT1hP6z";
+process.env.FRAMEKIT_ADMIN_EMAIL = "smoke@framekit.test";
+process.env.FRAMEKIT_ADMIN_PASSWORD = "Built smoke bootstrap passphrase";
+process.env.FRAMEKIT_ALLOWED_ORIGINS = "http://built.local";
 
 let server;
 globalThis.__srvxLoader__ = ({ server: loadedServer }) => {
@@ -32,9 +34,10 @@ try {
 
   const login = await json(fetchHandler, "/api/auth/login", {
     method: "POST",
+    headers: { origin: "http://built.local" },
     body: {
-      email: "admin@example.com",
-      password: "admin12345"
+      email: "smoke@framekit.test",
+      password: "Built smoke bootstrap passphrase"
     }
   });
   const headers = { authorization: `Bearer ${login.token}` };

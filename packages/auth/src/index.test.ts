@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createOidcProvider,
   hashPassword,
@@ -11,6 +11,21 @@ import {
 } from "./index.js";
 
 describe("PasswordAuthService", () => {
+  it("rejects weak or placeholder signing secrets in production", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    try {
+      expect(() => new PasswordAuthService({
+        secret: "development-secret-change-me",
+        userStore: new InMemoryUserStore([])
+      })).toThrow("strong, non-default value");
+      expect(() => new PasswordAuthService({
+        secret: "C8oY!6nq2Wz7Lk4pR9sV5xB3mJ1hT0uF",
+        userStore: new InMemoryUserStore([])
+      })).not.toThrow();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it("logs in and verifies signed sessions", async () => {
     const store = new InMemoryUserStore([
       {

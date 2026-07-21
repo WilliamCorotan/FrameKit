@@ -172,9 +172,7 @@ export class PasswordAuthService {
   private readonly lockoutSeconds: number;
 
   constructor(private readonly options: PasswordAuthOptions) {
-    if (options.secret.length < 16) {
-      throw new Error("Auth secret must be at least 16 characters.");
-    }
+    assertSecureAuthSecret(options.secret);
     this.sessionTtlSeconds = options.sessionTtlSeconds ?? 60 * 60 * 8;
     this.roleStore = options.roleStore ?? new InMemoryRoleStore([]);
     this.apiTokenStore = options.apiTokenStore ?? new InMemoryApiTokenStore([]);
@@ -591,6 +589,25 @@ export class PasswordAuthService {
       createdAt: new Date().toISOString(),
       ...input
     });
+  }
+}
+
+export function assertSecureAuthSecret(secret: string, environment = runtimeEnvironment()): void {
+  if (secret.length < 16) {
+    throw new Error("Auth secret must be at least 16 characters.");
+  }
+  if (environment !== "production") {
+    return;
+  }
+  const lower = secret.trim().toLowerCase();
+  if (
+    secret.trim().length < 32
+    || lower.includes("change-me")
+    || lower.includes("changeme")
+    || lower.includes("replace-with")
+    || new Set(secret).size < 8
+  ) {
+    throw new Error("Auth secret must be explicitly provisioned with a strong, non-default value in production.");
   }
 }
 
@@ -1045,4 +1062,8 @@ function constantEqual(left: string, right: string): boolean {
     result |= left.charCodeAt(index) ^ right.charCodeAt(index);
   }
   return result === 0;
+}
+
+function runtimeEnvironment(): string | undefined {
+  return (globalThis as { process?: { env?: { NODE_ENV?: string } } }).process?.env?.NODE_ENV;
 }

@@ -1,5 +1,5 @@
 import { defineEventHandler, getCookie, getQuery, getRouterParam, readBody, setCookie, setResponseStatus, type EventHandler, type H3Event } from "h3";
-import { bearerToken, type PasswordAuthService } from "@framekit/auth";
+import { assertSecureAuthSecret, bearerToken, type PasswordAuthService } from "@framekit/auth";
 import { FramekitError, type TenantContext } from "@framekit/core";
 import { createOpenApiDocument } from "@framekit/openapi";
 import type { FilterValue, FramekitRuntime } from "@framekit/runtime";
@@ -13,7 +13,30 @@ export type NitroAdapterOptions = {
   rateLimit?: NitroRateLimitOptions | NitroRateLimiter | false;
   healthChecks?: Record<string, NitroHealthCheck>;
   authCookie?: NitroAuthCookieOptions | false;
+  cors?: NitroCorsOptions | false;
+  security?: NitroHttpSecurityOptions;
   development?: NitroDevelopmentOptions;
+};
+
+export type NitroCorsOptions = {
+  origins: string[];
+  credentials?: boolean;
+};
+
+export type NitroHttpSecurityOptions = {
+  /** Additional origins allowed to submit cookie-authenticated mutations. */
+  trustedOrigins?: string[];
+  /** Trust x-forwarded-proto and x-forwarded-host from a sanitizing reverse proxy. */
+  trustProxy?: boolean;
+};
+
+export type NitroProductionCredentials = {
+  environment?: string;
+  authSecret?: string;
+  bootstrap?: {
+    email?: string;
+    password?: string;
+  };
 };
 
 export type NitroDevelopmentOptions = {
@@ -66,12 +89,34 @@ export type NitroHealthCheckResult = {
 
 export type NitroHealthCheck = () => NitroHealthCheckResult | Promise<NitroHealthCheckResult>;
 
+export function assertSecureProductionCredentials(options: NitroProductionCredentials): void {
+  const environment = options.environment ?? nodeEnvironment();
+  if (environment !== "production") {
+    return;
+  }
+  try {
+    assertSecureAuthSecret(options.authSecret ?? "", "production");
+  } catch (error) {
+    throw new Error(`FRAMEKIT_AUTH_SECRET: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (options.bootstrap) {
+    const email = options.bootstrap.email?.trim().toLowerCase();
+    if (!email || email === "admin@example.com" || email.endsWith("@example.com")) {
+      throw new Error("Production bootstrap email must be explicitly provisioned and cannot use example.com.");
+    }
+    assertProductionValue("FRAMEKIT_ADMIN_PASSWORD", options.bootstrap.password, 14);
+  }
+}
+
 export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapterOptions = {}): EventHandler {
   const basePath = options.basePath ?? "/api";
-  const rateLimiter = createRateLimiter(options.rateLimit);
-  const authCookie = options.authCookie === false ? undefined : normalizeAuthCookieOptions(options.authCookie);
-  const allowHeaderIdentity = options.development?.allowHeaderIdentity === true;
+  const trustProxy = options.security?.trustProxy === true;
+  const rateLimiter = createRateLimiter(options.rateLimit, trustProxy);
   const environment = nodeEnvironment();
+  const authCookie = options.authCookie === false ? undefined : normalizeAuthCookieOptions(options.authCookie, environment);
+  const cors = options.cors === false ? undefined : normalizeCorsOptions(options.cors, environment);
+  const trustedOrigins = normalizeTrustedOrigins(options.security?.trustedOrigins, cors, environment);
+  const allowHeaderIdentity = options.development?.allowHeaderIdentity === true;
   if (allowHeaderIdentity && environment !== "development" && environment !== "test") {
     throw new Error("development.allowHeaderIdentity requires NODE_ENV=development or NODE_ENV=test.");
   }
@@ -84,15 +129,17 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
     let statusCode = 200;
     let thrown: unknown;
     try {
-      event.res.headers.set("access-control-allow-origin", "*");
-      event.res.headers.set("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
-      event.res.headers.set("access-control-allow-headers", allowHeaderIdentity
-        ? "authorization,content-type,if-match,idempotency-key,x-tenant-id,x-user-id,x-roles,x-permissions"
-        : "authorization,content-type,if-match,idempotency-key,x-tenant-id");
       event.res.headers.set("x-request-id", requestId);
       event.res.headers.set("x-content-type-options", "nosniff");
       event.res.headers.set("referrer-policy", "no-referrer");
       event.res.headers.set("x-frame-options", "DENY");
+      event.res.headers.set("cross-origin-resource-policy", "same-site");
+      event.res.headers.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
+      if (environment === "production") {
+        event.res.headers.set("strict-transport-security", "max-age=31536000; includeSubDomains");
+      }
+
+      applyCors(event, cors, allowHeaderIdentity);
 
       if (method === "OPTIONS") {
         statusCode = 204;
@@ -100,7 +147,12 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return null;
       }
 
-      if (rateLimiter && !(await rateLimiter.allow({ key: requestKey(event.req), request: event.req, method, path }))) {
+      enforceCookieCsrf(event.req, authCookie, trustedOrigins, trustProxy);
+      if (isCookieIssuingAuthRoute(method, path, basePath)) {
+        enforceCookieIssuanceOrigin(event.req, authCookie, trustedOrigins, trustProxy);
+      }
+
+      if (rateLimiter && !(await rateLimiter.allow({ key: requestKey(event.req, trustProxy), request: event.req, method, path }))) {
         statusCode = 429;
         throw new FramekitError("RATE_LIMITED", "Too many requests.", 429);
       }
@@ -607,14 +659,185 @@ function sessionTokenFromRequest(request: Request, cookie?: Required<NitroAuthCo
   return bearerToken(request.headers.get("authorization")) ?? (cookie ? cookieValue(request.headers.get("cookie"), cookie.name) : undefined);
 }
 
-function normalizeAuthCookieOptions(options: NitroAuthCookieOptions | undefined): Required<NitroAuthCookieOptions> {
-  return {
+function normalizeAuthCookieOptions(options: NitroAuthCookieOptions | undefined, environment: string | undefined): Required<NitroAuthCookieOptions> {
+  const normalized = {
     name: options?.name ?? "framekit_session",
     path: options?.path ?? "/",
     httpOnly: options?.httpOnly ?? true,
-    secure: options?.secure ?? false,
+    secure: options?.secure ?? environment === "production",
     sameSite: options?.sameSite ?? "lax"
   };
+  if (environment === "production" && !normalized.secure) {
+    throw new Error("Session cookies must use Secure when NODE_ENV=production.");
+  }
+  if (normalized.sameSite === "none" && !normalized.secure) {
+    throw new Error("Session cookies with SameSite=None must use Secure.");
+  }
+  return normalized;
+}
+
+type NormalizedCorsOptions = {
+  origins: Set<string>;
+  credentials: boolean;
+};
+
+function normalizeCorsOptions(options: NitroCorsOptions | undefined, environment: string | undefined): NormalizedCorsOptions | undefined {
+  if (!options) {
+    return undefined;
+  }
+  if (options.origins.length === 0) {
+    throw new Error("cors.origins must include at least one origin.");
+  }
+  const origins = new Set(options.origins.map((origin) => origin === "*" ? origin : normalizeOrigin(origin)));
+  const credentials = options.credentials === true;
+  if (credentials && origins.has("*")) {
+    throw new Error("Credentialed CORS cannot use the wildcard origin.");
+  }
+  assertProductionHttpsOrigins(origins, environment, "cors.origins");
+  return { origins, credentials };
+}
+
+function normalizeTrustedOrigins(origins: string[] | undefined, cors: NormalizedCorsOptions | undefined, environment: string | undefined): Set<string> {
+  const trusted = new Set<string>();
+  for (const origin of origins ?? []) {
+    if (origin === "*") {
+      throw new Error("security.trustedOrigins cannot contain a wildcard.");
+    }
+    trusted.add(normalizeOrigin(origin));
+  }
+  if (cors?.credentials) {
+    for (const origin of cors.origins) {
+      if (origin !== "*") {
+        trusted.add(origin);
+      }
+    }
+  }
+  assertProductionHttpsOrigins(trusted, environment, "security.trustedOrigins");
+  return trusted;
+}
+
+function assertProductionHttpsOrigins(origins: Set<string>, environment: string | undefined, option: string): void {
+  if (environment !== "production") {
+    return;
+  }
+  for (const origin of origins) {
+    if (origin !== "*" && !origin.startsWith("https://")) {
+      throw new Error(`${option} must use HTTPS when NODE_ENV=production.`);
+    }
+  }
+}
+
+function normalizeOrigin(origin: string): string {
+  const url = new URL(origin);
+  if ((url.protocol !== "http:" && url.protocol !== "https:") || url.origin !== origin.replace(/\/$/, "")) {
+    throw new Error(`Invalid origin: ${origin}`);
+  }
+  return url.origin;
+}
+
+function applyCors(event: H3Event, cors: NormalizedCorsOptions | undefined, allowHeaderIdentity: boolean): void {
+  if (!cors) {
+    return;
+  }
+  const requestOrigin = event.req.headers.get("origin");
+  if (!requestOrigin) {
+    return;
+  }
+  let normalizedOrigin: string;
+  try {
+    normalizedOrigin = normalizeOrigin(requestOrigin);
+  } catch {
+    throw new FramekitError("CORS_ORIGIN_DENIED", "Request origin is not allowed.", 403);
+  }
+  const wildcard = cors.origins.has("*");
+  if (!wildcard && !cors.origins.has(normalizedOrigin)) {
+    throw new FramekitError("CORS_ORIGIN_DENIED", "Request origin is not allowed.", 403);
+  }
+  event.res.headers.set("access-control-allow-origin", wildcard ? "*" : normalizedOrigin);
+  event.res.headers.append("vary", "Origin");
+  event.res.headers.set("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
+  event.res.headers.set("access-control-allow-headers", allowHeaderIdentity
+    ? "authorization,content-type,if-match,idempotency-key,x-tenant-id,x-user-id,x-roles,x-permissions"
+    : "authorization,content-type,if-match,idempotency-key,x-tenant-id");
+  if (cors.credentials) {
+    event.res.headers.set("access-control-allow-credentials", "true");
+  }
+}
+
+function enforceCookieCsrf(
+  request: Request,
+  cookie: Required<NitroAuthCookieOptions> | undefined,
+  trustedOrigins: Set<string>,
+  trustProxy: boolean
+): void {
+  if (!cookie || !isUnsafeMethod(request.method) || bearerToken(request.headers.get("authorization"))) {
+    return;
+  }
+  if (!cookieValue(request.headers.get("cookie"), cookie.name)) {
+    return;
+  }
+  assertTrustedRequestOrigin(request, trustedOrigins, trustProxy, "Cookie-authenticated mutations");
+}
+
+function enforceCookieIssuanceOrigin(
+  request: Request,
+  cookie: Required<NitroAuthCookieOptions> | undefined,
+  trustedOrigins: Set<string>,
+  trustProxy: boolean
+): void {
+  if (!cookie) {
+    return;
+  }
+  assertTrustedRequestOrigin(request, trustedOrigins, trustProxy, "Cookie-establishing authentication requests");
+}
+
+function assertTrustedRequestOrigin(request: Request, trustedOrigins: Set<string>, trustProxy: boolean, operation: string): void {
+  const rawOrigin = request.headers.get("origin");
+  if (!rawOrigin) {
+    throw new FramekitError("CSRF_ORIGIN_REQUIRED", `${operation} require an Origin header.`, 403);
+  }
+  let origin: string;
+  try {
+    origin = normalizeOrigin(rawOrigin);
+  } catch {
+    throw new FramekitError("CSRF_ORIGIN_DENIED", "Request origin is not trusted.", 403);
+  }
+  if (origin === canonicalRequestOrigin(request, trustProxy) || trustedOrigins.has(origin)) {
+    return;
+  }
+  throw new FramekitError("CSRF_ORIGIN_DENIED", "Request origin is not trusted.", 403);
+}
+
+function isCookieIssuingAuthRoute(method: string, path: string, basePath: string): boolean {
+  if (method !== "POST") {
+    return false;
+  }
+  return path === `${basePath}/auth/login`
+    || path === `${basePath}/auth/refresh`
+    || Boolean(matchProviderLoginPath(path, basePath));
+}
+
+function canonicalRequestOrigin(request: Request, trustProxy: boolean): string {
+  if (trustProxy) {
+    const protocol = firstForwardedValue(request.headers.get("x-forwarded-proto"));
+    const host = firstForwardedValue(request.headers.get("x-forwarded-host"));
+    if (protocol && host && (protocol === "http" || protocol === "https")) {
+      try {
+        return new URL(`${protocol}://${host}`).origin;
+      } catch {
+        return new URL(request.url).origin;
+      }
+    }
+  }
+  return new URL(request.url).origin;
+}
+
+function firstForwardedValue(value: string | null): string | undefined {
+  return value?.split(",")[0]?.trim() || undefined;
+}
+
+function isUnsafeMethod(method: string): boolean {
+  return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
 function setSessionCookie(event: H3Event, token: string, expiresAt: string, cookie?: Required<NitroAuthCookieOptions>): void {
@@ -675,7 +898,7 @@ function splitHeader(value: string | null): string[] | undefined {
   return value ? value.split(",").map((part) => part.trim()).filter(Boolean) : undefined;
 }
 
-function createRateLimiter(option: NitroAdapterOptions["rateLimit"]): NitroRateLimiter | undefined {
+function createRateLimiter(option: NitroAdapterOptions["rateLimit"], trustProxy: boolean): NitroRateLimiter | undefined {
   if (!option) {
     return undefined;
   }
@@ -685,7 +908,7 @@ function createRateLimiter(option: NitroAdapterOptions["rateLimit"]): NitroRateL
   const buckets = new Map<string, { count: number; resetsAt: number }>();
   return {
     allow({ request }) {
-      const key = option.key?.(request) ?? requestKey(request);
+      const key = option.key?.(request) ?? requestKey(request, trustProxy);
       const now = Date.now();
       const current = buckets.get(key);
       if (!current || current.resetsAt <= now) {
@@ -698,8 +921,27 @@ function createRateLimiter(option: NitroAdapterOptions["rateLimit"]): NitroRateL
   };
 }
 
-function requestKey(request: Request): string {
-  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || request.headers.get("x-real-ip") || "local";
+function requestKey(request: Request, trustProxy: boolean): string {
+  if (!trustProxy) {
+    return "untrusted-proxy";
+  }
+  return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || request.headers.get("x-real-ip") || "trusted-proxy-unknown";
+}
+
+function assertProductionValue(name: string, value: string | undefined, minimumLength: number): void {
+  const normalized = value?.trim();
+  const lower = normalized?.toLowerCase() ?? "";
+  if (
+    !normalized
+    || normalized.length < minimumLength
+    || lower.includes("change-me")
+    || lower.includes("changeme")
+    || lower.includes("replace-with")
+    || lower === "admin12345"
+    || new Set(normalized).size < 8
+  ) {
+    throw new Error(`${name} must be explicitly provisioned with a strong, non-default value in production.`);
+  }
 }
 
 function nodeEnvironment(): string | undefined {

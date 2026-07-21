@@ -1,4 +1,4 @@
-import { hashPassword, InMemoryApiTokenStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
+import { InMemoryApiTokenStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
 import { createRuntime } from "@framekit/runtime";
 import {
@@ -15,6 +15,19 @@ import {
   PostgresUserStore
 } from "@framekit/db";
 import { InMemoryEventBus } from "@framekit/realtime";
+import { assertSecureProductionCredentials } from "@framekit/nitro";
+import { createBootstrapAdmin } from "./bootstrap.js";
+
+const environment = process.env.NODE_ENV ?? "development";
+const authSecret = process.env.FRAMEKIT_AUTH_SECRET ?? "development-secret-change-me";
+const bootstrapEmail = process.env.FRAMEKIT_ADMIN_EMAIL ?? "admin@example.com";
+const bootstrapPassword = process.env.FRAMEKIT_ADMIN_PASSWORD ?? "admin12345";
+
+assertSecureProductionCredentials({
+  environment,
+  authSecret,
+  bootstrap: { email: bootstrapEmail, password: bootstrapPassword }
+});
 
 export const customerDocType = defineDocType({
   name: "customer",
@@ -136,7 +149,7 @@ export const runtime = createRuntime(app, {
   realtime: eventBus
 });
 export const auth = new PasswordAuthService({
-  secret: process.env.FRAMEKIT_AUTH_SECRET ?? "development-secret-change-me",
+  secret: authSecret,
   userStore,
   roleStore,
   apiTokenStore,
@@ -255,15 +268,7 @@ async function createMutationUnitOfWork() {
 }
 
 async function createUserStore() {
-  const admin = {
-    id: "admin",
-    tenantId: "default",
-    email: process.env.FRAMEKIT_ADMIN_EMAIL ?? "admin@example.com",
-    name: "Framekit Admin",
-    passwordHash: await hashPassword(process.env.FRAMEKIT_ADMIN_PASSWORD ?? "admin12345", "framekit-dev-salt"),
-    roles: ["administrator"],
-    permissions: ["*"]
-  };
+  const admin = await createBootstrapAdmin(bootstrapEmail, bootstrapPassword);
   if (!process.env.DATABASE_URL) {
     return new InMemoryUserStore([admin]);
   }
