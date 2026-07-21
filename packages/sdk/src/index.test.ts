@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
+import { createRuntime, validateMigrationPlan, type MigrationPlan as RuntimeMigrationPlan } from "../../runtime/src/index.js";
 import { ofetch } from "ofetch";
 import { createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitClient, generateSdkTypes, type MigrationPlan } from "./index.js";
 
@@ -27,6 +28,10 @@ describe("generateSdkTypes", () => {
       id: "migration-1",
       tenantId: "default",
       appName: app.name,
+      fromSchemaChecksum: "from-checksum",
+      toSchemaChecksum: "to-checksum",
+      fromUniqueConstraints: [],
+      toUniqueConstraints: [],
       createdAt: "2026-07-21T00:00:00.000Z",
       changes: [],
       checksum: "checksum"
@@ -47,6 +52,23 @@ describe("generateSdkTypes", () => {
       ["http://localhost:3000/api/migrations/plan", expect.objectContaining({ method: "POST", body: { app } })],
       ["http://localhost:3000/api/migrations/apply", expect.objectContaining({ method: "POST", body: { plan, allowDestructive: true } })]
     ]);
+  });
+
+  it("keeps SDK migration plans structurally and behaviorally compatible with the runtime contract", async () => {
+    const current = defineApp({ name: "SDK migration parity", modules: [] });
+    const next = defineApp({ name: current.name, modules: [defineModule({
+      id: "crm", name: "CRM", doctypes: [defineDocType({ name: "customer", label: "Customer", fields: [
+        { name: "email", label: "Email", type: "text", unique: true }
+      ] })]
+    })] });
+    const runtimePlan: RuntimeMigrationPlan = await createRuntime(current, { idGenerator: () => "migration-sdk-parity" }).planMigration(
+      { tenantId: "default", userId: "migration", roles: ["administrator"], permissions: ["*"] }, next
+    );
+    const sdkPlan: MigrationPlan = runtimePlan;
+
+    expect(sdkPlan.changes.map((change) => change.kind)).toEqual(["add_doctype", "add_field", "add_unique_constraint"]);
+    expect(sdkPlan.toUniqueConstraints).toEqual([{ doctype: "customer", field: "email" }]);
+    await expect(validateMigrationPlan(sdkPlan)).resolves.toBeUndefined();
   });
 
   it("emits typed inputs, records, and workflow actions from metadata", () => {

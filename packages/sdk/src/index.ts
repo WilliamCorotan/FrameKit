@@ -91,7 +91,7 @@ export type DependencyHealthResponse = {
 };
 
 export type MigrationChange = {
-  kind: "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint";
+  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint";
   doctype: string;
   field: string;
   destructive: boolean;
@@ -106,6 +106,10 @@ export type MigrationPlan = {
   id: string;
   tenantId: string;
   appName: string;
+  fromSchemaChecksum: string;
+  toSchemaChecksum: string;
+  fromUniqueConstraints: Array<{ doctype: string; field: string }>;
+  toUniqueConstraints: Array<{ doctype: string; field: string }>;
   createdAt: string;
   changes: MigrationChange[];
   checksum: string;
