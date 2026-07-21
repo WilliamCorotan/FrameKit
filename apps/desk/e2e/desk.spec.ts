@@ -100,12 +100,21 @@ test("covers document list, create, edit, delete, pagination, search, and workfl
     await page.getByLabel("Name *").fill(`Page record ${index}`);
     await page.getByRole("button", { name: "Save" }).click();
   }
+  const secondPageResponse = page.waitForResponse((response) => new URL(response.url()).searchParams.get("offset") === "5");
   await page.getByRole("button", { name: "Next page" }).click();
+  await secondPageResponse;
   await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.locator(".list button.row")).toHaveCount(2);
   await expect(page.getByRole("button", { name: "Next page" })).toBeDisabled();
+  const firstPageResponse = page.waitForResponse((response) => new URL(response.url()).searchParams.get("offset") === "0");
   await page.getByRole("button", { name: "Previous page" }).click();
+  await firstPageResponse;
   await expect(page.getByText("Page 1")).toBeVisible();
+  await expect(page.locator(".list button.row")).toHaveCount(5);
+  const terminalPageResponse = page.waitForResponse((response) => new URL(response.url()).searchParams.get("offset") === "5");
   await page.getByRole("button", { name: "Next page" }).click();
+  await terminalPageResponse;
+  await expect(page.locator(".list button.row")).toHaveCount(2);
   await page.getByRole("button", { name: /CUSTOMER-001/ }).click();
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete" }).click();

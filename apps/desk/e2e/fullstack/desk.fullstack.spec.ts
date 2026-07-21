@@ -24,13 +24,14 @@ test("uses real auth, restores the session, reports server errors, and signs out
 
 test("runs real document CRUD, deletion, workflow, and pagination", async ({ page, request }, testInfo) => {
   const suffix = `${testInfo.project.name}-${Date.now()}`;
+  const paginationMarker = `pager${crypto.randomUUID().replaceAll("-", "")}`;
   const token = await loginApi(request);
   for (let index = 0; index < 7; index += 1) {
-    await createCustomer(request, token, `Page ${suffix} ${index}`);
+    await createCustomer(request, token, `${paginationMarker}-${index}`);
   }
 
   await signIn(page);
-  await page.getByLabel("Filter records").fill(`Page ${suffix}`);
+  await page.getByLabel("Filter records").fill(paginationMarker);
   await expect(page.getByText("Page 1")).toBeVisible();
   const firstPageIds = await recordIds(page);
   expect(firstPageIds).toHaveLength(5);
@@ -40,17 +41,26 @@ test("runs real document CRUD, deletion, workflow, and pagination", async ({ pag
   await page.getByRole("button", { name: "Save" }).click();
   await expect(page.getByLabel("Owner")).toHaveValue(updatedOwner);
   await expect(page.locator(".list button.row").first()).toContainText(updatedOwner);
+  const secondPageResponse = page.waitForResponse((response) => response.url().includes("/api/doctypes/customer?") && new URL(response.url()).searchParams.get("offset") === "5");
   await page.getByRole("button", { name: "Next page" }).click();
+  await secondPageResponse;
   await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.locator(".list button.row")).toHaveCount(2);
   const secondPageIds = await recordIds(page);
   expect(secondPageIds).toHaveLength(2);
   expect(new Set([...firstPageIds, ...secondPageIds]).size).toBe(7);
   await expect(page.getByRole("button", { name: "Next page" })).toBeDisabled();
+  const firstPageResponse = page.waitForResponse((response) => response.url().includes("/api/doctypes/customer?") && new URL(response.url()).searchParams.get("offset") === "0");
   await page.getByRole("button", { name: "Previous page" }).click();
+  await firstPageResponse;
   await expect(page.getByText("Page 1")).toBeVisible();
+  await expect(page.locator(".list button.row")).toHaveCount(5);
   expect(await recordIds(page)).toEqual(firstPageIds);
+  const terminalPageResponse = page.waitForResponse((response) => response.url().includes("/api/doctypes/customer?") && new URL(response.url()).searchParams.get("offset") === "5");
   await page.getByRole("button", { name: "Next page" }).click();
+  await terminalPageResponse;
   await expect(page.getByText("Page 2")).toBeVisible();
+  await expect(page.locator(".list button.row")).toHaveCount(2);
   await page.locator(".list button.row").first().click();
   page.once("dialog", (dialog) => dialog.accept());
   await page.getByRole("button", { name: "Delete" }).click();
