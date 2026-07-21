@@ -151,6 +151,17 @@ export type DocumentHook = (context: HookContext) => void | Promise<void>;
 
 export type ModuleHooks = Partial<Record<HookName, Record<string, DocumentHook[]>>>;
 
+const DocumentHookSchema = z.custom<DocumentHook>((value) => typeof value === "function", "Hook must be a function");
+const HookTargetSchema = z.record(z.string().min(1), z.array(DocumentHookSchema).min(1));
+const ModuleHooksSchema: z.ZodType<ModuleHooks> = z.object(
+  Object.fromEntries(HookNames.map((name) => [name, HookTargetSchema.optional()])) as Record<HookName, z.ZodOptional<typeof HookTargetSchema>>
+).strict();
+
+const SemVerSchema = z.string().regex(
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/,
+  "Version must be valid SemVer"
+);
+
 export const NavigationItemSchema = z.object({
   label: z.string().min(1),
   path: z.string().min(1),
@@ -164,13 +175,13 @@ export type NavigationItem = z.infer<typeof NavigationItemSchema>;
 export const ModuleSchema: z.ZodType<ModuleDefinition> = z.object({
   id: z.string().min(1).regex(/^[a-z][a-z0-9_-]*$/),
   name: z.string().min(1),
-  version: z.string().min(1),
+  version: SemVerSchema,
   description: z.string().optional(),
   dependencies: z.array(z.string()).default([]),
   doctypes: z.array(DocTypeSchema).default([]),
   permissions: z.array(z.string()).default([]),
   navigation: z.array(NavigationItemSchema).default([]),
-  hooks: z.custom<ModuleHooks>().optional(),
+  hooks: ModuleHooksSchema.optional(),
   jobs: z.array(z.string()).default([]),
   settings: z.array(z.string()).default([])
 });
@@ -191,7 +202,7 @@ export type ModuleDefinition = {
 
 export const AppSchema = z.object({
   name: z.string().min(1),
-  version: z.string().min(1),
+  version: SemVerSchema,
   modules: z.array(ModuleSchema).default([])
 });
 

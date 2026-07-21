@@ -43,6 +43,7 @@ type Metadata = {
 type DocumentRecord = {
   id: string;
   doctype: string;
+  revision: number;
   state?: string;
   documentStatus: "draft" | "submitted" | "cancelled";
   data: Record<string, unknown>;
@@ -239,7 +240,9 @@ function App() {
     if (!active || !selected) return;
     try {
       setStatus(action === "submit" ? "Submitting…" : "Cancelling…");
-      const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/${action}`, { method: "POST", token });
+      const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/${action}`, {
+        method: "POST", token, expectedRevision: selected.revision
+      });
       setSelected(record);
       setDraft(record.data);
       await refresh(active.name, query, page);
@@ -716,7 +719,7 @@ function FieldInput({ field, value, onChange }: { field: FieldDefinition; value:
   return <input type={field.type === "number" || field.type === "currency" ? "number" : "text"} value={String(value ?? "")} onChange={(event) => onChange(event.target.value)} disabled={field.readOnly} />;
 }
 
-async function fetchJson<T>(path: string, options: { method?: string; body?: unknown; token?: string } = {}): Promise<T> {
+async function fetchJson<T>(path: string, options: { method?: string; body?: unknown; token?: string; expectedRevision?: number } = {}): Promise<T> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     "x-tenant-id": "default"
@@ -724,6 +727,7 @@ async function fetchJson<T>(path: string, options: { method?: string; body?: unk
   if (options.token) {
     headers.authorization = `Bearer ${options.token}`;
   }
+  if (options.expectedRevision !== undefined) headers["if-match"] = String(options.expectedRevision);
   const response = await fetch(apiUrl + path, {
     method: options.method ?? "GET",
     body: options.body ? JSON.stringify(options.body) : undefined,

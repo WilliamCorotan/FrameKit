@@ -72,5 +72,14 @@ describe("core metadata", () => {
     expect(() => defineApp({ name: "Hook", modules: [defineModule({
       id: "crm", name: "CRM", hooks: { beforeValidate: { missing: [() => undefined] } }
     })] })).toThrow(/targets unknown DocType "missing"/);
+    expect(() => defineModule({ id: "crm", name: "CRM", hooks: { beforeValidte: {} } as never })).toThrow(/unrecognized key/i);
+    expect(() => defineModule({ id: "crm", name: "CRM", hooks: { beforeValidate: { customer: ["not-a-function"] } } as never })).toThrow(/Hook must be a function/);
+    expect(() => defineModule({ id: "crm", name: "CRM", hooks: { beforeValidate: [] } as never })).toThrow();
+  });
+
+  it("requires strict semantic versions for apps and modules", () => {
+    expect(() => defineApp({ name: "Bad", version: "v1" })).toThrow(/valid SemVer/);
+    expect(() => defineModule({ id: "bad", name: "Bad", version: "1.0" })).toThrow(/valid SemVer/);
+    expect(defineApp({ name: "RC", version: "1.2.3-rc.1+build.5" }).version).toBe("1.2.3-rc.1+build.5");
   });
 });

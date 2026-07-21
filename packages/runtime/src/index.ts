@@ -549,6 +549,13 @@ export class FramekitRuntime {
     const candidate = { ...input };
     await this.runHooks("beforeValidate", tenant, doctype, undefined, candidate);
     const data = this.prepareInput(doctype, candidate, true);
+    if (doctype.workflow) {
+      const suppliedState = data[doctype.workflow.field];
+      if (suppliedState !== undefined && suppliedState !== doctype.workflow.initialState) {
+        throw new FramekitError("INVALID_INITIAL_STATE", `New ${doctype.name} documents must start in "${doctype.workflow.initialState}"`, 422);
+      }
+      data[doctype.workflow.field] = doctype.workflow.initialState;
+    }
     await this.assertLinksExist(tenant, doctype, data);
     await this.assertUniqueFields(tenant, doctype, data);
     const state = doctype.workflow?.initialState;

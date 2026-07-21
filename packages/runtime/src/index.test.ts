@@ -400,6 +400,8 @@ describe("runtime document service", () => {
     });
     const runtime = createRuntime(app, { idGenerator: () => "deal123456" });
     const created = await runtime.create(tenant, "deal", { title: "Upgrade" });
+    expect(created).toMatchObject({ state: "open", data: { stage: "open" } });
+    await expect(runtime.create(tenant, "deal", { title: "Invalid", stage: "won" })).rejects.toMatchObject({ code: "INVALID_INITIAL_STATE" });
     const transitioned = await runtime.transition(tenant, "deal", created.id, "win");
 
     expect(transitioned.state).toBe("won");
