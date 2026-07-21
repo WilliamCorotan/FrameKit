@@ -74,6 +74,15 @@ test("runs real document CRUD, deletion, workflow, and pagination", async ({ pag
   await page.getByRole("button", { name: "Save" }).click();
   await page.getByRole("button", { name: "qualify" }).click();
   await expect(page.getByText("Transitioned")).toBeVisible();
+  const submitRequest = page.waitForRequest((request) => request.url().endsWith("/submit"));
+  await page.getByRole("button", { name: "Submit" }).click();
+  expect((await submitRequest).headers()["if-match"]).toBe("2");
+  await expect(page.getByText("Submitted")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Save" })).toBeDisabled();
+  const cancelRequest = page.waitForRequest((request) => request.url().endsWith("/cancel"));
+  await page.getByRole("button", { name: "Cancel" }).click();
+  expect((await cancelRequest).headers()["if-match"]).toBe("3");
+  await expect(page.getByText("Cancelled")).toBeVisible();
 });
 
 test("runs real administration and proves a least-privilege user is denied", async ({ page }, testInfo) => {

@@ -40,6 +40,8 @@ describe("generateSdkTypes", () => {
     await client.health();
     await client.dependencyHealth();
     await client.delete("note", "note-1", { expectedRevision: 2, idempotencyKey: "delete-note-1" });
+    await client.submit("note", "note-1", { expectedRevision: 3, idempotencyKey: "submit-note-1" });
+    await client.cancel("note", "note-1", { expectedRevision: 4, idempotencyKey: "cancel-note-1" });
     await client.migrations();
     await client.planMigration(app);
     await client.applyMigration(plan, { allowDestructive: true });
@@ -48,6 +50,8 @@ describe("generateSdkTypes", () => {
       ["http://localhost:3000/health", expect.objectContaining({ headers: expect.not.objectContaining({ authorization: expect.any(String) }) })],
       ["http://localhost:3000/health/dependencies", expect.objectContaining({ headers: expect.not.objectContaining({ authorization: expect.any(String) }) })],
       ["http://localhost:3000/api/doctypes/note/note-1", expect.objectContaining({ method: "DELETE", headers: expect.objectContaining({ authorization: "Bearer session", "if-match": "2", "idempotency-key": "delete-note-1" }) })],
+      ["http://localhost:3000/api/doctypes/note/note-1/submit", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "if-match": "3", "idempotency-key": "submit-note-1" }) })],
+      ["http://localhost:3000/api/doctypes/note/note-1/cancel", expect.objectContaining({ method: "POST", headers: expect.objectContaining({ "if-match": "4", "idempotency-key": "cancel-note-1" }) })],
       ["http://localhost:3000/api/migrations", expect.objectContaining({ headers: expect.objectContaining({ authorization: "Bearer session" }) })],
       ["http://localhost:3000/api/migrations/plan", expect.objectContaining({ method: "POST", body: { app } })],
       ["http://localhost:3000/api/migrations/apply", expect.objectContaining({ method: "POST", body: { plan, allowDestructive: true } })]

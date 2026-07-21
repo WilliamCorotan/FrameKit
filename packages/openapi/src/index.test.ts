@@ -16,7 +16,8 @@ describe("createOpenApiDocument", () => {
               label: "Deal",
               fields: [
                 { name: "title", label: "Title", type: "text", required: true },
-                { name: "amount", label: "Amount", type: "currency" }
+                { name: "amount", label: "Amount", type: "currency" },
+                { name: "stage", label: "Stage", type: "select", options: ["open", "won"] }
               ],
               workflow: {
                 field: "stage",
@@ -56,6 +57,8 @@ describe("createOpenApiDocument", () => {
     expect(doc.paths["/api/realtime/stream"]).toBeDefined();
     expect(doc.paths["/api/doctypes/deal"]).toBeDefined();
     expect(doc.paths["/api/doctypes/deal/{id}/transition"]).toBeDefined();
+    expect(doc.paths["/api/doctypes/deal/{id}/submit"]?.post?.operationId).toBe("submitDeal");
+    expect(doc.paths["/api/doctypes/deal/{id}/cancel"]?.post?.operationId).toBe("cancelDeal");
     const listDeal = doc.paths["/api/doctypes/deal"]?.get;
     expect(JSON.stringify(listDeal?.parameters)).toContain("cursor");
     expect(JSON.stringify(listDeal?.parameters)).toContain("fields");
@@ -79,5 +82,7 @@ describe("createOpenApiDocument", () => {
     const dealInput = doc.components.schemas.DealInput;
     expect(dealInput).toBeDefined();
     expect(dealInput?.required).toContain("title");
+    expect(doc.components.schemas.DealRecord?.required).toContain("documentStatus");
+    expect(doc.components.schemas.DealRecord?.properties?.documentStatus).toEqual({ type: "string", enum: ["draft", "submitted", "cancelled"] });
   });
 });

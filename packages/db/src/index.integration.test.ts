@@ -45,7 +45,9 @@ const customerDocType = defineDocType({
     { action: "create", permissions: ["crm.customer"] },
     { action: "read", permissions: ["crm.customer"] },
     { action: "update", permissions: ["crm.customer"] },
-    { action: "delete", permissions: ["crm.customer"] }
+    { action: "delete", permissions: ["crm.customer"] },
+    { action: "submit", permissions: ["crm.customer"] },
+    { action: "cancel", permissions: ["crm.customer"] }
   ]
 });
 
@@ -58,6 +60,25 @@ const dealDocType = defineDocType({
     { action: "create", permissions: ["crm.deal"] },
     { action: "read", permissions: ["crm.deal"] }
   ]
+});
+
+const approvalDocType = defineDocType({
+  name: "approval",
+  label: "Approval",
+  fields: [
+    { name: "title", label: "Title", type: "text", required: true },
+    { name: "status", label: "Status", type: "select", options: ["pending", "approved"], required: true }
+  ],
+  permissions: [
+    { action: "create", permissions: ["crm.approval"] },
+    { action: "read", permissions: ["crm.approval"] }
+  ],
+  workflow: {
+    field: "status",
+    initialState: "pending",
+    states: ["pending", "approved"],
+    transitions: [{ action: "approve", from: ["pending"], to: "approved" }]
+  }
 });
 
 const queryDocType = defineDocType({
@@ -75,7 +96,7 @@ const queryDocType = defineDocType({
 
 const app = defineApp({
   name: "Postgres Integration",
-  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType] })]
+  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType] })]
 });
 
 describe.skipIf(!connectionString)("Postgres durable stores", () => {
@@ -132,10 +153,14 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       name: "Durable Customer",
       external_id: "EXT-001"
     });
-    await runtime.update(tenant, "customer", customer.id, { status: "paused" });
+    const updatedCustomer = await runtime.update(tenant, "customer", customer.id, { status: "paused" });
+    const submittedCustomer = await runtime.submit(tenant, "customer", customer.id, { expectedRevision: updatedCustomer.revision });
+    const cancelledCustomer = await runtime.cancel(tenant, "customer", customer.id, { expectedRevision: submittedCustomer.revision });
 
     await expect(runtime.get(tenant, "customer", customer.id)).resolves.toMatchObject({
       id: "durable-customer",
+      documentStatus: "cancelled",
+      revision: cancelledCustomer.revision,
       data: { name: "Durable Customer", status: "paused", external_id: "EXT-001" }
     });
     await expect(runtime.list(tenant, "customer", { filters: { status: "paused" }, limit: 5 })).resolves.toHaveLength(1);
@@ -150,14 +175,21 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
 
     await expect(runtime.create(tenant, "deal", { title: "First Deal" })).resolves.toMatchObject({ id: "DEAL-0001" });
     await expect(runtime.create(tenant, "deal", { title: "Second Deal" })).resolves.toMatchObject({ id: "DEAL-0002" });
+    const approval = await runtime.create(tenant, "approval", { title: "Persist initial workflow state" });
+    await expect(runtime.get(tenant, "approval", approval.id)).resolves.toMatchObject({ state: "pending", data: { status: "pending" } });
+    await expect(runtime.create(tenant, "approval", { title: "Conflicting state", status: "approved" })).rejects.toMatchObject({ code: "INVALID_INITIAL_STATE" });
 
     await expect(runtime.auditTrail(tenant)).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ action: "create", doctype: "customer", documentId: customer.id }),
-      expect.objectContaining({ action: "update", doctype: "customer", documentId: customer.id })
+      expect.objectContaining({ action: "update", doctype: "customer", documentId: customer.id }),
+      expect.objectContaining({ action: "submit", doctype: "customer", documentId: customer.id }),
+      expect.objectContaining({ action: "cancel", doctype: "customer", documentId: customer.id })
     ]));
     await expect(runtime.outboxEvents(tenant, { status: "pending" })).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ type: "customer.created", topic: "customer", status: "pending" }),
-      expect.objectContaining({ type: "customer.updated", topic: "customer", status: "pending" })
+      expect.objectContaining({ type: "customer.updated", topic: "customer", status: "pending" }),
+      expect.objectContaining({ type: "customer.submitted", topic: "customer", status: "pending" }),
+      expect.objectContaining({ type: "customer.cancelled", topic: "customer", status: "pending" })
     ]));
 
     const nextApp = defineApp({
@@ -171,7 +203,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
               ...customerDocType,
               fields: [...customerDocType.fields, { name: "segment", label: "Segment", type: "text" }]
             }),
-            dealDocType
+            dealDocType,
+            approvalDocType
           ]
         })
       ]
@@ -365,7 +398,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       { id: "query-05", data: { name: "%_' literal", status: "active", score: 30, notes: "escaped", metadata: { rank: 5 } } }
     ];
     for (const fixture of fixtures) {
-      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
+      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, documentStatus: "draft" as const, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
       await memory.create(tenant, queryDocType, record);
       await sql`
         insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
@@ -394,6 +427,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       doctype: queryDocType.name,
       id: "query-concurrent-before-cursor",
       revision: 1,
+      documentStatus: "draft" as const,
       state: undefined,
       data: { name: "Inserted before cursor", status: "active", score: 1 },
       createdAt: timestamp,
@@ -418,7 +452,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       { id: "query-unicode-supplementary", data: { name: "\u{10000}", status: "unicode" } }
     ];
     for (const fixture of adversarialFixtures) {
-      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
+      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, documentStatus: "draft" as const, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
       await memory.create(tenant, queryDocType, record);
       await sql`
         insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
@@ -454,7 +488,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       { id: "query-boolean-true", data: { status: "boolean", enabled: true } }
     ];
     for (const fixture of booleanFixtures) {
-      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
+      const record = { tenantId: tenant.tenantId, doctype: queryDocType.name, revision: 1, documentStatus: "draft" as const, state: undefined, createdAt: timestamp, updatedAt: timestamp, ...fixture };
       await memory.create(tenant, queryDocType, record);
       await sql`
         insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)

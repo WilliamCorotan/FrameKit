@@ -49,6 +49,7 @@ export const framekitDocuments = pgTable(
     doctype: text("doctype").notNull(),
     id: text("id").notNull(),
     revision: integer("revision").notNull().default(1),
+    documentStatus: text("document_status").notNull().default("draft").$type<DocumentRecord["documentStatus"]>(),
     state: text("state"),
     data: jsonb("data").notNull().$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
@@ -329,6 +330,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
         doctype: framekitDocuments.doctype,
         id: framekitDocuments.id,
         revision: framekitDocuments.revision,
+        documentStatus: framekitDocuments.documentStatus,
         state: framekitDocuments.state,
         data: dataExpression,
         createdAt: framekitDocuments.createdAt,
@@ -373,6 +375,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
       doctype: record.doctype,
       id: record.id,
       revision: record.revision,
+      documentStatus: record.documentStatus,
       state: record.state,
       data: record.data,
       createdAt: new Date(record.createdAt),
@@ -388,6 +391,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
       .update(framekitDocuments)
       .set({
         revision: record.revision,
+        documentStatus: record.documentStatus,
         state: record.state,
         data: record.data,
         updatedAt: new Date(record.updatedAt)
@@ -474,10 +478,10 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
         let result: DocumentRecord | undefined;
         if (command.operation === "create") {
           await tx`
-            insert into framekit_documents (tenant_id, doctype, id, revision, state, data, created_at, updated_at)
+            insert into framekit_documents (tenant_id, doctype, id, revision, document_status, state, data, created_at, updated_at)
             values (
               ${command.document.tenantId}, ${command.document.doctype}, ${command.document.id}, ${command.document.revision},
-              ${command.document.state ?? null}, ${tx.json(command.document.data as postgres.JSONValue)}, ${command.document.createdAt}, ${command.document.updatedAt}
+              ${command.document.documentStatus}, ${command.document.state ?? null}, ${tx.json(command.document.data as postgres.JSONValue)}, ${command.document.createdAt}, ${command.document.updatedAt}
             )
           `;
           result = command.document;
@@ -485,7 +489,7 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
         } else if (command.operation === "update") {
           const rows = await tx<{ revision: number }[]>`
             update framekit_documents
-            set revision = ${command.document.revision}, state = ${command.document.state ?? null},
+            set revision = ${command.document.revision}, document_status = ${command.document.documentStatus}, state = ${command.document.state ?? null},
                 data = ${tx.json(command.document.data as postgres.JSONValue)}, updated_at = ${command.document.updatedAt}
             where tenant_id = ${command.tenant.tenantId} and doctype = ${command.doctype.name}
               and id = ${command.document.id} and revision = ${command.expectedRevision!}
@@ -1415,6 +1419,7 @@ create table if not exists framekit_documents (
   doctype text not null,
   id text not null,
   revision integer not null default 1,
+  document_status text not null default 'draft',
   state text,
   data jsonb not null,
   created_at timestamptz not null,
@@ -1422,6 +1427,7 @@ create table if not exists framekit_documents (
   constraint framekit_documents_identity unique (tenant_id, doctype, id)
 );
 alter table framekit_documents add column if not exists revision integer not null default 1;
+alter table framekit_documents add column if not exists document_status text not null default 'draft';
 create index if not exists framekit_documents_lookup on framekit_documents (tenant_id, doctype, updated_at desc);
 `;
 }
@@ -1429,6 +1435,7 @@ create index if not exists framekit_documents_lookup on framekit_documents (tena
 export function createMutationTablesSql(): string {
   return `
 alter table framekit_documents add column if not exists revision integer not null default 1;
+alter table framekit_documents add column if not exists document_status text not null default 'draft';
 create table if not exists framekit_document_unique_values (
   tenant_id text not null,
   doctype text not null,
@@ -2039,6 +2046,7 @@ function selectedRowToRecord(row: {
   doctype: string;
   id: string;
   revision: number;
+  documentStatus: DocumentRecord["documentStatus"];
   state: string | null;
   data: Record<string, unknown>;
   createdAt: Date;
@@ -2049,6 +2057,7 @@ function selectedRowToRecord(row: {
     doctype: row.doctype,
     id: row.id,
     revision: row.revision,
+    documentStatus: row.documentStatus,
     state: row.state ?? undefined,
     data: row.data,
     createdAt: row.createdAt.toISOString(),
@@ -2062,6 +2071,7 @@ function rowToRecord(row: typeof framekitDocuments.$inferSelect): DocumentRecord
     doctype: row.doctype,
     id: row.id,
     revision: row.revision,
+    documentStatus: row.documentStatus,
     state: row.state ?? undefined,
     data: row.data,
     createdAt: row.createdAt.toISOString(),

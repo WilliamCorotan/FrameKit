@@ -5,6 +5,7 @@
 ## Implemented
 
 - Metadata-defined DocTypes, modules, permissions, hooks, workflows, and document CRUD.
+- Fail-fast metadata cross-reference validation plus a persisted draft, submit, and cancel document lifecycle. See [metadata-compatibility.md](metadata-compatibility.md).
 - Nitro adapter with generated document routes, CORS, health, metadata, diagnostics, and OpenAPI endpoints.
 - In-memory repository for development and Postgres JSON-document repository for durable deployments.
 - Queue and realtime ports with initial adapters.

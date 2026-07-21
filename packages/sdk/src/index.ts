@@ -172,7 +172,9 @@ export const FRAMEKIT_HTTP_ENDPOINTS = [
   ["create", "POST", "/api/doctypes/:doctype"],
   ["update", "PATCH", "/api/doctypes/:doctype/:id"],
   ["delete", "DELETE", "/api/doctypes/:doctype/:id"],
-  ["transition", "POST", "/api/doctypes/:doctype/:id/transition"]
+  ["transition", "POST", "/api/doctypes/:doctype/:id/transition"],
+  ["submit", "POST", "/api/doctypes/:doctype/:id/submit"],
+  ["cancel", "POST", "/api/doctypes/:doctype/:id/cancel"]
 ] as const;
 
 export class FramekitClient {
@@ -455,6 +457,14 @@ export class FramekitClient {
 
   transition<TData extends DocumentData = DocumentData>(doctype: string, id: string, action: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
     return this.request(`/api/doctypes/${doctype}/${id}/transition`, { method: "POST", body: { action }, headers: mutationHeaders(options) });
+  }
+
+  submit<TData extends DocumentData = DocumentData>(doctype: string, id: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
+    return this.request(`/api/doctypes/${doctype}/${id}/submit`, { method: "POST", headers: mutationHeaders(options) });
+  }
+
+  cancel<TData extends DocumentData = DocumentData>(doctype: string, id: string, options: MutationRequestOptions = {}): Promise<DocumentRecord<TData>> {
+    return this.request(`/api/doctypes/${doctype}/${id}/cancel`, { method: "POST", headers: mutationHeaders(options) });
   }
 
   private request<T>(path: string, options: { method?: string; body?: unknown; skipAuth?: boolean; headers?: Record<string, string> } = {}): Promise<T> {
