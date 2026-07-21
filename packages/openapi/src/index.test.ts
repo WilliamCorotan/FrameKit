@@ -71,6 +71,8 @@ describe("createOpenApiDocument", () => {
     expect(doc.components.schemas.AuthSession).toBeDefined();
     expect(doc.components.schemas.AuthAuditEvent).toBeDefined();
     expect(doc.components.schemas.CreatedApiToken).toBeDefined();
+    expect(doc.paths["/api/doctypes/deal/{id}"]?.get?.responses).toMatchObject({ "401": {}, "409": {}, "422": {}, "429": {}, "500": {} });
+    expect(JSON.stringify(doc.paths["/api/doctypes/deal/{id}"]?.get?.responses)).toContain("x-request-id");
     expect(doc.components.securitySchemes.cookieAuth).toMatchObject({ type: "apiKey", in: "cookie", name: "framekit_session" });
     expect(doc.security).toEqual([{ bearerAuth: [] }, { cookieAuth: [] }]);
     expect(doc.paths["/health/live"]?.get?.security).toEqual([]);

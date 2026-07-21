@@ -48,12 +48,20 @@ try {
     if (!/^\^\d+\.\d+\.\d+/.test(appManifest.dependencies[name])) throw new Error(`${name} scaffold dependency is not published semver.`);
     appManifest.dependencies[name] = `file:${tarballs.get(name)}`;
   }
+  appManifest.dependencies["@framekit/sdk"] = `file:${tarballs.get("@framekit/sdk")}`;
   await writeFile(appManifestPath, `${JSON.stringify(appManifest, null, 2)}\n`);
   await writeFile(join(appRoot, "pnpm-workspace.yaml"), overridesYaml(tarballs));
 
   run("pnpm", ["install", "--no-frozen-lockfile"], appRoot);
   run("pnpm", ["typecheck"], appRoot);
   run("pnpm", ["build"], appRoot);
+  await writeFile(join(appRoot, "test", "sdk-contract.mjs"), `import { FRAMEKIT_SDK_CONFIG_VERSION, FramekitProtocolError, FramekitResponseError, FramekitValidationError, upgradeFramekitClientConfig } from "@framekit/sdk";
+const upgraded = upgradeFramekitClientConfig({ version: 1, baseUrl: "http://localhost" });
+if (FRAMEKIT_SDK_CONFIG_VERSION !== 2 || upgraded.config.version !== 2 || upgraded.config.retry !== undefined || typeof FramekitValidationError !== "function" || typeof FramekitResponseError !== "function" || typeof FramekitProtocolError !== "function") {
+  throw new Error("Packed SDK error/config exports are incomplete.");
+}
+`);
+  run(process.execPath, ["test/sdk-contract.mjs"], appRoot);
   run("pnpm", ["smoke"], appRoot);
   process.stdout.write(JSON.stringify({
     ok: true,

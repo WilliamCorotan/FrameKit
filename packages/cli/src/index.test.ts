@@ -104,6 +104,7 @@ describe("framekit CLI", () => {
     expect(stdout).toContain("export type CustomerInput");
     expect(stdout).toContain("export type DealWorkflowAction");
     expect(stdout).toContain('"win"');
+    expect(stdout).toContain("FramekitValidationError");
   });
 
   it("generates migration files from app module paths", async () => {

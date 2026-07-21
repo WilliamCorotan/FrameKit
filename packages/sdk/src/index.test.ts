@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, validateMigrationPlan, type MigrationPlan as RuntimeMigrationPlan } from "../../runtime/src/index.js";
 import { ofetch } from "ofetch";
-import { createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitClient, generateSdkTypes, type MigrationPlan } from "./index.js";
+import {
+  createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitAuthorizationError, FramekitCancelledError, FramekitClient, FramekitConflictError,
+  FramekitProtocolError, FramekitResponseError, FramekitServerError, FramekitValidationError, generateSdkTypes, upgradeFramekitClientConfig, type MigrationPlan
+} from "./index.js";
 
 vi.mock("ofetch", () => ({ ofetch: vi.fn() }));
 
@@ -14,7 +17,7 @@ afterEach(() => {
 describe("generateSdkTypes", () => {
   it("keeps the explicit HTTP endpoint matrix in parity with every public client method", () => {
     const methods = Object.getOwnPropertyNames(FramekitClient.prototype)
-      .filter((name) => !["constructor", "headers", "request"].includes(name))
+      .filter((name) => !["constructor", "execute", "headers", "request"].includes(name))
       .sort();
 
     expect(FRAMEKIT_HTTP_ENDPOINTS.map(([method]) => method).sort()).toEqual(methods);
@@ -136,6 +139,97 @@ describe("generateSdkTypes", () => {
     expect(generated).toContain("amount?: number;");
     expect(generated).toContain('stage?: "open" | "won";');
     expect(generated).toContain('export type DealWorkflowAction = "win";');
+    expect(generated).toContain("FramekitValidationError");
+    expect(generated).toContain("FramekitClientConfigV2");
+  });
+
+  it("maps OpenAPI failures into typed errors with request identity", async () => {
+    vi.mocked(ofetch).mockRejectedValue(httpFailure(422, "VALIDATION_FAILED", "email is invalid", { field: "email" }, { "x-request-id": "request-42" }));
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3 } });
+
+    const error = await client.get("customer", "one").catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(FramekitValidationError);
+    expect(error).toMatchObject({ status: 422, code: "VALIDATION_FAILED", details: { field: "email" }, requestId: "request-42" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries transient safe requests, honors Retry-After, and bounds attempts", async () => {
+    vi.useFakeTimers();
+    vi.mocked(ofetch)
+      .mockRejectedValueOnce(httpFailure(503, "UNAVAILABLE", "retry", undefined, { "retry-after": "1" }))
+      .mockResolvedValueOnce({ ok: true, app: "Retry" } as never);
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 2, baseDelayMs: 10, maxDelayMs: 2_000 } });
+
+    const result = client.health();
+    await vi.advanceTimersByTimeAsync(999);
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(result).resolves.toMatchObject({ ok: true });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("never implicitly retries conflicts or non-idempotent mutations", async () => {
+    const conflict = httpFailure(409, "REVISION_CONFLICT", "stale");
+    vi.mocked(ofetch).mockRejectedValue(conflict);
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3, baseDelayMs: 0 } });
+
+    await expect(client.get("customer", "one")).rejects.toBeInstanceOf(FramekitConflictError);
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+    vi.mocked(ofetch).mockReset().mockRejectedValue(httpFailure(503, "UNAVAILABLE", "retry"));
+    await expect(client.create("customer", { name: "Unsafe" })).rejects.toBeInstanceOf(FramekitServerError);
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+
+    vi.mocked(ofetch).mockReset().mockRejectedValueOnce(httpFailure(503, "UNAVAILABLE", "retry")).mockResolvedValueOnce({ id: "one" } as never);
+    await expect(client.create("customer", { name: "Safe" }, { idempotencyKey: "create-one" })).resolves.toMatchObject({ id: "one" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("classifies unknown HTTP responses separately from transport failures and never retries 405", async () => {
+    vi.mocked(ofetch).mockRejectedValue(httpFailure(405, "HTTP_405", "method not allowed"));
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3, baseDelayMs: 0 } });
+
+    const error = await client.get("customer", "one").catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(FramekitResponseError);
+    expect(error).toMatchObject({ status: 405, code: "HTTP_405" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("reserves transport retries for failures without an HTTP response", async () => {
+    vi.mocked(ofetch).mockRejectedValueOnce(new TypeError("fetch failed")).mockResolvedValueOnce({ ok: true, app: "Recovered" } as never);
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 2, baseDelayMs: 0 } });
+
+    await expect(client.health()).resolves.toMatchObject({ app: "Recovered" });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(2);
+  });
+
+  it("forwards list AbortSignal and performs zero requests when it is already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort("cancel before list");
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3 } });
+
+    await expect(client.list("customer", { signal: controller.signal })).rejects.toBeInstanceOf(FramekitCancelledError);
+    expect(vi.mocked(ofetch)).not.toHaveBeenCalled();
+  });
+
+  it("cancels retry waits with AbortSignal", async () => {
+    vi.mocked(ofetch).mockRejectedValue(httpFailure(503, "UNAVAILABLE", "retry", undefined, { "retry-after": "60" }));
+    const client = createClient({ baseUrl: "https://app.example", retry: { maxAttempts: 3 } });
+    const controller = new AbortController();
+    const result = client.health({ signal: controller.signal });
+    await Promise.resolve();
+    controller.abort("stop");
+    await expect(result).rejects.toBeInstanceOf(FramekitCancelledError);
+    expect(vi.mocked(ofetch)).toHaveBeenCalledTimes(1);
+  });
+
+  it("upgrades versioned configuration deterministically without enabling retries", () => {
+    expect(upgradeFramekitClientConfig({ version: 1, baseUrl: "https://app.example" })).toEqual({
+      config: { version: 2, baseUrl: "https://app.example" },
+      diagnostics: [{ code: "UPGRADED_V1", message: "SDK config version 1 upgraded to version 2 with retries disabled by default." }]
+    });
+    expect(upgradeFramekitClientConfig({ baseUrl: "https://app.example" }).diagnostics[0]?.code).toBe("ASSUMED_V1");
+    expect(() => upgradeFramekitClientConfig({ version: 3, baseUrl: "https://app.example" } as never)).toThrow("Unsupported");
   });
 
   it("parses server-sent realtime events from the SDK stream helper", async () => {
@@ -159,6 +253,53 @@ describe("generateSdkTypes", () => {
     expect(vi.mocked(fetch).mock.calls[0]?.[1]?.headers).toMatchObject({ "last-event-id": "41" });
   });
 
+  it("maps realtime HTTP envelopes with status, details, and request identity", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ code: "FORBIDDEN", message: "stream denied", details: { permission: "framekit.realtime.read" } }), {
+      status: 403,
+      headers: { "content-type": "application/json", "x-request-id": "stream-request-42" }
+    }));
+    const client = createClient({ baseUrl: "https://app.example" });
+
+    const error = await client.streamRealtimeEvents(() => undefined).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(FramekitAuthorizationError);
+    expect(error).toMatchObject({ status: 403, code: "FORBIDDEN", details: { permission: "framekit.realtime.read" }, requestId: "stream-request-42" });
+  });
+
+  it("maps realtime fetch and body-read aborts to cancellation", async () => {
+    const fetchController = new AbortController();
+    fetchController.abort("before fetch");
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    const client = createClient({ baseUrl: "https://app.example" });
+    await expect(client.streamRealtimeEvents(() => undefined, { signal: fetchController.signal })).rejects.toBeInstanceOf(FramekitCancelledError);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    fetchMock.mockResolvedValue(new Response(new ReadableStream<Uint8Array>({ start(controller) { streamController = controller; } }), { status: 200, headers: { "x-request-id": "read-abort-42" } }));
+    const readController = new AbortController();
+    const reading = client.streamRealtimeEvents(() => undefined, { signal: readController.signal });
+    await Promise.resolve();
+    await Promise.resolve();
+    readController.abort("during read");
+    streamController.error(new DOMException("aborted", "AbortError"));
+    const readError = await reading.catch((failure: unknown) => failure);
+    expect(readError).toBeInstanceOf(FramekitCancelledError);
+    expect(readError).toMatchObject({ status: 200, requestId: "read-abort-42" });
+  });
+
+  it("classifies malformed realtime event data as a protocol error", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("event: broken\ndata: {not-json}\n\n", { status: 200, headers: { "x-request-id": "protocol-42" } }));
+    const error = await createClient({ baseUrl: "https://app.example" }).streamRealtimeEvents(() => undefined).catch((failure: unknown) => failure);
+    expect(error).toBeInstanceOf(FramekitProtocolError);
+    expect(error).toMatchObject({ status: 200, code: "SSE_INVALID_JSON", requestId: "protocol-42" });
+  });
+
+  it("preserves established response context on stream read transport failures", async () => {
+    const body = new ReadableStream<Uint8Array>({ start(controller) { controller.error(new TypeError("socket closed")); } });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body, { status: 200, headers: { "x-request-id": "read-failure-42" } }));
+    const error = await createClient({ baseUrl: "https://app.example" }).streamRealtimeEvents(() => undefined).catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ status: 200, code: "STREAM_READ_FAILED", requestId: "read-failure-42" });
+  });
+
   it("includes credentials for cookie-backed auth helpers", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(
@@ -179,3 +320,7 @@ describe("generateSdkTypes", () => {
     expect(fetchMock.mock.calls[0]?.[1]?.headers).not.toMatchObject({ authorization: expect.any(String) });
   });
 });
+
+function httpFailure(status: number, code: string, message: string, details?: unknown, headers: Record<string, string> = {}) {
+  return { message, response: { status, headers: new Headers(headers), _data: { error: true, code, message, details } } };
+}
