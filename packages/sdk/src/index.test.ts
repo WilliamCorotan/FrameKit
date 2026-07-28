@@ -3,7 +3,7 @@ import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, validateMigrationPlan, type MigrationPlan as RuntimeMigrationPlan } from "../../runtime/src/index.js";
 import { ofetch } from "ofetch";
 import {
-  createClient, FRAMEKIT_HTTP_ENDPOINTS, FramekitAuthorizationError, FramekitCancelledError, FramekitClient, FramekitConflictError,
+  createClient, FRAMEKIT_HTTP_ENDPOINTS, FRAMEKIT_SDK_CONFIG_VERSION, FramekitAuthorizationError, FramekitCancelledError, FramekitClient, FramekitConflictError,
   FramekitProtocolError, FramekitResponseError, FramekitServerError, FramekitValidationError, generateSdkTypes, upgradeFramekitClientConfig, type MigrationPlan
 } from "./index.js";
 
@@ -15,6 +15,11 @@ afterEach(() => {
 });
 
 describe("generateSdkTypes", () => {
+  it("exports the current config version and upgrades v1 configs to that contract", () => {
+    expect(FRAMEKIT_SDK_CONFIG_VERSION).toBe(2);
+    expect(upgradeFramekitClientConfig({ version: 1, baseUrl: "https://app.example" }).config.version).toBe(FRAMEKIT_SDK_CONFIG_VERSION);
+  });
+
   it("sends typed document commands with an idempotency key", async () => {
     vi.mocked(ofetch).mockResolvedValue({} as never);
     const client = createClient({ baseUrl: "https://app.example", token: "session" });
@@ -34,6 +39,18 @@ describe("generateSdkTypes", () => {
       .sort();
 
     expect(FRAMEKIT_HTTP_ENDPOINTS.map(([method]) => method).sort()).toEqual(methods);
+  });
+
+  it("serializes list sorting as field then direction", async () => {
+    vi.mocked(ofetch).mockResolvedValue([] as never);
+    await createClient({ baseUrl: "https://app.example" }).list("customer", {
+      filters: {},
+      sort: { field: "name", direction: "asc" }
+    });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledWith(
+      "https://app.example/api/doctypes/customer?sort=name%3Aasc",
+      expect.any(Object)
+    );
   });
 
   it("covers health, delete, and typed migration request semantics", async () => {

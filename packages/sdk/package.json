@@ -28,7 +28,13 @@
   "description": "Framekit HTTP client and SDK type generation utilities.",
   "files": [
     "dist",
-    "src/index.ts"
+    "src/client.ts",
+    "src/endpoints.ts",
+    "src/errors.ts",
+    "src/generator.ts",
+    "src/index.ts",
+    "src/transport.ts",
+    "src/types.ts"
   ],
   "engines": { "node": ">=22 <26" },
   "publishConfig": {
