@@ -1206,6 +1206,37 @@ describe("runtime document service", () => {
     ]));
     await expect(runtime.upsertSetting({ ...privileged, permissions: ["framekit.settings.read"] }, "ops.region", "eu")).rejects.toMatchObject({ code: "FORBIDDEN" });
     await expect(createRuntime(app).upsertSetting(privileged, "ops.token", "secret")).rejects.toMatchObject({ code: "SECRET_STORAGE_UNAVAILABLE" });
+    const secretText = "runtime-adapter-secret";
+    const failingCustomization = new InMemoryCustomizationStore();
+    const failingRuntime = createRuntime(app, {
+      customization: failingCustomization,
+      settingsSecrets: {
+        seal: () => { throw new Error(`could not seal ${secretText}`); },
+        unseal: () => { throw new Error(`could not unseal ${secretText}`); }
+      }
+    });
+    const sealFailure = await failingRuntime.upsertSetting(privileged, "ops.token", secretText).catch((error) => error);
+    expect(sealFailure).toMatchObject({ code: "SECRET_STORAGE_FAILED", statusCode: 503, message: "Secret storage operation failed." });
+    expect(JSON.stringify(sealFailure)).not.toContain(secretText);
+    await failingCustomization.upsertSettingValue(privileged, { appName: app.name, scopeId: `tenant:${tenant.tenantId}`, key: "ops.token", value: "sealed-value", protected: true, updatedAt: new Date().toISOString() });
+    const unsealFailure = await failingRuntime.resolveSettingValue(privileged, "ops.token").catch((error) => error);
+    expect(unsealFailure).toMatchObject({ code: "SECRET_STORAGE_FAILED", statusCode: 503, message: "Secret storage operation failed." });
+    expect(JSON.stringify(unsealFailure)).not.toContain(secretText);
+    for (const [type, protectedValue] of [["text", true], ["secret", false]] as const) {
+      const driftSecret = `metadata-drift-${type}`;
+      const driftApp = defineApp({
+        name: `Drift ${type}`,
+        modules: [defineModule({ id: "ops", name: "Operations", settings: [{ key: "ops.token", label: "Token", type }] })]
+      });
+      const driftStore = new InMemoryCustomizationStore();
+      const driftRuntime = createRuntime(driftApp, { customization: driftStore, settingsSecrets: { seal: (value) => `sealed:${value}`, unseal: (value) => value.slice(7) } });
+      await driftStore.upsertSettingValue(privileged, { appName: driftApp.name, scopeId: `tenant:${tenant.tenantId}`, key: "ops.token", value: driftSecret, protected: protectedValue, updatedAt: new Date().toISOString() });
+      const listedFailure = await driftRuntime.settings(privileged).catch((error) => error);
+      const resolvedFailure = await driftRuntime.resolveSettingValue(privileged, "ops.token").catch((error) => error);
+      expect(listedFailure).toMatchObject({ code: "SECRET_STORAGE_FAILED", statusCode: 503 });
+      expect(resolvedFailure).toMatchObject({ code: "SECRET_STORAGE_FAILED", statusCode: 503 });
+      expect(JSON.stringify([listedFailure, resolvedFailure])).not.toContain(driftSecret);
+    }
     await customization.upsertSettingValue(privileged, { appName: app.name, scopeId: `tenant:${tenant.tenantId}`, key: "ops.region", value: { corrupt: true }, protected: false, updatedAt: new Date().toISOString() });
     await expect(runtime.settings(privileged)).rejects.toMatchObject({ code: "INVALID_SETTING_VALUE" });
   });

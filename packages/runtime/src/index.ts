@@ -543,8 +543,12 @@ export class FramekitRuntime {
     let persisted: unknown = value;
     if (definition.type === "secret") {
       if (!this.settingsSecrets) throw new FramekitError("SECRET_STORAGE_UNAVAILABLE", "Secret settings require an explicit secret storage port.", 503, { key });
-      persisted = await this.settingsSecrets.seal(String(value), { appName: this.app.name, scopeId, key });
-      if (typeof persisted !== "string" || !persisted) throw new FramekitError("SECRET_STORAGE_FAILED", "Secret storage did not return an opaque value.", 503, { key });
+      try {
+        persisted = await this.settingsSecrets.seal(String(value), { appName: this.app.name, scopeId, key });
+      } catch {
+        throw secretStorageFailure();
+      }
+      if (typeof persisted !== "string" || !persisted) throw secretStorageFailure();
     }
     const stored = await this.customization.upsertSettingValue(tenant, { scopeId, appName: this.app.name, key, value: persisted, protected: definition.type === "secret", updatedAt: this.now().toISOString() });
     return this.publicSetting(definition, stored);
@@ -555,9 +559,14 @@ export class FramekitRuntime {
     const scopeId = settingScopeId(definition, tenant, this.app.name);
     const persisted = (await this.listStoredSettings(tenant)).find((item) => item.key === key && item.scopeId === scopeId);
     if (!persisted) return definition.default;
+    if (persisted.protected !== (definition.type === "secret")) throw secretStorageFailure();
     if (definition.type !== "secret") return validateSettingValue(definition, persisted.value);
-    if (!this.settingsSecrets || !persisted.protected || typeof persisted.value !== "string") throw new FramekitError("SECRET_STORAGE_UNAVAILABLE", "Secret setting cannot be resolved without its secret storage port.", 503, { key });
-    return validateSettingValue(definition, await this.settingsSecrets.unseal(persisted.value, { appName: this.app.name, scopeId, key }));
+    if (!this.settingsSecrets || typeof persisted.value !== "string") throw new FramekitError("SECRET_STORAGE_UNAVAILABLE", "Secret setting cannot be resolved without its secret storage port.", 503, { key });
+    try {
+      return validateSettingValue(definition, await this.settingsSecrets.unseal(persisted.value, { appName: this.app.name, scopeId, key }));
+    } catch {
+      throw secretStorageFailure();
+    }
   }
 
   private async listStoredSettings(tenant: TenantContext): Promise<StoredSettingValue[]> {
@@ -573,6 +582,7 @@ export class FramekitRuntime {
   private publicSetting(definition: SettingDefinition, persisted?: StoredSettingValue, locale?: string): PublicSetting {
     const { default: defaultValue, ...publicDefinition } = definition;
     const secret = definition.type === "secret";
+    if (persisted && persisted.protected !== secret) throw secretStorageFailure();
     const value = persisted
       ? (secret ? undefined : validateSettingValue(definition, persisted.value))
       : (defaultValue === undefined ? undefined : validateSettingValue(definition, defaultValue));
@@ -2813,6 +2823,10 @@ export async function appSchemaChecksum(app: AppDefinition): Promise<string> {
   };
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(stableJson(metadata)));
   return base64Url(new Uint8Array(digest));
+}
+
+function secretStorageFailure(): FramekitError {
+  return new FramekitError("SECRET_STORAGE_FAILED", "Secret storage operation failed.", 503);
 }
 
 function appUniqueConstraints(app: AppDefinition): Array<{ doctype: string; field: string }> {

@@ -2,7 +2,7 @@ import { H3, toWebHandler } from "h3";
 import { describe, expect, it, vi } from "vitest";
 import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRoleStore, InMemoryUserStore, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
-import { createRuntime, migrationChecksum, type RealtimePublisher, type RuntimeRealtimeEvent } from "@framekit/runtime";
+import { createRuntime, InMemoryCustomizationStore, migrationChecksum, type RealtimePublisher, type RuntimeRealtimeEvent } from "@framekit/runtime";
 import { assertSecureProductionCredentials, createNitroHandler, createOpenTelemetryAdapters } from "./index.js";
 
 describe("createNitroHandler", () => {
@@ -150,9 +150,84 @@ describe("createNitroHandler", () => {
     const secret = await json<Record<string, unknown>>(fetch, "/api/settings/ops.token", { method: "PUT", headers, body: { value: "http-secret" } });
     expect(secret).toMatchObject({ key: "ops.token", configured: true, redacted: true });
     expect(JSON.stringify(secret)).not.toContain("http-secret");
+    for (const invalidBody of [5, "secret", true, null, []]) {
+      const response = await fetch(new Request("http://localhost/api/settings/ops.token", {
+        method: "PUT",
+        headers: { "content-type": "application/json", "x-tenant-id": "default", origin: "http://localhost", ...headers },
+        body: JSON.stringify(invalidBody)
+      }));
+      expect(response.status).toBe(422);
+      await expect(response.json()).resolves.toMatchObject({ error: true, code: "VALIDATION_FAILED", message: "value is required." });
+    }
     const listed = await json<Array<Record<string, unknown>>>(fetch, "/api/settings?locale=fr", { headers });
     expect(listed).toEqual([expect.objectContaining({ label: "Jeton", redacted: true })]);
     expect(JSON.stringify(listed)).not.toContain("http-secret");
+  });
+
+  it("sanitizes secret-storage adapter failures before API telemetry sinks", async () => {
+    const secret = "nitro-adapter-secret";
+    const app = defineApp({
+      name: "Secret failures",
+      modules: [defineModule({ id: "ops", name: "Operations", settings: [{ key: "ops.token", label: "Token", type: "secret", required: true }] })]
+    });
+    const runtime = createRuntime(app, {
+      settingsSecrets: {
+        seal: () => { throw new Error(`could not seal ${secret}`); },
+        unseal: () => { throw new Error(`could not unseal ${secret}`); }
+      }
+    });
+    const logs: unknown[] = [];
+    const exceptions: unknown[] = [];
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, {
+      development: { allowHeaderIdentity: true },
+      logger: { info: (event) => { logs.push(event); }, error: (event) => { logs.push(event); } },
+      tracer: { startSpan: () => ({ recordException: (error) => exceptions.push(error), end: () => undefined }) }
+    }));
+    const response = await toWebHandler(h3)(new Request("http://localhost/api/settings/ops.token", {
+      method: "PUT",
+      headers: {
+        "content-type": "application/json",
+        "x-tenant-id": "default",
+        "x-user-id": "operator",
+        "x-permissions": "framekit.settings.manage"
+      },
+      body: JSON.stringify({ value: secret })
+    }));
+    const body = await response.json();
+    expect(response.status).toBe(503);
+    expect(body).toMatchObject({ error: true, code: "SECRET_STORAGE_FAILED", message: "Secret storage operation failed." });
+    expect(JSON.stringify([body, logs, exceptions])).not.toContain(secret);
+  });
+
+  it("fails closed when a persisted setting protection marker drifts from metadata", async () => {
+    for (const [type, protectedValue] of [["text", true], ["secret", false]] as const) {
+      const secret = `nitro-metadata-drift-${type}`;
+      const app = defineApp({
+        name: `Drift ${type}`,
+        modules: [defineModule({ id: "ops", name: "Operations", settings: [{ key: "ops.token", label: "Token", type }] })]
+      });
+      const customization = new InMemoryCustomizationStore();
+      const runtime = createRuntime(app, { customization, settingsSecrets: { seal: (value) => `sealed:${value}`, unseal: (value) => value.slice(7) } });
+      await customization.upsertSettingValue({ tenantId: "default", userId: "operator", roles: [], permissions: ["framekit.settings.read"] }, {
+        appName: app.name, scopeId: "tenant:default", key: "ops.token", value: secret, protected: protectedValue, updatedAt: new Date().toISOString()
+      });
+      const logs: unknown[] = [];
+      const exceptions: unknown[] = [];
+      const h3 = new H3();
+      h3.all("/**", createNitroHandler(runtime, {
+        development: { allowHeaderIdentity: true },
+        logger: { info: (event) => { logs.push(event); }, error: (event) => { logs.push(event); } },
+        tracer: { startSpan: () => ({ recordException: (error) => exceptions.push(error), end: () => undefined }) }
+      }));
+      const response = await toWebHandler(h3)(new Request("http://localhost/api/settings", {
+        headers: { "x-tenant-id": "default", "x-user-id": "operator", "x-permissions": "framekit.settings.read" }
+      }));
+      const body = await response.json();
+      expect(response.status).toBe(503);
+      expect(body).toMatchObject({ error: true, code: "SECRET_STORAGE_FAILED", message: "Secret storage operation failed." });
+      expect(JSON.stringify([body, logs, exceptions])).not.toContain(secret);
+    }
   });
 
   it("exposes submit and cancel document lifecycle commands", async () => {

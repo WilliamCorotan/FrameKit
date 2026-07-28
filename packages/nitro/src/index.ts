@@ -606,8 +606,10 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
         assertOperationPermission(tenant, "framekit.settings.manage", "update application settings");
         const key = decodeURIComponent(path.slice(`${basePath}/settings/`.length));
-        const body = ((await readBody(event)) ?? {}) as { value?: unknown };
-        if (!("value" in body)) throw new FramekitError("VALIDATION_FAILED", "value is required.", 422);
+        const body: unknown = await readBody(event);
+        if (!isPlainObject(body) || !Object.prototype.hasOwnProperty.call(body, "value")) {
+          throw new FramekitError("VALIDATION_FAILED", "value is required.", 422);
+        }
         return await runtime.upsertSetting(tenant, key, body.value);
       }
 
@@ -1347,6 +1349,12 @@ function toFilterValue(value: unknown): FilterValue {
     return value as FilterValue;
   }
   throw new FramekitError("VALIDATION_FAILED", "filters may only contain primitive values, arrays, or operator objects.", 422);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal, after?: string): Response {
