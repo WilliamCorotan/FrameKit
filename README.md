@@ -276,7 +276,7 @@ docs/              Architecture, deployment, and roadmap docs
 
 ## Deployment
 
-The intended production target is a Nitro Node server with Postgres and Redis. The current release is a beta: production-depth gates are present, while the remaining 1.0 metadata semantics are tracked in the [maturity roadmap](docs/maturity-roadmap.md).
+The intended production target is a Nitro Node server with Postgres and Redis. The current release is a beta: production-depth gates are present, while the remaining 1.0 work is operational hardening and explicit production boundaries—durable saga coordination, native MFA, load/soak evidence, deeper schema-drift detection, packaged Desk, and production secret/object-storage adapters. See the [maturity roadmap](docs/maturity-roadmap.md).
 
 ```bash
 docker compose up --build

@@ -63,7 +63,7 @@ Status: implemented
 
 Status: implemented for the beta
 
-- Generate typed SDK models from app metadata; generated endpoint parity remains incomplete.
+- Generate typed SDK models from app metadata; generated endpoint parity is implemented and covered by the explicit HTTP endpoint matrix. The remaining developer-experience limitation is the intentionally un-packaged Desk template, pending stable asset, configuration, and upgrade contracts.
 - Add a `create-app` server template for Nitro, Docker/env, and a starter DocType. The scaffold intentionally excludes Desk; a future packaged Desk template requires its own stable asset and upgrade contract.
 - Add CI workflow, deployment presets docs, and package publishing metadata.
 - Publish lifecycle, compatibility, observability, security, contribution, and support contracts; enforce coverage and supply-chain gates in CI.

@@ -15,7 +15,6 @@ Scores are evidence-based engineering estimates, not issue-completion percentage
 ## Overall assessment
 
 - Component-average implementation: **88%**.
-- Functional breadth: approximately **92%**; production readiness: approximately **82%**.
 - Stage: **beta**. The P0 and P1 milestones and all feature issues are closed. [#60](https://github.com/WilliamCorotan/FrameKit/issues/60) is the only open P2 issue and closes with this reconciliation after its reviewed PR is merged.
 
 ## Modern framework component matrix
@@ -37,8 +36,8 @@ Scores are evidence-based engineering estimates, not issue-completion percentage
 
 ## Milestone reconciliation
 
-- **P0:** closed; #16, #17, and #18 are closed.
-- **P1:** closed; #19 through #25 are closed.
+- **P0:** closed, **4/4** issues: #16, #17, #18, and #28.
+- **P1:** closed, **8/8** issues: #19 through #25 and #41.
 - **P2 Production Maturity:** #26, #27, #39, #40, #42, #45, #46, and #47 are closed. #60 is its sole remaining open issue; no feature issue remains open.
 
 The remaining 1.0 work is deliberately outside that closed feature scope: durable saga coordination, native MFA, load/soak/fault evidence, deeper physical-schema drift detection, generated API/versioned upgrade documentation, packaged Desk, and production object-storage/secret adapters.
@@ -49,12 +48,16 @@ The following evidence was collected for the exact merged baseline above on 2026
 
 | Check | Exact result |
 | --- | --- |
-| `pnpm audit:all` | Passed lint, recursive typecheck, coverage test run, and all package/CRM/Desk builds. |
+| `pnpm audit:all` | Node 24; passed lint, recursive typecheck, coverage test run, and all package/CRM/Desk builds. |
 | Unit/in-process | **161 passed, 18 skipped**; runtime **37/37** and Nitro **22/22**. |
 | Coverage | **68.15% statements, 62.08% branches, 68.93% functions, 70.62% lines** (all above the configured 60/50/60/60 gates). |
-| Service matrix | Live PostgreSQL 16 DB **17/17** and Redis 8 jobs **1/1** passed; CI also gates PostgreSQL 17 and Redis 7. |
-| Built and browser | Built CRM smoke passed; Desk mocked browser **7/7** and live full-stack Chromium/Firefox **8/8** passed. |
-| Packaging/compatibility | Node 22/24 package exports and packed standalone-consumer verification passed. |
+| `DATABASE_URL=postgres://framekit:framekit@localhost:5432/framekit REDIS_URL=redis://localhost:6379 pnpm test:services` | Passed against live PostgreSQL 16/Redis 7 and PostgreSQL 17/Redis 8: DB **17/17**, jobs **1/1** in each matrix entry. |
+| `pnpm test:smoke:crm:built` | Built CRM assertion suite passed **2/2**. |
+| `pnpm smoke:crm:built` | Built CRM smoke passed and terminated cleanly. |
+| `pnpm test:desk:browser` | Mocked Desk browser journeys passed **7/7**. |
+| `DATABASE_URL=postgres://framekit:framekit@localhost:5432/framekit_desk pnpm test:desk:fullstack` | Live Postgres-backed Desk full-stack suite passed in Chromium and Firefox (**8** journeys; exit 0). |
+| `pnpm --filter './packages/**' build && pnpm verify:package-exports` | Passed under Node **22** and Node **24**; verified exports for all **10** public packages in each run. |
+| `pnpm verify:standalone` | Packed standalone consumer passed install, typecheck, build, authentication, and built-Nitro CRUD proof. |
 | Hosted gates | CI [30332849761](https://github.com/WilliamCorotan/FrameKit/actions/runs/30332849761), CodeQL [30332849759](https://github.com/WilliamCorotan/FrameKit/actions/runs/30332849759), Dependency Security [30332849780](https://github.com/WilliamCorotan/FrameKit/actions/runs/30332849780), and SBOM [30332849774](https://github.com/WilliamCorotan/FrameKit/actions/runs/30332849774) succeeded. |
 
 `pnpm audit:all` does not itself start service containers, run both browser engines, switch Node majors, pack a consumer, or invoke hosted CodeQL/SBOM. Those commands are independently wired in [CI](../.github/workflows/ci.yml), [release](../.github/workflows/release.yml), and the linked successful hosted runs.
