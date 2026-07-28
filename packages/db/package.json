@@ -32,7 +32,17 @@
   "description": "Framekit Postgres and Drizzle persistence adapters.",
   "files": [
     "dist",
-    "src/index.ts"
+    "src/index.ts",
+    "src/schema.ts",
+    "src/schema-contract.ts",
+    "src/types.ts",
+    "src/document-mapping.ts",
+    "src/document-repository.ts",
+    "src/migration-sql-helpers.ts",
+    "src/mutation-repository.ts",
+    "src/auth-adapters.ts",
+    "src/runtime-adapters.ts",
+    "src/ddl.ts"
   ],
   "engines": {
     "node": ">=22 <26"
