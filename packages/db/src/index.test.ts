@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { getTableConfig } from "drizzle-orm/pg-core";
 import { migrationChecksum, type MigrationPlan } from "@framekit/runtime";
 import {
   createApiTokenTableSql,
@@ -18,6 +19,7 @@ import {
   createViewTableSql,
   PostgresMigrationStore
 } from "./index.js";
+import { framekitAuthIdentityLinks, framekitSessionRevocations } from "./schema.js";
 
 describe("db migration sql", () => {
   it("defines document and user tables", () => {
@@ -51,6 +53,22 @@ describe("db migration sql", () => {
     expect(createMigrationTableSql()).toContain("attempt_id text");
     expect(createMigrationTableSql()).toContain("approval jsonb not null");
     expect(createMigrationTableSql()).toContain("checksum");
+  });
+
+  it("keeps Drizzle identity indexes aligned with generated authentication DDL", () => {
+    const ddl = `${createSessionRevocationTableSql()}\n${createAuthIdentityLifecycleTablesSql()}`;
+    const drizzleIndexes = [
+      ...getTableConfig(framekitSessionRevocations).indexes,
+      ...getTableConfig(framekitAuthIdentityLinks).indexes
+    ].map((index) => index.config.name);
+
+    for (const indexName of drizzleIndexes) {
+      expect(ddl).toContain(indexName);
+    }
+    expect(drizzleIndexes).toEqual(expect.arrayContaining([
+      "framekit_session_revocations_identity",
+      "framekit_auth_identity_links_subject"
+    ]));
   });
 
   it("hashes immutable conversion artifacts and rejects duplicate registry identities", async () => {
