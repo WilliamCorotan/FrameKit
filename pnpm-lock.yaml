@@ -273,8 +273,8 @@ importers:
         specifier: workspace:*
         version: link:../runtime
       h3:
-        specifier: 2.0.1-rc.26
-        version: 2.0.1-rc.26
+        specifier: 2.0.1-rc.22
+        version: 2.0.1-rc.22(crossws@0.4.7(srvx@0.12.4))
 
   packages/openapi:
     dependencies:
@@ -1310,16 +1310,6 @@ packages:
       crossws:
         optional: true
 
-  h3@2.0.1-rc.26:
-    resolution: {integrity: sha512-GDxlvDsKxgjRvG5UBRJYyGJTMWLV30CJ4cV+e7QCTgftDHihrvio1fVPbNembhEr6J4WNm8IWy3fookgyTweLw==}
-    engines: {node: '>=20.11.1'}
-    hasBin: true
-    peerDependencies:
-      crossws: ^0.4.9
-    peerDependenciesMeta:
-      crossws:
-        optional: true
-
   has-flag@4.0.0:
     resolution: {integrity: sha512-EykJT/Q1KjTWctppgIAgfSO0tKVuZUjhgMr17kqTumMl6Afv3EISleU7qZUzoXDFTAHTDC4NOoG/ZxU3EvlMPQ==}
     engines: {node: '>=8'}
@@ -1638,9 +1628,6 @@ packages:
 
   rou3@0.8.1:
     resolution: {integrity: sha512-ePa+XGk00/3HuCqrEnK3LxJW7I0SdNg6EFzKUJG73hMAdDcOUC/i/aSz7LSDwLrGr33kal/rqOGydzwl6U7zBA==}
-
-  rou3@0.9.1:
-    resolution: {integrity: sha512-z/sSmzvtwMDDnxsPVhfWMuG6F6mbmhFDXoVqLmMfbpDD9qfV3GDmSQpf0+W296/ZDIpW2wcMmBfpVFzcnOi/nA==}
 
   sade@1.8.1:
     resolution: {integrity: sha512-xal3CZX1Xlo/k4ApwCFrHVACi9fBqJ7V+mwhBsuf/1IOKbBy098Fex+Wa/5QMubw09pSZ/u8EY8PWgevJsXp1A==}
@@ -2623,6 +2610,11 @@ snapshots:
     optionalDependencies:
       srvx: 0.11.18
 
+  crossws@0.4.7(srvx@0.12.4):
+    optionalDependencies:
+      srvx: 0.12.4
+    optional: true
+
   csstype@3.2.3: {}
 
   db0@0.3.4(drizzle-orm@0.45.2(postgres@3.4.9)):
@@ -2732,10 +2724,12 @@ snapshots:
     optionalDependencies:
       crossws: 0.4.7(srvx@0.11.18)
 
-  h3@2.0.1-rc.26:
+  h3@2.0.1-rc.22(crossws@0.4.7(srvx@0.12.4)):
     dependencies:
-      rou3: 0.9.1
-      srvx: 0.12.4
+      rou3: 0.8.1
+      srvx: 0.11.18
+    optionalDependencies:
+      crossws: 0.4.7(srvx@0.12.4)
 
   has-flag@4.0.0: {}
 
@@ -3059,8 +3053,6 @@ snapshots:
 
   rou3@0.8.1: {}
 
-  rou3@0.9.1: {}
-
   sade@1.8.1:
     dependencies:
       mri: 1.2.0
@@ -3098,7 +3090,8 @@ snapshots:
 
   srvx@0.11.18: {}
 
-  srvx@0.12.4: {}
+  srvx@0.12.4:
+    optional: true
 
   stackback@0.0.2: {}
 
