@@ -29,4 +29,23 @@ export function jsonPathSegment(value: string): string { return value.replaceAll
 export function sqlLiteral(value: string): string { return `'${value.replaceAll("'", "''")}'`; }
 export function sqlLiteralJson(value: unknown): string { return sqlLiteral(JSON.stringify(value)); }
 
-function identifierPart(value: string): string { return value.replaceAll(/[^a-zA-Z0-9_]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase(); }
+function identifierPart(value: string): string {
+  const normalized: string[] = [];
+  let replacingInvalidRun = false;
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    const allowed = character === "_" || (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+    if (allowed) {
+      normalized.push(character.toLowerCase());
+      replacingInvalidRun = false;
+    } else if (!replacingInvalidRun) {
+      normalized.push("_");
+      replacingInvalidRun = true;
+    }
+  }
+  let start = 0;
+  let end = normalized.length;
+  while (start < end && normalized[start] === "_") start += 1;
+  while (end > start && normalized[end - 1] === "_") end -= 1;
+  return normalized.slice(start, end).join("");
+}

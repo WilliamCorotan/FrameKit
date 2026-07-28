@@ -19,10 +19,18 @@ import {
   createViewTableSql,
   PostgresMigrationStore
 } from "./index.js";
+import { indexIdentifier } from "./migration-sql-helpers.js";
 import { framekitAuditEvents, framekitAuthIdentityLinks, framekitCustomFields, framekitOutboxEvents, framekitSessionRevocations, framekitViews } from "./schema.js";
 import { fixedSchema, type FixedSchemaTable } from "./schema-contract.js";
 
 describe("db migration sql", () => {
+  it("normalizes adversarial migration identifiers in linear time", () => {
+    expect(indexIdentifier({
+      doctype: `${"_".repeat(10_000)}Customer`,
+      field: `${"-".repeat(10_000)}region${"-".repeat(10_000)}`
+    }, "idx")).toBe("framekit_documents_customer_region_idx");
+  });
+
   it("defines document and user tables", () => {
     expect(createDocumentTableSql()).toContain("framekit_documents");
     expect(createDocumentTableSql()).toContain("document_status text not null default 'draft'");
@@ -75,8 +83,12 @@ describe("db migration sql", () => {
     for (const [contract, table, ddl] of cases) {
       const drizzle = getTableConfig(table);
       expect(drizzle.name).toBe(contract.name);
-      expect(drizzle.columns.map((column) => ({ name: column.name, nullable: !column.notNull, hasDefault: column.hasDefault })))
-        .toEqual(contract.columns.map((column) => ({ name: column.name, nullable: column.nullable, hasDefault: column.default !== undefined })));
+      expect(drizzle.columns.map((column) => ({
+        name: column.name,
+        type: column.getSQLType() === "timestamp with time zone" ? "timestamptz" : column.getSQLType(),
+        nullable: !column.notNull,
+        default: column.hasDefault ? String(column.default) : undefined
+      }))).toEqual(contract.columns);
       expect(drizzle.indexes.map((index) => ({
         name: index.config.name,
         unique: index.config.unique,
