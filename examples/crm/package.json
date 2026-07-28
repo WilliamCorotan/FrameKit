@@ -21,6 +21,6 @@
     "@framekit/nitro": "workspace:*",
     "@framekit/realtime": "workspace:*",
     "@framekit/runtime": "workspace:*",
-    "nitro": "^3.0.260610-beta"
+    "nitro": "3.0.260610-beta"
   }
 }
