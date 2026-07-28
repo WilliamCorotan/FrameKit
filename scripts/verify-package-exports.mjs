@@ -3,11 +3,10 @@ import { access, readFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { publicPackageDirectories } from "./public-packages.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const packageDirectories = ["auth", "cli", "core", "db", "jobs", "nitro", "openapi", "realtime", "runtime", "sdk"];
-
-for (const directory of packageDirectories) {
+for (const directory of publicPackageDirectories) {
   const packageRoot = join(root, "packages", directory);
   const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
   if (manifest.private) throw new Error(`${manifest.name} unexpectedly became private.`);
