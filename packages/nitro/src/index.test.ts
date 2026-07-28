@@ -4,7 +4,7 @@ import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRo
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, InMemoryCustomizationStore, migrationChecksum, type RealtimePublisher, type RuntimeRealtimeEvent } from "@framekit/runtime";
 import { assertSecureProductionCredentials, createNitroHandler, createOpenTelemetryAdapters } from "./index.js";
-import { matchNitroRoute } from "./route-dispatcher.js";
+import { matchNitroRoute, normalizeNitroBasePath } from "./route-dispatcher.js";
 import { matchAttachmentPath } from "./route-matchers.js";
 import { FRAMEKIT_ROUTE_CATALOG } from "@framekit/openapi";
 
@@ -23,6 +23,7 @@ describe("createNitroHandler", () => {
     expect(matchNitroRoute("PUT", "/v1/auth/roles/example", "/v1")?.group).toBe("auth");
     expect(matchNitroRoute("GET", "/v1/auth/users/example/extra", "/v1")).toBeUndefined();
     expect(matchNitroRoute("GET", "/v1/auth/users", "/api")).toBeUndefined();
+    expect(normalizeNitroBasePath(`v1${"/".repeat(30_000)}`)).toBe("/v1");
   });
 
   it("uses a normalized custom base path throughout dispatch", async () => {
