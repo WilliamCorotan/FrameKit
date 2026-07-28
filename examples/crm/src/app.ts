@@ -2,7 +2,7 @@ import { assertSecureProductionCredentials } from "@framekit/nitro";
 import { createRuntime } from "@framekit/runtime";
 import { createAuth } from "./auth.js";
 import { app } from "./domain.js";
-import { seedDemoData } from "./seed.js";
+import { createDemoSeeder } from "./seed.js";
 import { createRealtimePublisher, createRuntimePersistence } from "./stores.js";
 
 const environment = process.env.NODE_ENV ?? "development";
@@ -21,8 +21,6 @@ export const eventBus = await createRealtimePublisher();
 export const runtime = createRuntime(app, { ...persistence, realtime: eventBus });
 export const auth = await createAuth({ secret: authSecret, email: bootstrapEmail, password: bootstrapPassword });
 
-export function seedDemo(): Promise<void> {
-  return seedDemoData(runtime);
-}
+export const seedDemo = createDemoSeeder(runtime);
 
 export { app, contactDocType, crmModule, customerDocType, dealDocType } from "./domain.js";

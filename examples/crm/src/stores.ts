@@ -20,9 +20,12 @@ import {
 import { InMemoryEventBus } from "@framekit/realtime";
 import { createBootstrapAdmin } from "./bootstrap.js";
 
-const databaseUrl = process.env.DATABASE_URL;
+export function storageMode(): "memory" | "postgres" {
+  return process.env.DATABASE_URL ? "postgres" : "memory";
+}
 
 export async function createRuntimePersistence() {
+  const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) return {};
   const repository = new PostgresDocumentRepository({ connectionString: databaseUrl });
   const audit = new PostgresAuditStore({ connectionString: databaseUrl });
@@ -42,6 +45,7 @@ export async function createRuntimePersistence() {
 }
 
 export async function createRealtimePublisher() {
+  const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) return new InMemoryEventBus();
   const realtime = new PostgresRealtimePublisher({ connectionString: databaseUrl });
   await realtime.migrate();
@@ -49,6 +53,7 @@ export async function createRealtimePublisher() {
 }
 
 export async function createAuthStores(email: string, password: string) {
+  const databaseUrl = process.env.DATABASE_URL;
   const administrator = { id: "administrator", tenantId: "default", name: "Administrator", permissions: ["*"] };
   const admin = await createBootstrapAdmin(email, password);
   if (!databaseUrl) {
