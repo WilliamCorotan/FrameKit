@@ -1,6 +1,6 @@
 # Framekit Roadmap
 
-> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-21, Framekit is assessed at 85% implementation toward a production-ready 1.0 and is a beta.
+> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-28, Framekit is assessed at 88% implementation toward a production-ready 1.0 and is a beta; [#60](https://github.com/WilliamCorotan/FrameKit/issues/60) is the sole remaining P2 reconciliation issue.
 
 ## Implemented
 
@@ -128,3 +128,8 @@ Core and runtime remain inward modules. Nitro, Postgres, BullMQ, and Desk are ad
 - Scored 12 modern framework components using a production-ready 1.0 rubric; after completing #16 and #18, component-average implementation is 55%, functional breadth is approximately 60%, and production readiness is approximately 43%.
 - Opened prioritized tracking issues #16 through #27 with acceptance criteria.
 - Current order: finish production-safe HTTP/auth defaults, then atomic/concurrent persistence, scalable queries and migrations, durable jobs/realtime, full-stack verification and standalone publication, and deeper domain and operational maturity.
+
+### 2026-07-28 - Final Feature Reconciliation
+
+- Closed-feature evidence is reconciled in [maturity-roadmap.md](maturity-roadmap.md): all P0/P1 work and P2 feature issues (#26, #27, #39, #40, #42, #45, #46, and #47) are closed; #60 remains only to land the reviewed documentation and verification reconciliation.
+- The score is 88% component-average implementation. The remaining 1.0 risks are hardening and deliberately delegated adapters, not an open selected metadata primitive.
