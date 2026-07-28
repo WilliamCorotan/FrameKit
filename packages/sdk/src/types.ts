@@ -1,0 +1,28 @@
+import type { AttachmentMetadata, DocumentData, DocumentRecord, TenantContext } from "@framekit/core";
+
+export type AuthUser = { id: string; tenantId: string; email: string; name: string; roles: string[]; permissions: string[]; disabledAt?: string; lockedUntil?: string };
+export type AuthRole = { tenantId: string; id: string; name: string; permissions: string[]; createdAt?: string; updatedAt?: string };
+export type ApiToken = { tenantId: string; id: string; name: string; userId?: string; roles: string[]; permissions: string[]; createdAt: string; expiresAt?: string; revokedAt?: string };
+export type CreatedApiToken = ApiToken & { token: string };
+export type AuthAuditEvent = { id: string; tenantId: string; actorUserId?: string; targetUserId?: string; action: string; success: boolean; createdAt: string; details?: Record<string, unknown> };
+export type IssuedLifecycleToken = { token: string; expiresAt: string };
+type FramekitClientBaseConfig = { baseUrl: string; tenant?: Partial<TenantContext>; token?: string; authMode?: "bearer" | "cookie"; credentials?: RequestCredentials };
+export type FramekitRetryPolicy = { maxAttempts: number; baseDelayMs?: number; maxDelayMs?: number };
+export type FramekitClientConfigV1 = FramekitClientBaseConfig & { version: 1 };
+export type FramekitClientConfigV2 = FramekitClientBaseConfig & { version: 2; retry?: FramekitRetryPolicy };
+export type FramekitClientOptions = FramekitClientConfigV1 | FramekitClientConfigV2 | (FramekitClientBaseConfig & { version?: undefined; retry?: FramekitRetryPolicy });
+export type FramekitConfigUpgradeDiagnostic = { code: "ASSUMED_V1" | "UPGRADED_V1"; message: string };
+export type FramekitConfigUpgradeResult = { config: FramekitClientConfigV2; diagnostics: FramekitConfigUpgradeDiagnostic[] };
+export const FRAMEKIT_SDK_CONFIG_VERSION = 2 as const;
+export type FramekitRequestOptions = { signal?: AbortSignal };
+export type ListDocumentsOptions = { search?: string; limit?: number; offset?: number; cursor?: string; fields?: string[]; filters?: Record<string, unknown>; sort?: { field: string; direction?: "asc" | "desc" }; signal?: AbortSignal };
+export type ListDocumentsPage<TData extends DocumentData = DocumentData> = { items: DocumentRecord<TData>[]; nextCursor?: string };
+export type MutationRequestOptions = { expectedRevision?: number; idempotencyKey?: string; signal?: AbortSignal };
+export type DocumentCommandResult = { command: string; mode: "atomic" | "saga"; replayed: boolean; documents: Array<DocumentRecord | undefined> };
+export type AttachmentDownload = { metadata: AttachmentMetadata; bytes: Uint8Array };
+export type HealthResponse = { ok: true; app: string; version?: string };
+export type DependencyHealthResponse = { ok: boolean; dependencies: Record<string, { ok: boolean; details?: unknown }> };
+export type MigrationChange = { kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "change_collection_schema" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy" | "add_setting" | "remove_setting" | "change_setting"; doctype: string; field: string; destructive: boolean; from?: unknown; to?: unknown; rollback?: MigrationRollback };
+export type MigrationRollback = Omit<MigrationChange, "rollback">;
+export type MigrationPlan = { id: string; tenantId: string; appName: string; fromSchemaChecksum: string; toSchemaChecksum: string; fromUniqueConstraints: Array<{ doctype: string; field: string }>; toUniqueConstraints: Array<{ doctype: string; field: string }>; createdAt: string; changes: MigrationChange[]; checksum: string };
+export type MigrationRecord = MigrationPlan & { appliedAt: string };

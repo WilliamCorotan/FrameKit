@@ -30,7 +30,10 @@
   "description": "Framekit job queue and outbox helpers.",
   "files": [
     "dist",
-    "src/index.ts"
+    "src/index.ts",
+    "src/outbox.ts",
+    "src/queue.ts",
+    "src/scheduler.ts"
   ],
   "engines": { "node": ">=22 <26" },
   "publishConfig": {

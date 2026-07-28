@@ -35,7 +35,11 @@
   "description": "Framekit project and code generation CLI.",
   "files": [
     "dist",
-    "src/index.ts"
+    "src/commands.ts",
+    "src/dispatch.ts",
+    "src/index.ts",
+    "src/paths.ts",
+    "src/templates.ts"
   ],
   "engines": { "node": ">=22 <26" },
   "publishConfig": {
