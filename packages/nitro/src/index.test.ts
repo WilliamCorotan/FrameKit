@@ -4,8 +4,14 @@ import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRo
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, InMemoryCustomizationStore, migrationChecksum, type RealtimePublisher, type RuntimeRealtimeEvent } from "@framekit/runtime";
 import { assertSecureProductionCredentials, createNitroHandler, createOpenTelemetryAdapters } from "./index.js";
+import { NITRO_STATIC_ROUTE_REGISTRATIONS } from "./route-dispatcher.js";
+import { FRAMEKIT_STATIC_ROUTE_CATALOG } from "@framekit/openapi";
 
 describe("createNitroHandler", () => {
+  it("keeps the static dispatcher registrations aligned with OpenAPI", () => {
+    expect(NITRO_STATIC_ROUTE_REGISTRATIONS.map(([method, path]) => [method, path]).sort()).toEqual([...FRAMEKIT_STATIC_ROUTE_CATALOG].sort());
+  });
+
   it("exposes authorized atomic document commands without persistence details", async () => {
     const item = defineDocType({
       name: "command_item", label: "Command Item", fields: [{ name: "name", label: "Name", type: "text", required: true }],

@@ -31,7 +31,13 @@
   "description": "Nitro integration for Framekit runtimes.",
   "files": [
     "dist",
-    "src/index.ts"
+    "src/contracts.ts",
+    "src/index.ts",
+    "src/production-policy.ts",
+    "src/request-security-policy.ts",
+    "src/route-dispatcher.ts",
+    "src/route-matchers.ts",
+    "src/telemetry.ts"
   ],
   "engines": {
     "node": ">=22 <26"

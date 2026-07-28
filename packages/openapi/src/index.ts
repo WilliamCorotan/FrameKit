@@ -1,33 +1,10 @@
 import { decimalPrecision, decimalScale, listDocTypes, type AppDefinition, type DocTypeDefinition, type FieldDefinition } from "@framekit/core";
+import { createdResponse, errorResponses, expectedRevisionParam, headerParam, idempotencyKeyParam, jsonBody, listResponse, okResponse, pathParam, queryParam, ref, type JsonSchema } from "./path-operations.js";
+export { FRAMEKIT_STATIC_ROUTE_CATALOG } from "./route-catalog.js";
 
 export type OpenApiOptions = {
   basePath?: string;
   serverUrl?: string;
-};
-
-type JsonSchema = {
-  $ref?: string;
-  type?: string | string[];
-  const?: string;
-  format?: string;
-  enum?: unknown[];
-  properties?: Record<string, JsonSchema>;
-  required?: string[];
-  additionalProperties?: boolean | JsonSchema;
-  items?: JsonSchema;
-  description?: string;
-  minimum?: number;
-  maximum?: number;
-  oneOf?: JsonSchema[];
-  minLength?: number;
-  maxLength?: number;
-  pattern?: string;
-  readOnly?: boolean;
-  "x-framekit-precision"?: number;
-  "x-framekit-scale"?: number;
-  "x-framekit-minimum"?: string;
-  "x-framekit-maximum"?: string;
-  "x-framekit-computed"?: unknown;
 };
 
 type Operation = {
@@ -1117,88 +1094,6 @@ function documentRecordSchema(dataSchema: JsonSchema, owned: boolean): JsonSchem
       updatedAt: { type: "string", format: "date-time" }
     }
   };
-}
-
-function ref(name: string): JsonSchema {
-  return { "$ref": `#/components/schemas/${name}` } as JsonSchema;
-}
-
-function okResponse(schema: JsonSchema): Record<string, unknown> {
-  return {
-    "200": { description: "OK", content: { "application/json": { schema } } },
-    ...errorResponses()
-  };
-}
-
-function listResponse(schema: JsonSchema): Record<string, unknown> {
-  return {
-    "200": {
-      description: "OK",
-      headers: {
-        "x-next-cursor": {
-          description: "Opaque cursor for the next stable keyset page. Omitted on the final page.",
-          schema: { type: "string" }
-        }
-      },
-      content: { "application/json": { schema } }
-    },
-    ...errorResponses()
-  };
-}
-
-function createdResponse(schema: JsonSchema): Record<string, unknown> {
-  return {
-    "201": { description: "Created", content: { "application/json": { schema } } },
-    ...errorResponses()
-  };
-}
-
-function errorResponses(): Record<string, unknown> {
-  return {
-    "400": errorResponse("Bad request"),
-    "401": errorResponse("Unauthenticated"),
-    "403": errorResponse("Forbidden"),
-    "404": errorResponse("Not found"),
-    "409": errorResponse("Conflict"),
-    "422": errorResponse("Validation failed"),
-    "429": errorResponse("Rate limited", true),
-    "500": errorResponse("Internal server error")
-  };
-}
-
-function errorResponse(description: string, retryAfter = false) {
-  return {
-    description,
-    headers: {
-      "x-request-id": { description: "Request identity preserved by SDK errors.", schema: { type: "string" } },
-      ...(retryAfter ? { "Retry-After": { description: "Delay before a safe retry, in seconds or HTTP-date form.", schema: { type: "string" } } } : {})
-    },
-    content: { "application/json": { schema: ref("FramekitError") } }
-  };
-}
-
-function jsonBody(schema: JsonSchema, required: boolean) {
-  return { required, content: { "application/json": { schema } } };
-}
-
-function pathParam(name: string) {
-  return { name, in: "path", required: true, schema: { type: "string" } };
-}
-
-function queryParam(name: string, type: string, description?: string) {
-  return { name, in: "query", required: false, schema: { type }, description };
-}
-
-function headerParam(name: string) {
-  return { name, in: "header", required: false, schema: { type: "string" } };
-}
-
-function expectedRevisionParam() {
-  return { name: "If-Match", in: "header", required: false, schema: { type: "integer", minimum: 1 } };
-}
-
-function idempotencyKeyParam() {
-  return { name: "Idempotency-Key", in: "header", required: false, schema: { type: "string" } };
 }
 
 function schemaName(doctype: DocTypeDefinition, suffix: string): string {

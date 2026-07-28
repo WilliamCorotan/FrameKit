@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
-import { createOpenApiDocument } from "./index.js";
+import { createOpenApiDocument, FRAMEKIT_STATIC_ROUTE_CATALOG } from "./index.js";
 
 describe("createOpenApiDocument", () => {
   it("generates paths and schemas from DocType metadata", () => {
@@ -37,6 +37,8 @@ describe("createOpenApiDocument", () => {
     });
 
     const doc = createOpenApiDocument(app, { basePath: "/api" });
+
+    expect(FRAMEKIT_STATIC_ROUTE_CATALOG.every(([, path]) => path in doc.paths)).toBe(true);
 
     expect(doc.openapi).toBe("3.1.0");
     expect(doc.paths["/api/auth/login"]).toBeDefined();
