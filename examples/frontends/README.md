@@ -12,6 +12,22 @@ into an application instead of depending on a shared demo component.
 | Solid | `@framekit/example-frontend-solid` | `pnpm dev:frontend:solid` |
 | Vanilla TypeScript | `@framekit/example-frontend-vanilla` | `pnpm dev:frontend:vanilla` |
 
+## Template structure
+
+Each template keeps the same dependency direction while using its framework's
+native conventions:
+
+- `main.*` bootstraps the application.
+- `App.*` composes the page for component-based frameworks.
+- `api/` (or `lib/api/`) owns Framekit SDK configuration and error adaptation.
+- `domain/` contains customer types and pure formatting helpers.
+- `hooks/`, `composables/`, or `state/` owns session and request orchestration.
+- `components/` or `ui/` renders the interface and wires user events.
+
+Dependencies flow from UI to state, then to the API and domain modules. The
+templates do not share source files, so each directory remains independently
+copyable.
+
 ## Run one
 
 From the repository root, start the in-memory CRM API:

@@ -32,6 +32,9 @@ for (const [framework, , port] of templates) {
     await page.getByRole("button", { name: /refresh/i }).click();
     await page.getByRole("button", { name: /sign out/i }).click();
     await expect(page.getByRole("button", { name: /open ledger|open register|sign in/i })).toBeVisible();
+    if (framework === "vanilla") {
+      await expect(page.getByText("Signed out. No credentials were stored.")).toBeVisible();
+    }
     await page.waitForTimeout(400);
     await expect(page.getByText("Acme Manufacturing")).toHaveCount(0);
   });
