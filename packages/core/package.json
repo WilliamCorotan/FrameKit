@@ -27,7 +27,14 @@
   "description": "Core Framekit schema, module, and document primitives.",
   "files": [
     "dist",
-    "src/index.ts"
+    "src/composition.ts",
+    "src/errors.ts",
+    "src/index.ts",
+    "src/localization.ts",
+    "src/metadata.ts",
+    "src/policy.ts",
+    "src/schema.ts",
+    "src/settings.ts"
   ],
   "engines": { "node": ">=22 <26" },
   "publishConfig": {
