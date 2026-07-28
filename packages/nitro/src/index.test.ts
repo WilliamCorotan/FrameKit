@@ -1113,6 +1113,11 @@ describe("createNitroHandler", () => {
       body: { id: "reader", name: "Reader", permissions: ["crm.customer"] }
     });
     expect(role).toMatchObject({ id: "reader" });
+    await expect(json(fetch, "/api/auth/roles/reader", {
+      method: "PUT",
+      headers,
+      body: { name: "Reader", permissions: ["crm.customer", "crm.updated"] }
+    })).resolves.toMatchObject({ id: "reader", permissions: ["crm.customer", "crm.updated"] });
 
     await json(fetch, "/api/auth/users", {
       method: "POST",
@@ -1126,6 +1131,16 @@ describe("createNitroHandler", () => {
         permissions: ["crm.customer"]
       }
     });
+    await expect(json(fetch, "/api/auth/users/worker", {
+      method: "PUT",
+      headers,
+      body: {
+        email: "worker@example.com",
+        name: "Updated Worker",
+        roles: ["reader"],
+        permissions: ["crm.customer"]
+      }
+    })).resolves.toMatchObject({ id: "worker", name: "Updated Worker" });
     await json(fetch, "/api/auth/users/worker/password", {
       method: "POST",
       headers,
