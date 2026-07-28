@@ -1178,6 +1178,25 @@ describe("runtime document service", () => {
     })).rejects.toMatchObject({ code: "DOCTYPE_NOT_FOUND" });
   });
 
+  it("plans durable setting metadata changes and blocks unsafe automatic application", async () => {
+    const base = defineApp({ name: "Settings migration", modules: [defineModule({ id: "ops", name: "Operations", settings: [{ key: "ops.token", label: "Token", type: "secret", scope: "tenant" }] })] });
+    const changed = defineApp({ name: "Settings migration", modules: [defineModule({ id: "ops", name: "Operations", settings: [{ key: "ops.token", label: "Token", type: "text", scope: "app", default: "new" }] })] });
+    const runtime = createRuntime(base, { idGenerator: () => "settings-migration" });
+    const plan = await runtime.planMigration(tenant, changed);
+    expect(plan.changes).toEqual([expect.objectContaining({ kind: "change_setting", doctype: "settings", field: "ops.token", destructive: true })]);
+    await expect(validateMigrationPlan(plan)).resolves.toBeUndefined();
+    expect(() => assertDestructiveMigration(plan, {})).toThrow(/destructive/i);
+    expect(() => assertSupportedMigration(plan)).toThrow(/operator-reviewed/i);
+    await expect(runtime.applyMigration(tenant, plan)).rejects.toMatchObject({ code: "DESTRUCTIVE_MIGRATION" });
+
+    const added = await createRuntime(defineApp({ name: "Settings migration", modules: [] }), { idGenerator: () => "settings-added" }).planMigration(tenant, base);
+    expect(added.changes).toEqual([expect.objectContaining({ kind: "add_setting", field: "ops.token", destructive: false })]);
+    expect(createExecutableMigrationArtifact(added).down).toEqual([]);
+    await expect(createRollbackMigrationPlan({ ...added, appliedAt: new Date().toISOString() })).rejects.toMatchObject({ code: "IRREVERSIBLE_MIGRATION" });
+    const removed = await runtime.planMigration(tenant, defineApp({ name: "Settings migration", modules: [] }));
+    expect(removed.changes).toEqual([expect.objectContaining({ kind: "remove_setting", field: "ops.token", destructive: true })]);
+  });
+
   it("localizes metadata and persists typed settings with fail-closed secret handling", async () => {
     const app = defineApp({
       name: "Settings", localization: { defaultLocale: "en", supportedLocales: ["en", "fr"], fallbackLocales: ["en"], translations: { fr: { "module.ops": "Exploitation", "setting.region": "Région", "desk.saved": "Enregistré" }, en: {} } },

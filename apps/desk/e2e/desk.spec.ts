@@ -258,6 +258,11 @@ test("renders localized typed settings and keeps secrets redacted after update",
   await page.getByRole("button", { name: "Save Région" }).click();
   await expect(page.getByLabel(/Région/)).toHaveValue("eu");
 
+  const limit = page.getByLabel(/Limite/);
+  await limit.fill("");
+  await page.getByRole("button", { name: "Save Limite" }).click();
+  await expect(page.getByText("Enter a finite number before saving.")).toBeVisible();
+
   const secret = page.getByLabel(/Jeton/);
   await expect(secret).toHaveAttribute("type", "password");
   await expect(secret).toHaveValue("");
@@ -333,6 +338,7 @@ async function mockDeskApi(page: Page) {
   const customFields: Array<{ id: string; doctype: string; field: Record<string, unknown> }> = [];
   const settings = [
     { key: "ops.region", label: "Région", type: "select", scope: "tenant", required: true, options: ["us", "eu"], value: "us", configured: true, redacted: false },
+    { key: "ops.limit", label: "Limite", type: "number", scope: "tenant", required: true, value: 12, configured: true, redacted: false },
     { key: "ops.token", label: "Jeton", type: "secret", scope: "tenant", required: true, configured: true, redacted: true }
   ];
 

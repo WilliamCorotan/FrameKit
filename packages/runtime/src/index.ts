@@ -227,7 +227,7 @@ export type NamingSeriesStore = LifecycleResource & {
 };
 
 export type MigrationChange = {
-  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "change_collection_schema" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy";
+  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "change_collection_schema" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy" | "add_setting" | "remove_setting" | "change_setting";
   doctype: string;
   field: string;
   destructive: boolean;
@@ -743,6 +743,21 @@ export class FramekitRuntime {
         changes.push(migrationChange({ kind: "remove_unique_constraint", doctype: currentDocType.name, field: field.name, destructive: false, from: field.name }));
       }
       changes.push(migrationChange({ kind: "remove_doctype", doctype: currentDocType.name, field: "*", destructive: true, from: currentDocType }));
+    }
+    const currentSettings = this.app.modules.flatMap((module) => module.settings);
+    const nextSettings = parsed.modules.flatMap((module) => module.settings);
+    for (const nextSetting of nextSettings) {
+      const currentSetting = currentSettings.find((setting) => setting.key === nextSetting.key);
+      if (!currentSetting) {
+        changes.push(migrationChange({ kind: "add_setting", doctype: "settings", field: nextSetting.key, destructive: false, to: nextSetting }));
+      } else if (stableJson(settingStorageContract(currentSetting)) !== stableJson(settingStorageContract(nextSetting))) {
+        changes.push(migrationChange({ kind: "change_setting", doctype: "settings", field: nextSetting.key, destructive: true, from: currentSetting, to: nextSetting }));
+      }
+    }
+    for (const currentSetting of currentSettings) {
+      if (!nextSettings.some((setting) => setting.key === currentSetting.key)) {
+        changes.push(migrationChange({ kind: "remove_setting", doctype: "settings", field: currentSetting.key, destructive: true, from: currentSetting }));
+      }
     }
     const plan = {
       id: this.idGenerator(),
@@ -1939,6 +1954,16 @@ function fieldStorageContract(field: FieldDefinition): string {
   return field.computed ? `${exact}:computed:${JSON.stringify(field.computed)}` : exact;
 }
 
+function settingStorageContract(setting: SettingDefinition): Pick<SettingDefinition, "type" | "scope" | "required" | "default" | "options"> {
+  return {
+    type: setting.type,
+    scope: setting.scope,
+    required: setting.required,
+    ...(setting.default === undefined ? {} : { default: setting.default }),
+    ...(setting.options === undefined ? {} : { options: setting.options })
+  };
+}
+
 export class InMemoryDocumentRepository implements DocumentRepository {
   private readonly records = new Map<string, DocumentRecord>();
 
@@ -2652,7 +2677,7 @@ function assertMemoryIdempotencyFingerprint(key: string, expected: string, actua
 }
 
 function migrationChange(change: Omit<MigrationChange, "rollback">): MigrationChange {
-  if (change.kind === "remove_doctype" || change.kind === "remove_field") return { ...change };
+  if (change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "add_setting" || change.kind === "remove_setting") return { ...change };
   return { ...change, rollback: rollbackFor(change) };
 }
 
@@ -2680,6 +2705,12 @@ function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollba
       return { kind: "add_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
     case "change_row_policy":
       return { kind: "change_row_policy", doctype: change.doctype, field: "row_policy", destructive: true, from: change.to, to: change.from };
+    case "add_setting":
+      return { kind: "remove_setting", doctype: "settings", field: change.field, destructive: true, from: change.to };
+    case "remove_setting":
+      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing setting ${change.field} cannot restore prior values automatically.`, 409);
+    case "change_setting":
+      return { kind: "change_setting", doctype: "settings", field: change.field, destructive: true, from: change.to, to: change.from };
   }
 }
 
@@ -2703,17 +2734,18 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration plan identity, schema checksums, uniqueness metadata, and changes are required.", 422);
   }
   const identifier = /^[a-z][a-z0-9_]*$/;
-  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "change_collection_schema", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint", "change_row_policy"]);
+  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "change_collection_schema", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint", "change_row_policy", "add_setting", "remove_setting", "change_setting"]);
   const constraints = [...plan.fromUniqueConstraints, ...plan.toUniqueConstraints];
   if (constraints.some((constraint) => !constraint || !identifier.test(constraint.doctype) || !identifier.test(constraint.field))) {
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration uniqueness metadata contains an invalid DocType or field identifier.", 422);
   }
   for (const change of plan.changes) {
-    if (!change || !changeKinds.has(change.kind) || !identifier.test(change.doctype) || typeof change.field !== "string") {
+    const settingChange = change && (change.kind === "add_setting" || change.kind === "remove_setting" || change.kind === "change_setting");
+    if (!change || !changeKinds.has(change.kind) || !identifier.test(change.doctype) || typeof change.field !== "string" || (settingChange && (change.doctype !== "settings" || !/^[a-z][a-z0-9_.-]*$/.test(change.field)))) {
       throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration changes contain an invalid DocType or field identifier.", 422);
     }
     const fields = change.field === "*" ? ["*"] : change.field.split(",");
-    if (fields.some((field) => field !== "*" && !identifier.test(field))) {
+    if (!settingChange && fields.some((field) => field !== "*" && !identifier.test(field))) {
       throw new FramekitError("INVALID_MIGRATION_PLAN", `Migration change ${change.kind} contains an invalid field identifier.`, 422);
     }
     if (change.destructive !== migrationChangeIsDestructive(change)) {
@@ -2902,11 +2934,11 @@ export function assertDestructiveMigration(plan: MigrationPlan, options: { allow
 }
 
 export function migrationChangeIsDestructive(change: Pick<MigrationChange, "kind"> | MigrationRollback): boolean {
-  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type" || change.kind === "change_collection_schema" || change.kind === "change_row_policy";
+  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type" || change.kind === "change_collection_schema" || change.kind === "change_row_policy" || change.kind === "remove_setting" || change.kind === "change_setting";
 }
 
 export function assertSupportedMigration(plan: MigrationPlan): void {
-  const unsupported = plan.changes.filter((change) => change.kind === "change_field_type" || change.kind === "change_collection_schema");
+  const unsupported = plan.changes.filter((change) => change.kind === "change_field_type" || change.kind === "change_collection_schema" || change.kind === "remove_setting" || change.kind === "change_setting");
   if (unsupported.length > 0) {
     throw new FramekitError("UNSUPPORTED_MIGRATION_CONVERSION", "Automatic field or collection-schema conversion is not supported; provide an operator-reviewed data migration.", 422, unsupported);
   }

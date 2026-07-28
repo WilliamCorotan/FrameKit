@@ -2269,6 +2269,12 @@ function statementsForChange(tenantId: string, change: MigrationChange | Migrati
       return [`drop index if exists ${indexIdentifier(change, "uniq")};`];
     case "change_row_policy":
       return [`-- change_row_policy ${change.doctype}: authorize only after any required owner_id backfill`];
+    case "add_setting":
+      return [`-- add_setting ${change.field}: settings use the shared framekit_setting_values table`];
+    case "remove_setting":
+      return [`-- remove_setting ${change.field}: explicit operator-reviewed durable value cleanup is required`];
+    case "change_setting":
+      return [`-- change_setting ${change.field}: explicit operator-reviewed settings value migration is required`];
   }
 }
 
@@ -2671,6 +2677,12 @@ function rollbackFromChange(change: MigrationChange): MigrationRollback {
       return { kind: "add_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
     case "change_row_policy":
       return { kind: "change_row_policy", doctype: change.doctype, field: "row_policy", destructive: true, from: change.to, to: change.from };
+    case "add_setting":
+      return { kind: "remove_setting", doctype: "settings", field: change.field, destructive: true, from: change.to };
+    case "remove_setting":
+      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing setting ${change.field} cannot be rolled back automatically.`, 409);
+    case "change_setting":
+      return { kind: "change_setting", doctype: "settings", field: change.field, destructive: true, from: change.to, to: change.from };
   }
 }
 

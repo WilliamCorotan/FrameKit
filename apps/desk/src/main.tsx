@@ -715,7 +715,15 @@ function OperationsPanel({ section, token, doctypes, status, setStatus, locale }
     try {
       setStatus("Saving…");
       const draft = settingDrafts[setting.key];
+      if (setting.type === "number" && (typeof draft !== "number" && (typeof draft !== "string" || draft.trim() === ""))) {
+        setStatus("Enter a finite number before saving.");
+        return;
+      }
       const value = setting.type === "number" ? Number(draft) : setting.type === "boolean" ? Boolean(draft) : String(draft ?? "");
+      if (setting.type === "number" && !Number.isFinite(value)) {
+        setStatus("Enter a finite number before saving.");
+        return;
+      }
       await fetchJson(`/api/settings/${encodeURIComponent(setting.key)}`, { method: "PUT", token, body: { value } });
       setSettingDrafts((current) => ({ ...current, ...(setting.type === "secret" ? { [setting.key]: "" } : {}) }));
       await refresh();
@@ -763,6 +771,7 @@ function OperationsPanel({ section, token, doctypes, status, setStatus, locale }
       {section === "settings" ? (
         <section className="editor">
           <div className="editor-head"><div><p className="eyebrow">Application settings</p><h2>Typed configuration</h2></div></div>
+          {status ? <p role="status">{status}</p> : null}
           <div className="fields">
             {settings.map((setting) => (
               <label className="field" key={setting.key}>
