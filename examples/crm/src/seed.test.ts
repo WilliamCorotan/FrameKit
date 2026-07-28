@@ -17,6 +17,20 @@ describe("createDemoSeeder", () => {
     await expect(runtime.list(admin, "deal")).resolves.toHaveLength(1);
   });
 
+  it("is idempotent across independent seeders sharing persistence", async () => {
+    const runtime = createRuntime(app);
+
+    await Promise.all([
+      createDemoSeeder(runtime)(),
+      createDemoSeeder(runtime)()
+    ]);
+
+    const admin = { tenantId: "default", userId: "test", roles: ["administrator"], permissions: ["*"] };
+    await expect(runtime.list(admin, "customer")).resolves.toHaveLength(1);
+    await expect(runtime.list(admin, "contact")).resolves.toHaveLength(1);
+    await expect(runtime.list(admin, "deal")).resolves.toHaveLength(1);
+  });
+
   it("adds missing contact and deal when the demo customer already exists", async () => {
     const runtime = createRuntime(app);
     const admin = { tenantId: "default", userId: "test", roles: ["administrator"], permissions: ["*"] };

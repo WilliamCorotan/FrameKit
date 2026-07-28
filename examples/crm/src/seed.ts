@@ -32,19 +32,23 @@ async function findOrCreateCustomer(runtime: DemoRuntime) {
   const [existing] = await runtime.list(admin, "customer", { filters: { name: "Acme Manufacturing" }, limit: 1 });
   return existing ?? runtime.create(admin, "customer", {
     name: "Acme Manufacturing", status: "active", owner: "Mina Torres", annual_revenue: "1200000.00", notes: "Pilot customer for the metadata desk."
-  });
+  }, { idempotencyKey: "crm-demo:customer:acme-manufacturing:v1" });
 }
 
 async function findOrCreateContact(runtime: DemoRuntime, customer: string) {
   const [existing] = await runtime.list(admin, "contact", { filters: { customer, email: "rowan@example.com" }, limit: 1 });
   if (!existing) {
-    await runtime.create(admin, "contact", { full_name: "Rowan Ibarra", email: "rowan@example.com", customer, is_primary: true });
+    await runtime.create(admin, "contact", { full_name: "Rowan Ibarra", email: "rowan@example.com", customer, is_primary: true }, {
+      idempotencyKey: "crm-demo:contact:rowan-ibarra:v1"
+    });
   }
 }
 
 async function findOrCreateDeal(runtime: DemoRuntime, customer: string) {
   const [existing] = await runtime.list(admin, "deal", { filters: { customer, title: "Factory rollout" }, limit: 1 });
   if (!existing) {
-    await runtime.create(admin, "deal", { title: "Factory rollout", customer, amount: "84000.00" });
+    await runtime.create(admin, "deal", { title: "Factory rollout", customer, amount: "84000.00" }, {
+      idempotencyKey: "crm-demo:deal:factory-rollout:v1"
+    });
   }
 }
