@@ -72,7 +72,8 @@ export function matchNitroRoute(method: string, path: string, basePath: string):
 
 export function normalizeNitroBasePath(basePath: string): string {
   const prefixed = basePath.startsWith("/") ? basePath : `/${basePath}`;
-  return prefixed.length > 1 ? prefixed.replace(/\/+$/, "") : prefixed;
+  const normalized = prefixed.replace(/\/+$/, "");
+  return normalized === "/" ? "" : normalized;
 }
 
 async function dispatchAuthRoute(event: H3Event, context: RouteContext): Promise<Result> {

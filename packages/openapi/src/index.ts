@@ -652,6 +652,14 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         requestBody: jsonBody(userWriteSchema(false), true),
         responses: okResponse(ref("AuthUser"))
       },
+      put: {
+        operationId: "replaceAuthUser",
+        summary: "Update a tenant user",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        requestBody: jsonBody(userWriteSchema(false), true),
+        responses: okResponse(ref("AuthUser"))
+      },
       delete: {
         operationId: "deleteAuthUser",
         summary: "Delete a tenant user",
@@ -694,6 +702,14 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
     [`${basePath}/auth/roles/{id}`]: {
       patch: {
         operationId: "updateAuthRole",
+        summary: "Update a tenant role",
+        tags: ["Auth"],
+        parameters: [pathParam("id")],
+        requestBody: jsonBody(roleWriteSchema(false), true),
+        responses: okResponse(ref("AuthRole"))
+      },
+      put: {
+        operationId: "replaceAuthRole",
         summary: "Update a tenant role",
         tags: ["Auth"],
         parameters: [pathParam("id")],

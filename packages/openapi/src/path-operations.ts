@@ -1,11 +1,26 @@
 export type JsonSchema = {
   $ref?: string;
   type?: string | string[];
+  const?: string;
+  format?: string;
+  enum?: unknown[];
   properties?: Record<string, JsonSchema>;
   required?: string[];
   additionalProperties?: boolean | JsonSchema;
   items?: JsonSchema;
+  description?: string;
   minimum?: number;
+  maximum?: number;
+  oneOf?: JsonSchema[];
+  minLength?: number;
+  maxLength?: number;
+  pattern?: string;
+  readOnly?: boolean;
+  "x-framekit-precision"?: number;
+  "x-framekit-scale"?: number;
+  "x-framekit-minimum"?: string;
+  "x-framekit-maximum"?: string;
+  "x-framekit-computed"?: unknown;
   [key: string]: unknown;
 };
 

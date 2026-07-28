@@ -19,6 +19,8 @@ describe("createNitroHandler", () => {
   it("normalizes custom base paths and rejects wrong segments", () => {
     expect(matchNitroRoute("GET", "/v1/doctypes/order/example/attachments/files/example", "/v1/")?.group).toBe("documents");
     expect(matchNitroRoute("GET", "/health", "/v1")?.path).toBe("/health/live");
+    expect(matchNitroRoute("PUT", "/v1/auth/users/example", "/v1")?.group).toBe("auth");
+    expect(matchNitroRoute("PUT", "/v1/auth/roles/example", "/v1")?.group).toBe("auth");
     expect(matchNitroRoute("GET", "/v1/auth/users/example/extra", "/v1")).toBeUndefined();
     expect(matchNitroRoute("GET", "/v1/auth/users", "/api")).toBeUndefined();
   });
@@ -34,6 +36,19 @@ describe("createNitroHandler", () => {
     await expect(json(toWebHandler(h3), "/v1/meta", {
       headers: { "x-user-id": "reader" }
     })).resolves.toMatchObject({ name: "Custom base" });
+  });
+
+  it("preserves the empty base path as a root-mounted API", async () => {
+    const runtime = createRuntime(defineApp({ name: "Root API", modules: [] }));
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, {
+      basePath: "",
+      development: { allowHeaderIdentity: true }
+    }));
+
+    await expect(json(toWebHandler(h3), "/meta", {
+      headers: { "x-user-id": "reader" }
+    })).resolves.toMatchObject({ name: "Root API" });
   });
 
   it("exposes authorized atomic document commands without persistence details", async () => {
