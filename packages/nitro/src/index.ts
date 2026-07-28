@@ -212,7 +212,9 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         return health;
       }
       if (method === "GET" && path === basePath + "/meta") {
-        return await runtime.metadata(await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity));
+        const query = getQuery(event);
+        const requestedLocale = typeof query.locale === "string" ? canonicalLocale(query.locale) : preferredLocale(event.req.headers.get("accept-language"), runtime.app.localization.supportedLocales);
+        return await runtime.metadata(await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity), { locale: requestedLocale });
       }
       if (method === "POST" && path === basePath + "/auth/login") {
         if (!options.auth) {
@@ -594,6 +596,22 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         }
         return await runtime.upsertView(tenant, { doctype: body.doctype, type: body.type, fields: body.fields });
       }
+      if (method === "GET" && path === basePath + "/settings") {
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.settings.read", "read application settings");
+        const query = getQuery(event);
+        return await runtime.settings(tenant, { locale: typeof query.locale === "string" ? canonicalLocale(query.locale) : preferredLocale(event.req.headers.get("accept-language"), runtime.app.localization.supportedLocales) });
+      }
+      if (method === "PUT" && path.startsWith(basePath + "/settings/")) {
+        const tenant = await tenantFromRequest(event.req, options.auth, authCookie, allowHeaderIdentity);
+        assertOperationPermission(tenant, "framekit.settings.manage", "update application settings");
+        const key = decodeURIComponent(path.slice(`${basePath}/settings/`.length));
+        const body: unknown = await readBody(event);
+        if (!isPlainObject(body) || !Object.prototype.hasOwnProperty.call(body, "value")) {
+          throw new FramekitError("VALIDATION_FAILED", "value is required.", 422);
+        }
+        return await runtime.upsertSetting(tenant, key, body.value);
+      }
 
       const commandId = matchCommandPath(path, basePath);
       if (method === "POST" && commandId) {
@@ -710,6 +728,26 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
       }
     }
   });
+}
+
+function preferredLocale(header: string | null, supportedLocales: string[]): string | undefined {
+  const candidates = (header ?? "").split(",").map((entry, index) => {
+    const [tag = "", ...parameters] = entry.trim().split(";");
+    const quality = Number(parameters.find((parameter) => parameter.trim().startsWith("q="))?.trim().slice(2) ?? "1");
+    return { locale: canonicalLocale(tag), quality: Number.isFinite(quality) ? quality : 0, index };
+  }).filter((candidate) => candidate.locale && candidate.quality > 0).sort((left, right) => right.quality - left.quality || left.index - right.index);
+  return candidates.find((candidate) => {
+    const parts = candidate.locale!.split("-");
+    return parts.some((_, index) => supportedLocales.includes(parts.slice(0, parts.length - index).join("-")));
+  })?.locale ?? candidates[0]?.locale;
+}
+
+function canonicalLocale(locale: string): string | undefined {
+  try {
+    return Intl.getCanonicalLocales(locale)[0];
+  } catch {
+    return undefined;
+  }
 }
 
 export function routeParam(name: string): string {
@@ -1311,6 +1349,12 @@ function toFilterValue(value: unknown): FilterValue {
     return value as FilterValue;
   }
   throw new FramekitError("VALIDATION_FAILED", "filters may only contain primitive values, arrays, or operator objects.", 422);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal, after?: string): Response {

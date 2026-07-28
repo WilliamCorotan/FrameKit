@@ -11,6 +11,9 @@ import {
   getDocType,
   hasRowAccess,
   hasAccess,
+  localeFallbackChain,
+  resolveTranslation,
+  validateSettingValue,
   ViewSchema,
   type AppDefinition,
   type AttachmentMetadata,
@@ -24,6 +27,7 @@ import {
   type FieldDefinition,
   type HookName,
   type OwnerTransferReceipt,
+  type SettingDefinition,
   type TenantContext,
   type ViewDefinition
 } from "@framekit/core";
@@ -192,7 +196,29 @@ export type CustomizationStore = LifecycleResource & {
   addCustomField(tenant: TenantContext, field: CustomFieldDefinition): Promise<CustomFieldDefinition>;
   listViews(tenant: TenantContext): Promise<ViewDefinition[]>;
   upsertView(tenant: TenantContext, view: ViewDefinition): Promise<ViewDefinition>;
+  listSettingValues?(tenant: TenantContext, appName: string): Promise<StoredSettingValue[]>;
+  upsertSettingValue?(tenant: TenantContext, value: StoredSettingValue): Promise<StoredSettingValue>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
+};
+
+export type StoredSettingValue = {
+  scopeId: string;
+  appName: string;
+  key: string;
+  value: unknown;
+  protected: boolean;
+  updatedAt: string;
+};
+
+export type SettingsSecretPort = {
+  seal(value: string, context: { appName: string; scopeId: string; key: string }): Promise<string> | string;
+  unseal(value: string, context: { appName: string; scopeId: string; key: string }): Promise<string> | string;
+};
+
+export type PublicSetting = Omit<SettingDefinition, "default"> & {
+  value?: string | number | boolean;
+  configured: boolean;
+  redacted: boolean;
 };
 
 export type NamingSeriesStore = LifecycleResource & {
@@ -201,7 +227,7 @@ export type NamingSeriesStore = LifecycleResource & {
 };
 
 export type MigrationChange = {
-  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "change_collection_schema" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy";
+  kind: "add_doctype" | "remove_doctype" | "add_field" | "remove_field" | "change_field_type" | "change_collection_schema" | "add_index" | "remove_index" | "add_unique_constraint" | "remove_unique_constraint" | "change_row_policy" | "add_setting" | "remove_setting" | "change_setting";
   doctype: string;
   field: string;
   destructive: boolean;
@@ -333,6 +359,7 @@ export type RuntimeOptions = {
   attachmentStorage?: AttachmentStorage;
   idGenerator?: () => string;
   now?: () => Date;
+  settingsSecrets?: SettingsSecretPort;
 };
 
 export type AttachmentStorage = {
@@ -363,6 +390,7 @@ export class FramekitRuntime {
   private readonly idGenerator: () => string;
   private readonly now: () => Date;
   private readonly activeAttachmentKeys = new Set<string>();
+  private readonly settingsSecrets?: SettingsSecretPort;
   private readonly resources: LifecycleResource[];
   private lifecycleState: "created" | "started" | "closing" | "closed" = "created";
   private startPromise?: Promise<void>;
@@ -389,6 +417,7 @@ export class FramekitRuntime {
     this.commandRowPolicy = options.commandRowPolicy;
     this.idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
     this.now = options.now ?? (() => new Date());
+    this.settingsSecrets = options.settingsSecrets;
     this.resources = uniqueLifecycleResources([
       repository, audit, outbox, this.customization, this.namingSeries, this.migrations, this.realtime, this.attachmentStorage,
       ...(this.mutations ? [this.mutations] : []), ...(options.resources ?? [])
@@ -465,13 +494,110 @@ export class FramekitRuntime {
     }
   }
 
-  async metadata(tenant?: TenantContext) {
+  async metadata(tenant?: TenantContext, options: { locale?: string } = {}) {
     const modules = tenant ? await this.modulesWithCustomFields(tenant) : this.app.modules;
+    const chain = localeFallbackChain(this.app.localization, options.locale);
+    const localizedModules = modules.map((module) => ({
+      ...module,
+      name: resolveTranslation(this.app, module.nameKey, module.name, options.locale)!,
+      description: resolveTranslation(this.app, module.descriptionKey, module.description, options.locale),
+      navigation: module.navigation.map((item) => ({ ...item, label: resolveTranslation(this.app, item.labelKey, item.label, options.locale)! })),
+      settings: module.settings.map((setting) => ({ ...setting, label: resolveTranslation(this.app, setting.labelKey, setting.label, options.locale)!, description: resolveTranslation(this.app, setting.descriptionKey, setting.description, options.locale) })),
+      doctypes: module.doctypes.map((doctype) => ({
+        ...doctype,
+        label: resolveTranslation(this.app, doctype.labelKey, doctype.label, options.locale)!,
+        description: resolveTranslation(this.app, doctype.descriptionKey, doctype.description, options.locale),
+        fields: doctype.fields.map((field) => ({ ...field, label: resolveTranslation(this.app, field.labelKey, field.label, options.locale)!, description: resolveTranslation(this.app, field.descriptionKey, field.description, options.locale) }))
+      }))
+    }));
+    const messages: Record<string, string> = {};
+    for (const locale of [...chain].reverse()) Object.assign(messages, this.app.localization.translations[locale] ?? {});
     return {
-      name: this.app.name,
+      name: resolveTranslation(this.app, this.app.nameKey, this.app.name, options.locale)!,
       version: this.app.version,
-      modules: modules.map(({ hooks: _hooks, ...module }) => module)
+      locale: chain[0] ?? this.app.localization.defaultLocale,
+      supportedLocales: this.app.localization.supportedLocales,
+      messages,
+      modules: localizedModules.map(({ hooks: _hooks, ...module }) => module)
     };
+  }
+
+  async settings(tenant: TenantContext, options: { locale?: string } = {}): Promise<PublicSetting[]> {
+    this.assertSettingsPermission(tenant, "framekit.settings.read");
+    const definitions = this.app.modules.flatMap((module) => module.settings);
+    const stored = await this.listStoredSettings(tenant);
+    return definitions.map((definition) => {
+      const scopeId = settingScopeId(definition, tenant, this.app.name);
+      const persisted = stored.find((item) => item.key === definition.key && item.scopeId === scopeId);
+      return this.publicSetting(definition, persisted, options.locale);
+    });
+  }
+
+  async upsertSetting(tenant: TenantContext, key: string, input: unknown): Promise<PublicSetting> {
+    this.assertSettingsPermission(tenant, "framekit.settings.manage");
+    const definition = this.settingDefinition(key);
+    if (definition.scope === "app") this.assertSettingsPermission(tenant, "framekit.settings.app.manage");
+    if (!this.customization.upsertSettingValue) throw new FramekitError("SETTINGS_STORE_UNAVAILABLE", "The configured customization store cannot persist settings.", 501);
+    const value = validateSettingValue(definition, input);
+    const scopeId = settingScopeId(definition, tenant, this.app.name);
+    let persisted: unknown = value;
+    if (definition.type === "secret") {
+      if (!this.settingsSecrets) throw new FramekitError("SECRET_STORAGE_UNAVAILABLE", "Secret settings require an explicit secret storage port.", 503, { key });
+      try {
+        persisted = await this.settingsSecrets.seal(String(value), { appName: this.app.name, scopeId, key });
+      } catch {
+        throw secretStorageFailure();
+      }
+      if (typeof persisted !== "string" || !persisted) throw secretStorageFailure();
+    }
+    const stored = await this.customization.upsertSettingValue(tenant, { scopeId, appName: this.app.name, key, value: persisted, protected: definition.type === "secret", updatedAt: this.now().toISOString() });
+    return this.publicSetting(definition, stored);
+  }
+
+  async resolveSettingValue(tenant: TenantContext, key: string): Promise<unknown> {
+    const definition = this.settingDefinition(key);
+    const scopeId = settingScopeId(definition, tenant, this.app.name);
+    const persisted = (await this.listStoredSettings(tenant)).find((item) => item.key === key && item.scopeId === scopeId);
+    if (!persisted) return definition.default;
+    if (persisted.protected !== (definition.type === "secret")) throw secretStorageFailure();
+    if (definition.type !== "secret") return validateSettingValue(definition, persisted.value);
+    if (!this.settingsSecrets || typeof persisted.value !== "string") throw new FramekitError("SECRET_STORAGE_UNAVAILABLE", "Secret setting cannot be resolved without its secret storage port.", 503, { key });
+    try {
+      return validateSettingValue(definition, await this.settingsSecrets.unseal(persisted.value, { appName: this.app.name, scopeId, key }));
+    } catch {
+      throw secretStorageFailure();
+    }
+  }
+
+  private async listStoredSettings(tenant: TenantContext): Promise<StoredSettingValue[]> {
+    return this.customization.listSettingValues ? this.customization.listSettingValues(tenant, this.app.name) : [];
+  }
+
+  private settingDefinition(key: string): SettingDefinition {
+    const definition = this.app.modules.flatMap((module) => module.settings).find((setting) => setting.key === key);
+    if (!definition) throw new FramekitError("SETTING_NOT_FOUND", `Unknown setting "${key}"`, 404);
+    return definition;
+  }
+
+  private publicSetting(definition: SettingDefinition, persisted?: StoredSettingValue, locale?: string): PublicSetting {
+    const { default: defaultValue, ...publicDefinition } = definition;
+    const secret = definition.type === "secret";
+    if (persisted && persisted.protected !== secret) throw secretStorageFailure();
+    const value = persisted
+      ? (secret ? undefined : validateSettingValue(definition, persisted.value))
+      : (defaultValue === undefined ? undefined : validateSettingValue(definition, defaultValue));
+    return {
+      ...publicDefinition,
+      label: resolveTranslation(this.app, definition.labelKey, definition.label, locale)!,
+      description: resolveTranslation(this.app, definition.descriptionKey, definition.description, locale),
+      ...(value === undefined ? {} : { value }),
+      configured: Boolean(persisted) || (!secret && defaultValue !== undefined),
+      redacted: secret
+    };
+  }
+
+  private assertSettingsPermission(tenant: TenantContext, permission: string): void {
+    if (!tenant.permissions.includes("*") && !tenant.permissions.includes(permission)) throw new FramekitError("FORBIDDEN", `Missing permission ${permission}`, 403);
   }
 
   async diagnostics() {
@@ -617,6 +743,21 @@ export class FramekitRuntime {
         changes.push(migrationChange({ kind: "remove_unique_constraint", doctype: currentDocType.name, field: field.name, destructive: false, from: field.name }));
       }
       changes.push(migrationChange({ kind: "remove_doctype", doctype: currentDocType.name, field: "*", destructive: true, from: currentDocType }));
+    }
+    const currentSettings = this.app.modules.flatMap((module) => module.settings);
+    const nextSettings = parsed.modules.flatMap((module) => module.settings);
+    for (const nextSetting of nextSettings) {
+      const currentSetting = currentSettings.find((setting) => setting.key === nextSetting.key);
+      if (!currentSetting) {
+        changes.push(migrationChange({ kind: "add_setting", doctype: "settings", field: nextSetting.key, destructive: false, to: nextSetting }));
+      } else if (stableJson(settingStorageContract(currentSetting)) !== stableJson(settingStorageContract(nextSetting))) {
+        changes.push(migrationChange({ kind: "change_setting", doctype: "settings", field: nextSetting.key, destructive: true, from: currentSetting, to: nextSetting }));
+      }
+    }
+    for (const currentSetting of currentSettings) {
+      if (!nextSettings.some((setting) => setting.key === currentSetting.key)) {
+        changes.push(migrationChange({ kind: "remove_setting", doctype: "settings", field: currentSetting.key, destructive: true, from: currentSetting }));
+      }
     }
     const plan = {
       id: this.idGenerator(),
@@ -1813,6 +1954,16 @@ function fieldStorageContract(field: FieldDefinition): string {
   return field.computed ? `${exact}:computed:${JSON.stringify(field.computed)}` : exact;
 }
 
+function settingStorageContract(setting: SettingDefinition): Pick<SettingDefinition, "type" | "scope" | "required" | "default" | "options"> {
+  return {
+    type: setting.type,
+    scope: setting.scope,
+    required: setting.required,
+    ...(setting.default === undefined ? {} : { default: setting.default }),
+    ...(setting.options === undefined ? {} : { options: setting.options })
+  };
+}
+
 export class InMemoryDocumentRepository implements DocumentRepository {
   private readonly records = new Map<string, DocumentRecord>();
 
@@ -2279,12 +2430,13 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
 export class InMemoryCustomizationStore implements CustomizationStore {
   private readonly fields: CustomFieldDefinition[] = [];
   private readonly views: ViewDefinition[] = [];
+  private readonly settings = new Map<string, StoredSettingValue>();
 
   describe(): RepositoryDiagnostics {
     return {
       kind: "memory",
       durable: false,
-      features: ["custom-fields", "views"]
+      features: ["custom-fields", "views", "settings"]
     };
   }
 
@@ -2312,6 +2464,28 @@ export class InMemoryCustomizationStore implements CustomizationStore {
       this.views.push({ ...view, fields: [...view.fields] });
     }
     return view;
+  }
+
+  async listSettingValues(tenant: TenantContext, appName: string): Promise<StoredSettingValue[]> {
+    const tenantScope = `tenant:${tenant.tenantId}`;
+    const appScope = `app:${appName}`;
+    return [...this.settings.values()].filter((item) => item.appName === appName && (item.scopeId === tenantScope || item.scopeId === appScope)).map((item) => ({ ...item }));
+  }
+
+  async upsertSettingValue(tenant: TenantContext, value: StoredSettingValue): Promise<StoredSettingValue> {
+    assertSettingValueScope(tenant, value);
+    this.settings.set(`${value.appName}\0${value.scopeId}\0${value.key}`, { ...value });
+    return { ...value };
+  }
+}
+
+function settingScopeId(definition: SettingDefinition, tenant: TenantContext, appName: string): string {
+  return definition.scope === "app" ? `app:${appName}` : `tenant:${tenant.tenantId}`;
+}
+
+function assertSettingValueScope(tenant: TenantContext, value: StoredSettingValue): void {
+  if (value.scopeId !== `tenant:${tenant.tenantId}` && value.scopeId !== `app:${value.appName}`) {
+    throw new FramekitError("FORBIDDEN", "Setting value scope does not match the authenticated tenant or application.", 403);
   }
 }
 
@@ -2503,7 +2677,7 @@ function assertMemoryIdempotencyFingerprint(key: string, expected: string, actua
 }
 
 function migrationChange(change: Omit<MigrationChange, "rollback">): MigrationChange {
-  if (change.kind === "remove_doctype" || change.kind === "remove_field") return { ...change };
+  if (change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "add_setting" || change.kind === "remove_setting") return { ...change };
   return { ...change, rollback: rollbackFor(change) };
 }
 
@@ -2531,6 +2705,12 @@ function rollbackFor(change: Omit<MigrationChange, "rollback">): MigrationRollba
       return { kind: "add_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
     case "change_row_policy":
       return { kind: "change_row_policy", doctype: change.doctype, field: "row_policy", destructive: true, from: change.to, to: change.from };
+    case "add_setting":
+      return { kind: "remove_setting", doctype: "settings", field: change.field, destructive: true, from: change.to };
+    case "remove_setting":
+      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing setting ${change.field} cannot restore prior values automatically.`, 409);
+    case "change_setting":
+      return { kind: "change_setting", doctype: "settings", field: change.field, destructive: true, from: change.to, to: change.from };
   }
 }
 
@@ -2554,17 +2734,18 @@ export async function validateMigrationPlan(plan: MigrationPlan): Promise<void> 
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration plan identity, schema checksums, uniqueness metadata, and changes are required.", 422);
   }
   const identifier = /^[a-z][a-z0-9_]*$/;
-  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "change_collection_schema", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint", "change_row_policy"]);
+  const changeKinds = new Set(["add_doctype", "remove_doctype", "add_field", "remove_field", "change_field_type", "change_collection_schema", "add_index", "remove_index", "add_unique_constraint", "remove_unique_constraint", "change_row_policy", "add_setting", "remove_setting", "change_setting"]);
   const constraints = [...plan.fromUniqueConstraints, ...plan.toUniqueConstraints];
   if (constraints.some((constraint) => !constraint || !identifier.test(constraint.doctype) || !identifier.test(constraint.field))) {
     throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration uniqueness metadata contains an invalid DocType or field identifier.", 422);
   }
   for (const change of plan.changes) {
-    if (!change || !changeKinds.has(change.kind) || !identifier.test(change.doctype) || typeof change.field !== "string") {
+    const settingChange = change && (change.kind === "add_setting" || change.kind === "remove_setting" || change.kind === "change_setting");
+    if (!change || !changeKinds.has(change.kind) || !identifier.test(change.doctype) || typeof change.field !== "string" || (settingChange && (change.doctype !== "settings" || !/^[a-z][a-z0-9_.-]*$/.test(change.field)))) {
       throw new FramekitError("INVALID_MIGRATION_PLAN", "Migration changes contain an invalid DocType or field identifier.", 422);
     }
     const fields = change.field === "*" ? ["*"] : change.field.split(",");
-    if (fields.some((field) => field !== "*" && !identifier.test(field))) {
+    if (!settingChange && fields.some((field) => field !== "*" && !identifier.test(field))) {
       throw new FramekitError("INVALID_MIGRATION_PLAN", `Migration change ${change.kind} contains an invalid field identifier.`, 422);
     }
     if (change.destructive !== migrationChangeIsDestructive(change)) {
@@ -2676,6 +2857,10 @@ export async function appSchemaChecksum(app: AppDefinition): Promise<string> {
   return base64Url(new Uint8Array(digest));
 }
 
+function secretStorageFailure(): FramekitError {
+  return new FramekitError("SECRET_STORAGE_FAILED", "Secret storage operation failed.", 503);
+}
+
 function appUniqueConstraints(app: AppDefinition): Array<{ doctype: string; field: string }> {
   return app.modules.flatMap((module) => module.doctypes.flatMap((doctype) =>
     doctype.fields.filter((field) => field.unique).map((field) => ({ doctype: doctype.name, field: field.name }))
@@ -2749,11 +2934,11 @@ export function assertDestructiveMigration(plan: MigrationPlan, options: { allow
 }
 
 export function migrationChangeIsDestructive(change: Pick<MigrationChange, "kind"> | MigrationRollback): boolean {
-  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type" || change.kind === "change_collection_schema" || change.kind === "change_row_policy";
+  return change.kind === "remove_doctype" || change.kind === "remove_field" || change.kind === "change_field_type" || change.kind === "change_collection_schema" || change.kind === "change_row_policy" || change.kind === "remove_setting" || change.kind === "change_setting";
 }
 
 export function assertSupportedMigration(plan: MigrationPlan): void {
-  const unsupported = plan.changes.filter((change) => change.kind === "change_field_type" || change.kind === "change_collection_schema");
+  const unsupported = plan.changes.filter((change) => change.kind === "change_field_type" || change.kind === "change_collection_schema" || change.kind === "remove_setting" || change.kind === "change_setting");
   if (unsupported.length > 0) {
     throw new FramekitError("UNSUPPORTED_MIGRATION_CONVERSION", "Automatic field or collection-schema conversion is not supported; provide an operator-reviewed data migration.", 422, unsupported);
   }

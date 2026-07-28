@@ -36,6 +36,6 @@ The following are deliberately outside the bounded 1.0 metadata slice and have s
 | Implemented | Child/repeating records and attachments | [#39](https://github.com/WilliamCorotan/FrameKit/issues/39), [policy](children-and-attachments.md) |
 | Implemented | Exact decimals, computed fields, and richer validators | [#40](https://github.com/WilliamCorotan/FrameKit/issues/40), [policy](domain-fields.md) |
 | Implemented | Ownership and row-level policies | [#41](https://github.com/WilliamCorotan/FrameKit/issues/41), [policy](row-permissions.md) |
-| P2 | Localization and typed settings | [#42](https://github.com/WilliamCorotan/FrameKit/issues/42) |
+| Implemented | Localization and typed settings | [#42](https://github.com/WilliamCorotan/FrameKit/issues/42), [contract](localization-settings.md) |
 
 Each primitive is accepted only when its semantics are consistent across all contract surfaces and covered by adapter-backed tests.

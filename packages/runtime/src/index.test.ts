@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type DocumentHook, type TenantContext } from "@framekit/core";
-import { applyFilters, assertDestructiveMigration, assertSupportedMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryAttachmentStorage, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan, type AttachmentStorage } from "./index.js";
+import { applyFilters, assertDestructiveMigration, assertSupportedMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryAttachmentStorage, InMemoryCustomizationStore, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan, type AttachmentStorage } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -1176,6 +1176,88 @@ describe("runtime document service", () => {
       doctype: "customer",
       field: { name: "missing_link", label: "Missing", type: "link", linkTo: "unknown" }
     })).rejects.toMatchObject({ code: "DOCTYPE_NOT_FOUND" });
+  });
+
+  it("plans durable setting metadata changes and blocks unsafe automatic application", async () => {
+    const base = defineApp({ name: "Settings migration", modules: [defineModule({ id: "ops", name: "Operations", settings: [{ key: "ops.token", label: "Token", type: "secret", scope: "tenant" }] })] });
+    const changed = defineApp({ name: "Settings migration", modules: [defineModule({ id: "ops", name: "Operations", settings: [{ key: "ops.token", label: "Token", type: "text", scope: "app", default: "new" }] })] });
+    const runtime = createRuntime(base, { idGenerator: () => "settings-migration" });
+    const plan = await runtime.planMigration(tenant, changed);
+    expect(plan.changes).toEqual([expect.objectContaining({ kind: "change_setting", doctype: "settings", field: "ops.token", destructive: true })]);
+    await expect(validateMigrationPlan(plan)).resolves.toBeUndefined();
+    expect(() => assertDestructiveMigration(plan, {})).toThrow(/destructive/i);
+    expect(() => assertSupportedMigration(plan)).toThrow(/operator-reviewed/i);
+    await expect(runtime.applyMigration(tenant, plan)).rejects.toMatchObject({ code: "DESTRUCTIVE_MIGRATION" });
+
+    const added = await createRuntime(defineApp({ name: "Settings migration", modules: [] }), { idGenerator: () => "settings-added" }).planMigration(tenant, base);
+    expect(added.changes).toEqual([expect.objectContaining({ kind: "add_setting", field: "ops.token", destructive: false })]);
+    expect(createExecutableMigrationArtifact(added).down).toEqual([]);
+    await expect(createRollbackMigrationPlan({ ...added, appliedAt: new Date().toISOString() })).rejects.toMatchObject({ code: "IRREVERSIBLE_MIGRATION" });
+    const removed = await runtime.planMigration(tenant, defineApp({ name: "Settings migration", modules: [] }));
+    expect(removed.changes).toEqual([expect.objectContaining({ kind: "remove_setting", field: "ops.token", destructive: true })]);
+  });
+
+  it("localizes metadata and persists typed settings with fail-closed secret handling", async () => {
+    const app = defineApp({
+      name: "Settings", localization: { defaultLocale: "en", supportedLocales: ["en", "fr"], fallbackLocales: ["en"], translations: { fr: { "module.ops": "Exploitation", "setting.region": "Région", "desk.saved": "Enregistré" }, en: {} } },
+      modules: [defineModule({ id: "ops", name: "Operations", nameKey: "module.ops", settings: [
+        { key: "ops.region", label: "Region", labelKey: "setting.region", type: "select", options: ["us", "eu"], default: "us" },
+        { key: "ops.shared", label: "Shared", type: "boolean", scope: "app", default: false },
+        { key: "ops.token", label: "Token", type: "secret", required: true }
+      ] })]
+    });
+    const privileged = { ...tenant, permissions: ["framekit.settings.read", "framekit.settings.manage", "framekit.settings.app.manage"] };
+    const customization = new InMemoryCustomizationStore();
+    const runtime = createRuntime(app, { customization, settingsSecrets: { seal: (value) => `sealed:${value}`, unseal: (value) => value.slice("sealed:".length) } });
+    await expect(runtime.metadata(privileged, { locale: "fr" })).resolves.toMatchObject({ locale: "fr", modules: [{ id: "ops", name: "Exploitation" }], messages: { "desk.saved": "Enregistré" } });
+    await expect(runtime.settings(privileged, { locale: "fr" })).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ key: "ops.region", label: "Région", value: "us" })]));
+    await expect(runtime.upsertSetting(privileged, "ops.region", "eu")).resolves.toMatchObject({ value: "eu", redacted: false });
+    await expect(runtime.upsertSetting(privileged, "ops.token", "super-secret")).resolves.toMatchObject({ configured: true, redacted: true });
+    expect(JSON.stringify(await runtime.settings(privileged))).not.toContain("super-secret");
+    await expect(runtime.resolveSettingValue(privileged, "ops.token")).resolves.toBe("super-secret");
+    await expect(runtime.upsertSetting({ ...privileged, permissions: ["framekit.settings.manage"] }, "ops.region", "us")).resolves.toMatchObject({ value: "us" });
+    await expect(runtime.upsertSetting({ ...privileged, permissions: ["framekit.settings.manage"] }, "ops.shared", true)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(runtime.upsertSetting(privileged, "ops.shared", true)).resolves.toMatchObject({ value: true, scope: "app" });
+    const otherTenant = { ...privileged, tenantId: "tenant_2" };
+    await expect(runtime.settings(otherTenant)).resolves.toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "ops.region", value: "us" }),
+      expect.objectContaining({ key: "ops.shared", value: true })
+    ]));
+    await expect(runtime.upsertSetting({ ...privileged, permissions: ["framekit.settings.read"] }, "ops.region", "eu")).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(createRuntime(app).upsertSetting(privileged, "ops.token", "secret")).rejects.toMatchObject({ code: "SECRET_STORAGE_UNAVAILABLE" });
+    const secretText = "runtime-adapter-secret";
+    const failingCustomization = new InMemoryCustomizationStore();
+    const failingRuntime = createRuntime(app, {
+      customization: failingCustomization,
+      settingsSecrets: {
+        seal: () => { throw new Error(`could not seal ${secretText}`); },
+        unseal: () => { throw new Error(`could not unseal ${secretText}`); }
+      }
+    });
+    const sealFailure = await failingRuntime.upsertSetting(privileged, "ops.token", secretText).catch((error) => error);
+    expect(sealFailure).toMatchObject({ code: "SECRET_STORAGE_FAILED", statusCode: 503, message: "Secret storage operation failed." });
+    expect(JSON.stringify(sealFailure)).not.toContain(secretText);
+    await failingCustomization.upsertSettingValue(privileged, { appName: app.name, scopeId: `tenant:${tenant.tenantId}`, key: "ops.token", value: "sealed-value", protected: true, updatedAt: new Date().toISOString() });
+    const unsealFailure = await failingRuntime.resolveSettingValue(privileged, "ops.token").catch((error) => error);
+    expect(unsealFailure).toMatchObject({ code: "SECRET_STORAGE_FAILED", statusCode: 503, message: "Secret storage operation failed." });
+    expect(JSON.stringify(unsealFailure)).not.toContain(secretText);
+    for (const [type, protectedValue] of [["text", true], ["secret", false]] as const) {
+      const driftSecret = `metadata-drift-${type}`;
+      const driftApp = defineApp({
+        name: `Drift ${type}`,
+        modules: [defineModule({ id: "ops", name: "Operations", settings: [{ key: "ops.token", label: "Token", type }] })]
+      });
+      const driftStore = new InMemoryCustomizationStore();
+      const driftRuntime = createRuntime(driftApp, { customization: driftStore, settingsSecrets: { seal: (value) => `sealed:${value}`, unseal: (value) => value.slice(7) } });
+      await driftStore.upsertSettingValue(privileged, { appName: driftApp.name, scopeId: `tenant:${tenant.tenantId}`, key: "ops.token", value: driftSecret, protected: protectedValue, updatedAt: new Date().toISOString() });
+      const listedFailure = await driftRuntime.settings(privileged).catch((error) => error);
+      const resolvedFailure = await driftRuntime.resolveSettingValue(privileged, "ops.token").catch((error) => error);
+      expect(listedFailure).toMatchObject({ code: "SECRET_STORAGE_FAILED", statusCode: 503 });
+      expect(resolvedFailure).toMatchObject({ code: "SECRET_STORAGE_FAILED", statusCode: 503 });
+      expect(JSON.stringify([listedFailure, resolvedFailure])).not.toContain(driftSecret);
+    }
+    await customization.upsertSettingValue(privileged, { appName: app.name, scopeId: `tenant:${tenant.tenantId}`, key: "ops.region", value: { corrupt: true }, protected: false, updatedAt: new Date().toISOString() });
+    await expect(runtime.settings(privileged)).rejects.toMatchObject({ code: "INVALID_SETTING_VALUE" });
   });
 
   it("stores tenant view metadata", async () => {

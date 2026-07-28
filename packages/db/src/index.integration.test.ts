@@ -129,7 +129,10 @@ const collectionDocType = defineDocType({
 
 const app = defineApp({
   name: "Postgres Integration",
-  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType, securedDocType, securedReferenceDocType, collectionDocType] })]
+  modules: [defineModule({ id: "crm", name: "CRM", doctypes: [customerDocType, dealDocType, approvalDocType, securedDocType, securedReferenceDocType, collectionDocType], settings: [
+    { key: "crm.region", label: "Region", type: "text", default: "global" },
+    { key: "crm.secret", label: "Secret", type: "secret", required: true }
+  ] })]
 });
 
 describe.skipIf(!connectionString)("Postgres durable stores", () => {
@@ -179,7 +182,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       migrations: stores.migrations,
       mutations: stores.mutations,
       idGenerator: createIdGenerator("main"),
-      now: () => new Date("2026-07-06T00:00:00.000Z")
+      now: () => new Date("2026-07-06T00:00:00.000Z"),
+      settingsSecrets: { seal: (value) => `pg-sealed:${value}`, unseal: (value) => value.slice("pg-sealed:".length) }
     });
 
     const customer = await runtime.create(tenant, "customer", {
@@ -205,6 +209,11 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await runtime.upsertView(tenant, { doctype: "customer", type: "list", fields: ["name", "region"] });
     await expect(runtime.customFields(tenant)).resolves.toMatchObject([{ id: "customer.region", field: { name: "region" } }]);
     await expect(runtime.views(tenant)).resolves.toMatchObject([{ id: "pg_integration_tenant.customer.list", fields: ["name", "region"] }]);
+    await expect(runtime.upsertSetting(tenant, "crm.region", "apac")).resolves.toMatchObject({ value: "apac" });
+    await expect(runtime.upsertSetting(tenant, "crm.secret", "postgres-secret")).resolves.toMatchObject({ configured: true, redacted: true });
+    const persistedSettings = await sql<{ key: string; value: unknown; protected: boolean }[]>`select key, value, protected from framekit_setting_values where app_name = ${app.name} order by key`;
+    expect(persistedSettings).toEqual([{ key: "crm.region", value: "apac", protected: false }, { key: "crm.secret", value: "pg-sealed:postgres-secret", protected: true }]);
+    expect(JSON.stringify(await runtime.settings(tenant))).not.toContain("postgres-secret");
 
     await expect(runtime.create(tenant, "deal", { title: "First Deal" })).resolves.toMatchObject({ id: "DEAL-0001" });
     await expect(runtime.create(tenant, "deal", { title: "Second Deal" })).resolves.toMatchObject({ id: "DEAL-0002" });
@@ -227,10 +236,12 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
 
     const nextApp = defineApp({
       name: "Postgres Integration",
+      localization: app.localization,
       modules: [
         defineModule({
           id: "crm",
           name: "CRM",
+          settings: app.modules[0]!.settings,
           doctypes: [
             defineDocType({
               ...customerDocType,
@@ -246,6 +257,11 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       ]
     });
     const plan = await runtime.planMigration(tenant, nextApp);
+    expect(plan.changes).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "add_setting" }),
+      expect.objectContaining({ kind: "remove_setting" }),
+      expect.objectContaining({ kind: "change_setting" })
+    ]));
     await runtime.applyMigration(tenant, plan);
     await expect(runtime.migrationHistory(tenant)).resolves.toEqual([
       expect.objectContaining({ id: plan.id, checksum: plan.checksum, changes: expect.arrayContaining([expect.objectContaining({ field: "segment" })]) })
@@ -1382,6 +1398,7 @@ async function cleanup(sql: postgres.Sql) {
   await sql`delete from framekit_outbox_events where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_custom_fields where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_views where tenant_id = ${tenant.tenantId}`;
+  await sql`delete from framekit_setting_values where scope_id = ${`tenant:${tenant.tenantId}`} or app_name = ${app.name}`;
   await sql`delete from framekit_naming_series where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_migrations where tenant_id = ${tenant.tenantId}`;
   await sql`delete from framekit_document_unique_values where tenant_id = ${tenant.tenantId}`;

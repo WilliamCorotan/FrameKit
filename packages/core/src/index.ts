@@ -16,6 +16,15 @@ export const fieldTypes = [
   "attachments"
 ] as const;
 
+const TranslationKeySchema = z.string().regex(/^[a-z][a-z0-9_.-]*$/);
+const LocaleSchema = z.string().min(2).refine((locale) => {
+  try {
+    return Intl.getCanonicalLocales(locale)[0] === locale;
+  } catch {
+    return false;
+  }
+}, "Locale must be a canonical BCP 47 language tag");
+
 export type FieldType = (typeof fieldTypes)[number];
 export type DocumentAction = "create" | "read" | "update" | "delete" | "submit" | "cancel" | "transition" | "transfer_owner";
 export type DocumentStatus = "draft" | "submitted" | "cancelled";
@@ -38,6 +47,7 @@ export const ComputedFieldSchema = z.discriminatedUnion("operation", [
 const FieldBaseSchema = z.object({
   name: z.string().min(1).regex(/^[a-z][a-z0-9_]*$/),
   label: z.string().min(1),
+  labelKey: TranslationKeySchema.optional(),
   precision: z.number().int().min(1).max(100).optional(),
   scale: z.number().int().min(0).max(50).optional(),
   required: z.boolean().default(false),
@@ -48,6 +58,7 @@ const FieldBaseSchema = z.object({
   readOnly: z.boolean().default(false),
   inList: z.boolean().default(false),
   description: z.string().optional(),
+  descriptionKey: TranslationKeySchema.optional(),
   validators: z.array(FieldValidatorSchema).default([])
 });
 
@@ -149,7 +160,9 @@ export type RowPolicy = z.infer<typeof RowPolicySchema>;
 export const DocTypeSchema = z.object({
   name: z.string().min(1).regex(/^[a-z][a-z0-9_]*$/),
   label: z.string().min(1),
+  labelKey: TranslationKeySchema.optional(),
   description: z.string().optional(),
+  descriptionKey: TranslationKeySchema.optional(),
   fields: z.array(FieldSchema).default([]),
   permissions: z.array(PermissionRuleSchema).default([]),
   ownership: z.object({
@@ -246,6 +259,7 @@ const SemVerSchema = z.string().regex(
 
 export const NavigationItemSchema = z.object({
   label: z.string().min(1),
+  labelKey: TranslationKeySchema.optional(),
   path: z.string().min(1),
   icon: z.string().optional(),
   permission: z.string().optional(),
@@ -293,11 +307,37 @@ export const DocumentCommandRequestSchema = z.object({
 export type DocumentCommandOperation = z.infer<typeof DocumentCommandOperationSchema>;
 export type DocumentCommandRequest = z.infer<typeof DocumentCommandRequestSchema>;
 
+export const SettingDefinitionSchema = z.object({
+  key: z.string().regex(/^[a-z][a-z0-9_.-]*$/),
+  label: z.string().min(1),
+  labelKey: TranslationKeySchema.optional(),
+  description: z.string().optional(),
+  descriptionKey: TranslationKeySchema.optional(),
+  type: z.enum(["text", "number", "boolean", "select", "secret"]),
+  scope: z.enum(["tenant", "app"]).default("tenant"),
+  required: z.boolean().default(false),
+  default: z.unknown().optional(),
+  options: z.array(z.string()).optional()
+}).strict();
+
+export type SettingDefinition = z.infer<typeof SettingDefinitionSchema>;
+
+export const LocalizationSchema = z.object({
+  defaultLocale: LocaleSchema.default("en"),
+  supportedLocales: z.array(LocaleSchema).min(1).default(["en"]),
+  fallbackLocales: z.array(LocaleSchema).default([]),
+  translations: z.record(LocaleSchema, z.record(TranslationKeySchema, z.string())).default({})
+}).strict();
+
+export type LocalizationDefinition = z.infer<typeof LocalizationSchema>;
+
 export const ModuleSchema: z.ZodType<ModuleDefinition> = z.object({
   id: z.string().min(1).regex(/^[a-z][a-z0-9_-]*$/),
   name: z.string().min(1),
+  nameKey: TranslationKeySchema.optional(),
   version: SemVerSchema,
   description: z.string().optional(),
+  descriptionKey: TranslationKeySchema.optional(),
   dependencies: z.array(z.string()).default([]),
   doctypes: z.array(DocTypeSchema).default([]),
   permissions: z.array(z.string()).default([]),
@@ -305,14 +345,16 @@ export const ModuleSchema: z.ZodType<ModuleDefinition> = z.object({
   commands: z.array(CommandDefinitionSchema).default([]),
   hooks: ModuleHooksSchema.optional(),
   jobs: z.array(z.string()).default([]),
-  settings: z.array(z.string()).default([])
+  settings: z.array(SettingDefinitionSchema).default([])
 });
 
 export type ModuleDefinition = {
   id: string;
   name: string;
+  nameKey?: string;
   version: string;
   description?: string;
+  descriptionKey?: string;
   dependencies: string[];
   doctypes: DocTypeDefinition[];
   permissions: string[];
@@ -320,18 +362,22 @@ export type ModuleDefinition = {
   commands: CommandDefinition[];
   hooks?: ModuleHooks;
   jobs: string[];
-  settings: string[];
+  settings: SettingDefinition[];
 };
 
 export const AppSchema = z.object({
   name: z.string().min(1),
+  nameKey: TranslationKeySchema.optional(),
   version: SemVerSchema,
+  localization: LocalizationSchema.default({ defaultLocale: "en", supportedLocales: ["en"], fallbackLocales: [], translations: {} }),
   modules: z.array(ModuleSchema).default([])
 });
 
 export type AppDefinition = {
   name: string;
+  nameKey?: string;
   version: string;
+  localization: LocalizationDefinition;
   modules: ModuleDefinition[];
 };
 
@@ -349,13 +395,14 @@ export function defineDocType(definition: z.input<typeof DocTypeSchema>): DocTyp
 }
 
 export function defineModule(
-  definition: Omit<Partial<ModuleDefinition>, "doctypes" | "commands"> & Pick<ModuleDefinition, "id" | "name"> & {
+  definition: Omit<Partial<ModuleDefinition>, "doctypes" | "commands" | "settings"> & Pick<ModuleDefinition, "id" | "name"> & {
     doctypes?: z.input<typeof DocTypeSchema>[];
     commands?: z.input<typeof CommandDefinitionSchema>[];
+    settings?: z.input<typeof SettingDefinitionSchema>[];
   }
 ): ModuleDefinition {
   const doctypes = (definition.doctypes ?? []).map((doctype) => defineDocType(doctype));
-  return ModuleSchema.parse({
+  const module = ModuleSchema.parse({
     version: "0.1.0",
     dependencies: [],
     permissions: [],
@@ -366,6 +413,13 @@ export function defineModule(
     ...definition,
     doctypes
   });
+  const settingKeys = new Set<string>();
+  for (const setting of module.settings) {
+    if (settingKeys.has(setting.key)) throw new Error(`Duplicate setting key "${setting.key}" in module "${module.id}"`);
+    settingKeys.add(setting.key);
+    assertSettingDefinition(setting);
+  }
+  return module;
 }
 
 export function defineApp(definition: Omit<Partial<AppDefinition>, "modules"> & Pick<AppDefinition, "name"> & { modules?: ModuleDefinition[] }): AppDefinition {
@@ -377,7 +431,66 @@ export function defineApp(definition: Omit<Partial<AppDefinition>, "modules"> & 
   assertNoDuplicateDoctypes(app.modules);
   assertModuleDependencies(app.modules);
   assertAppReferences(app);
+  assertLocalization(app);
+  const settingKeys = new Set<string>();
+  for (const setting of app.modules.flatMap((module) => module.settings)) {
+    if (settingKeys.has(setting.key)) throw new Error(`Duplicate application setting key "${setting.key}"`);
+    settingKeys.add(setting.key);
+  }
   return app;
+}
+
+export function localeFallbackChain(localization: LocalizationDefinition, requestedLocale?: string): string[] {
+  const requested = requestedLocale && LocaleSchema.safeParse(requestedLocale).success ? requestedLocale : localization.defaultLocale;
+  const parts = requested.split("-");
+  const parents = parts.slice(1).map((_, index) => parts.slice(0, parts.length - index - 1).join("-"));
+  return [...new Set([requested, ...parents, ...localization.fallbackLocales, localization.defaultLocale].filter((locale) => localization.supportedLocales.includes(locale)))];
+}
+
+export function resolveTranslation(app: AppDefinition, key: string | undefined, fallback: string | undefined, requestedLocale?: string): string | undefined {
+  if (!key) return fallback;
+  for (const locale of localeFallbackChain(app.localization, requestedLocale)) {
+    const translated = app.localization.translations[locale]?.[key];
+    if (translated !== undefined) return translated;
+  }
+  return fallback;
+}
+
+export function validateSettingValue(definition: SettingDefinition, value: unknown): string | number | boolean {
+  if (definition.type === "number") {
+    if (typeof value !== "number" || !Number.isFinite(value)) throw new FramekitError("INVALID_SETTING_VALUE", `${definition.key} must be a finite number`, 422, { key: definition.key, type: definition.type });
+    return value;
+  }
+  if (definition.type === "boolean") {
+    if (typeof value !== "boolean") throw new FramekitError("INVALID_SETTING_VALUE", `${definition.key} must be a boolean`, 422, { key: definition.key, type: definition.type });
+    return value;
+  }
+  if (typeof value !== "string" || (definition.required && value.length === 0)) throw new FramekitError("INVALID_SETTING_VALUE", `${definition.key} must be a${definition.required ? " non-empty" : ""} string`, 422, { key: definition.key, type: definition.type });
+  if (definition.type === "select" && !definition.options?.includes(value)) throw new FramekitError("INVALID_SETTING_VALUE", `${definition.key} must be one of its declared options`, 422, { key: definition.key, type: definition.type });
+  return value;
+}
+
+function assertSettingDefinition(definition: SettingDefinition): void {
+  if (definition.type === "select") {
+    if (!definition.options?.length) throw new Error(`Select setting "${definition.key}" requires options`);
+    if (new Set(definition.options).size !== definition.options.length) throw new Error(`Select setting "${definition.key}" has duplicate options`);
+  } else if (definition.options) {
+    throw new Error(`Only select settings may declare options: "${definition.key}"`);
+  }
+  if (definition.type === "secret" && definition.default !== undefined) throw new Error(`Secret setting "${definition.key}" cannot declare a plaintext default`);
+  if (definition.default !== undefined) validateSettingValue(definition, definition.default);
+}
+
+function assertLocalization(app: AppDefinition): void {
+  const localization = app.localization;
+  if (new Set(localization.supportedLocales).size !== localization.supportedLocales.length) throw new Error("Localization supportedLocales must be unique");
+  if (!localization.supportedLocales.includes(localization.defaultLocale)) throw new Error("Localization defaultLocale must be supported");
+  for (const locale of localization.fallbackLocales) {
+    if (!localization.supportedLocales.includes(locale)) throw new Error(`Localization fallback locale "${locale}" must be supported`);
+  }
+  for (const locale of Object.keys(localization.translations)) {
+    if (!localization.supportedLocales.includes(locale)) throw new Error(`Translations provided for unsupported locale "${locale}"`);
+  }
 }
 
 export function getDocType(app: AppDefinition, name: string): DocTypeDefinition {
