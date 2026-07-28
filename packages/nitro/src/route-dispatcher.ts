@@ -1,43 +1,78 @@
 import { getQuery, readBody, sendRedirect, setResponseStatus, type H3Event } from "h3";
+import type { PasswordAuthService } from "@framekit/auth";
 import { FramekitError, type TenantContext } from "@framekit/core";
-import { createOpenApiDocument } from "@framekit/openapi";
-import type { DocumentCommandRequest, FramekitRuntime } from "@framekit/runtime";
+import { createOpenApiDocument, FRAMEKIT_ROUTE_CATALOG, type FramekitRouteDefinition } from "@framekit/openapi";
+import type { DocumentCommandRequest, FilterValue, FramekitRuntime } from "@framekit/runtime";
 import { matchAttachmentPath, matchAuthManagementPath, matchCommandPath, matchDocumentPath, matchOutboxPath, matchProviderAuthorizationPath, matchProviderLoginPath, matchUserPasswordPath, matchUserRecoveryPath } from "./route-matchers.js";
 
 const UNHANDLED = Symbol("unhandled");
 type Result = { handled: true; value: unknown } | typeof UNHANDLED;
 const handled = (value: unknown): Result => ({ handled: true, value });
-export type RouteContext = { runtime: FramekitRuntime; options: any; basePath: string; authCookie?: any; allowHeaderIdentity: boolean; setTelemetryStatus(code: number): void; helpers: Record<string, any> };
+type RouteAuthCookie = { name: string; path: string; httpOnly: boolean; secure: boolean; sameSite: "lax" | "strict" | "none" };
+type RouteOptions = {
+  auth?: PasswordAuthService;
+  serverUrl?: string;
+  healthChecks?: Record<string, (signal: AbortSignal) => { ok: boolean; details?: unknown } | Promise<{ ok: boolean; details?: unknown }>>;
+  healthCheckTimeoutMs?: number;
+};
+export type RouteContext = { runtime: FramekitRuntime; options: RouteOptions; basePath: string; authCookie?: RouteAuthCookie; allowHeaderIdentity: boolean; setTelemetryStatus(code: number): void; helpers: RouteHelpers };
+type RouteHelpers = {
+  assertAuthManager(tenant: TenantContext): void;
+  assertOperationPermission(tenant: TenantContext, permission: string, operation: string): void;
+  authenticatedTenantFromRequest(request: Request, auth: PasswordAuthService, cookie?: RouteContext["authCookie"]): Promise<TenantContext>;
+  canonicalLocale(locale: string): string | undefined;
+  clearSessionCookie(event: H3Event, cookie?: RouteContext["authCookie"]): void;
+  createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal, after?: string): Response;
+  decodeBase64(value: string): Uint8Array;
+  encodeBase64(value: Uint8Array): string;
+  isOutboxStatus(value: unknown): value is "pending" | "dispatched" | "failed";
+  isPlainObject(value: unknown): value is Record<string, unknown>;
+  mutationOptions(request: Request): { expectedRevision?: number; idempotencyKey?: string };
+  parseFields(value: unknown): string[] | undefined;
+  parseFilters(value: unknown): Record<string, FilterValue> | undefined;
+  parseSort(value: unknown): { field: string; direction?: "asc" | "desc" } | undefined;
+  preferredLocale(header: string | null, supportedLocales: string[]): string | undefined;
+  requireAuth(auth: RouteContext["options"]["auth"]): PasswordAuthService;
+  runHealthChecks(checks: NonNullable<RouteOptions["healthChecks"]>, timeoutMs: number): Promise<{ ok: boolean; details?: unknown }>;
+  sessionTokenFromEvent(event: H3Event, cookie?: RouteContext["authCookie"]): string | undefined;
+  setSessionCookie(event: H3Event, token: string, expiresAt: string, cookie?: RouteContext["authCookie"]): void;
+  tenantFromRequest(request: Request, auth?: RouteContext["options"]["auth"], cookie?: RouteContext["authCookie"], allowHeaderIdentity?: boolean): Promise<TenantContext>;
+};
 
 /**
  * The static matcher registrations used to select a focused dispatcher.
  * Dynamic document, attachment, command, and auth-resource matchers remain
  * in route-matchers.ts because their segments are application data.
  */
-export const NITRO_STATIC_ROUTE_REGISTRATIONS = [
-  ["GET", "/health/live", "platform"], ["GET", "/health/ready", "platform"], ["GET", "/api/meta", "platform"], ["GET", "/api/openapi.json", "platform"], ["GET", "/api/diagnostics", "platform"],
-  ["POST", "/api/auth/login", "auth"], ["POST", "/api/auth/refresh", "auth"], ["POST", "/api/auth/logout", "auth"], ["GET", "/api/auth/me", "auth"], ["POST", "/api/auth/providers/{id}/login", "auth"], ["GET", "/api/auth/providers/{id}/authorize", "auth"], ["GET", "/api/auth/providers/{id}/callback", "auth"], ["POST", "/api/auth/invitations", "auth"], ["POST", "/api/auth/invitations/accept", "auth"], ["POST", "/api/auth/identity-links", "auth"], ["POST", "/api/auth/password/change", "auth"], ["POST", "/api/auth/password/reset/request", "auth"], ["POST", "/api/auth/password/reset/complete", "auth"], ["GET", "/api/auth/users", "auth"], ["POST", "/api/auth/users", "auth"], ["POST", "/api/auth/users/{id}/password", "auth"], ["POST", "/api/auth/users/{id}/recovery", "auth"], ["GET", "/api/auth/audit", "auth"], ["GET", "/api/auth/roles", "auth"], ["POST", "/api/auth/roles", "auth"], ["GET", "/api/auth/tokens", "auth"], ["POST", "/api/auth/tokens", "auth"],
-  ["GET", "/api/migrations", "platform"], ["POST", "/api/migrations/plan", "platform"], ["POST", "/api/migrations/apply", "platform"], ["GET", "/api/realtime/events", "platform"], ["GET", "/api/realtime/stream", "platform"], ["GET", "/api/audit", "platform"], ["GET", "/api/outbox", "platform"], ["GET", "/api/custom-fields", "platform"], ["POST", "/api/custom-fields", "platform"], ["GET", "/api/views", "platform"], ["POST", "/api/views", "platform"], ["GET", "/api/settings", "platform"], ["PUT", "/api/settings/{key}", "platform"], ["POST", "/api/attachments/cleanup", "documents"]
-] as const;
 
 export async function dispatchNitroRoutes(event: H3Event, context: RouteContext): Promise<unknown> {
   const { runtime, options, basePath, authCookie, allowHeaderIdentity } = context;
   const method = event.req.method ?? "GET";
   const path = event.url.pathname;
-  if (matchesStaticRegistration(method, path, basePath, "auth") || path.startsWith(`${basePath}/auth/`)) {
+  const matched = matchNitroRoute(method, path, basePath);
+  if (matched?.group === "auth") {
     const auth = await dispatchAuthRoute(event, context);
     if (auth !== UNHANDLED) return auth.value;
   }
-  if (matchesStaticRegistration(method, path, basePath, "platform") || path.startsWith(`${basePath}/outbox/`)) {
+  if (matched?.group === "platform") {
     const platform = await dispatchPlatformRoute(event, context);
     if (platform !== UNHANDLED) return platform.value;
   }
-  return await dispatchDocumentRoute(event, context);
+  if (matched?.group === "documents") return await dispatchDocumentRoute(event, context);
+  throw new FramekitError("NOT_FOUND", "Route not found", 404);
 }
 
-function matchesStaticRegistration(method: string, path: string, basePath: string, group: "auth" | "platform" | "documents"): boolean {
-  const normalizedPath = path === "/health" ? "/health/live" : path === "/health/dependencies" ? "/health/ready" : path.startsWith(basePath) ? `/api${path.slice(basePath.length)}` : path;
-  return NITRO_STATIC_ROUTE_REGISTRATIONS.some(([registeredMethod, pattern, registeredGroup]) => registeredMethod === method && registeredGroup === group && pattern.split("/").every((segment, index) => segment.startsWith("{") || segment === normalizedPath.split("/")[index]) && pattern.split("/").length === normalizedPath.split("/").length);
+/** Return the actual catalog definition that structurally matches this request. */
+export function matchNitroRoute(method: string, path: string, basePath: string): FramekitRouteDefinition | undefined {
+  const normalizedBasePath = normalizeNitroBasePath(basePath);
+  const normalizedPath = path === "/health" ? "/health/live" : path === "/health/dependencies" ? "/health/ready" : path === normalizedBasePath || path.startsWith(`${normalizedBasePath}/`) ? `/api${path.slice(normalizedBasePath.length)}` : path;
+  const pathSegments = normalizedPath.split("/");
+  return FRAMEKIT_ROUTE_CATALOG.find((definition) => definition.method === method && definition.path.split("/").length === pathSegments.length && definition.path.split("/").every((segment, index) => (segment.startsWith("{") && segment.endsWith("}")) || segment === pathSegments[index]));
+}
+
+export function normalizeNitroBasePath(basePath: string): string {
+  const prefixed = basePath.startsWith("/") ? basePath : `/${basePath}`;
+  return prefixed.length > 1 ? prefixed.replace(/\/+$/, "") : prefixed;
 }
 
 async function dispatchAuthRoute(event: H3Event, context: RouteContext): Promise<Result> {
@@ -401,7 +436,7 @@ if (method === "GET" && path === basePath + "/outbox") {
   const query = getQuery(event);
   return handled(await runtime.outboxEvents(tenant, {
     limit: typeof query.limit === "string" ? Number(query.limit) : undefined,
-    status: isOutboxStatus(query.status) ? query.status as any : undefined
+    status: isOutboxStatus(query.status) ? query.status : undefined
   }));
 }
 const outboxAction = matchOutboxPath(path, basePath);

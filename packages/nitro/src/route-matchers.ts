@@ -63,7 +63,7 @@ export function matchUserRecoveryPath(path: string, basePath: string): { userId:
 function decodePathSegment(value: string): string {
   try {
     const decoded = decodeURIComponent(value);
-    if (!decoded || decoded.includes("\0")) throw new Error("invalid segment");
+    if (!decoded || decoded.includes("\0") || decoded.includes("/")) throw new Error("invalid segment");
     return decoded;
   } catch {
     throw new FramekitError("INVALID_PATH", "Request path contains a malformed identifier.", 400);

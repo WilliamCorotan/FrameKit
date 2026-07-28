@@ -1,6 +1,6 @@
 import { decimalPrecision, decimalScale, listDocTypes, type AppDefinition, type DocTypeDefinition, type FieldDefinition } from "@framekit/core";
 import { createdResponse, errorResponses, expectedRevisionParam, headerParam, idempotencyKeyParam, jsonBody, listResponse, okResponse, pathParam, queryParam, ref, type JsonSchema } from "./path-operations.js";
-export { FRAMEKIT_STATIC_ROUTE_CATALOG } from "./route-catalog.js";
+export { FRAMEKIT_ROUTE_CATALOG, FRAMEKIT_STATIC_ROUTE_CATALOG, type FramekitRouteDefinition, type FramekitRouteGroup } from "./route-catalog.js";
 
 export type OpenApiOptions = {
   basePath?: string;

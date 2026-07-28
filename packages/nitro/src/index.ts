@@ -5,7 +5,7 @@ import { createOpenApiDocument } from "@framekit/openapi";
 import type { DocumentCommandRequest, FilterValue, FramekitRuntime, RuntimeRealtimeEvent } from "@framekit/runtime";
 import { assertSecureProductionCredentials, nodeEnvironment } from "./production-policy.js";
 import { applyResponseSecurityHeaders, requestContext } from "./request-security-policy.js";
-import { dispatchNitroRoutes } from "./route-dispatcher.js";
+import { dispatchNitroRoutes, normalizeNitroBasePath, type RouteContext } from "./route-dispatcher.js";
 import { matchProviderLoginPath as routeProviderLoginPath } from "./route-matchers.js";
 import { redactTelemetry, redactTelemetryError } from "./telemetry.js";
 
@@ -132,7 +132,7 @@ export function createOpenTelemetryAdapters(options: {
 export { assertSecureProductionCredentials } from "./production-policy.js";
 
 export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapterOptions = {}): EventHandler {
-  const basePath = options.basePath ?? "/api";
+  const basePath = normalizeNitroBasePath(options.basePath ?? "/api");
   const trustProxy = options.security?.trustProxy === true;
   const rateLimiter = createRateLimiter(options.rateLimit, trustProxy);
   const environment = nodeEnvironment();
@@ -171,7 +171,8 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
         throw new FramekitError("RATE_LIMITED", "Too many requests.", 429);
       }
 
-      return await dispatchNitroRoutes(event, { runtime, options, basePath, authCookie, allowHeaderIdentity, setTelemetryStatus: (code) => { statusCode = code; }, helpers: { assertAuthManager, assertOperationPermission, authenticatedTenantFromRequest, canonicalLocale, clearSessionCookie, createRealtimeStream, decodeBase64, encodeBase64, isOutboxStatus, isPlainObject, mutationOptions, parseFields, parseFilters, parseSort, preferredLocale, requireAuth, runHealthChecks, sessionTokenFromEvent, setSessionCookie, tenantFromRequest } });
+      const routeContext = { runtime, options, basePath, authCookie, allowHeaderIdentity, setTelemetryStatus: (code: number) => { statusCode = code; }, helpers: { assertAuthManager, assertOperationPermission, authenticatedTenantFromRequest, canonicalLocale, clearSessionCookie, createRealtimeStream, decodeBase64, encodeBase64, isOutboxStatus, isPlainObject, mutationOptions, parseFields, parseFilters, parseSort, preferredLocale, requireAuth, runHealthChecks, sessionTokenFromEvent, setSessionCookie, tenantFromRequest } } satisfies RouteContext;
+      return await dispatchNitroRoutes(event, routeContext);
     } catch (error) {
       thrown = error;
       const response = toErrorResponse(error);
@@ -199,7 +200,7 @@ export function createNitroHandler(runtime: FramekitRuntime, options: NitroAdapt
   });
 }
 
-export function preferredLocale(header: string | null, supportedLocales: string[]): string | undefined {
+function preferredLocale(header: string | null, supportedLocales: string[]): string | undefined {
   const candidates = (header ?? "").split(",").map((entry, index) => {
     const [tag = "", ...parameters] = entry.trim().split(";");
     const quality = Number(parameters.find((parameter) => parameter.trim().startsWith("q="))?.trim().slice(2) ?? "1");
@@ -211,7 +212,7 @@ export function preferredLocale(header: string | null, supportedLocales: string[
   })?.locale ?? candidates[0]?.locale;
 }
 
-export function canonicalLocale(locale: string): string | undefined {
+function canonicalLocale(locale: string): string | undefined {
   try {
     return Intl.getCanonicalLocales(locale)[0];
   } catch {
@@ -223,52 +224,7 @@ export function routeParam(name: string): string {
   return getRouterParam({ context: { params: {} } } as never, name) ?? "";
 }
 
-function matchDocumentPath(path: string, basePath: string): { doctype: string; id?: string; operation?: string } | undefined {
-  const prefix = `${basePath}/doctypes/`;
-  if (!path.startsWith(prefix)) {
-    return undefined;
-  }
-  const parts = path.slice(prefix.length).split("/").filter(Boolean);
-  if (parts.length === 1) {
-    return { doctype: parts[0] ?? "" };
-  }
-  if (parts.length === 2) {
-    return { doctype: parts[0] ?? "", id: parts[1] };
-  }
-  if (parts.length === 3 && ["transition", "submit", "cancel", "owner"].includes(parts[2]!)) {
-    return { doctype: parts[0] ?? "", id: parts[1], operation: parts[2] };
-  }
-  return undefined;
-}
-
-function matchCommandPath(path: string, basePath: string): string | undefined {
-  const prefix = `${basePath}/commands/`;
-  if (!path.startsWith(prefix)) return undefined;
-  const id = path.slice(prefix.length);
-  return id && !id.includes("/") ? decodeURIComponent(id) : undefined;
-}
-
-function matchAttachmentPath(path: string, basePath: string): { doctype: string; id: string; field: string; attachmentId?: string } | undefined {
-  const prefix = `${basePath}/doctypes/`;
-  if (!path.startsWith(prefix)) return undefined;
-  const encoded = path.slice(prefix.length).split("/");
-  if ((encoded.length !== 4 && encoded.length !== 5) || encoded.some((part) => !part)) return undefined;
-  const [doctype, id, resource, field, attachmentId] = encoded.map(decodePathSegment);
-  if (resource !== "attachments") return undefined;
-  return { doctype: doctype!, id: id!, field: field!, ...(attachmentId ? { attachmentId } : {}) };
-}
-
-function decodePathSegment(value: string): string {
-  try {
-    const decoded = decodeURIComponent(value);
-    if (!decoded || decoded.includes("\0")) throw new Error("invalid segment");
-    return decoded;
-  } catch {
-    throw new FramekitError("INVALID_PATH", "Request path contains a malformed identifier.", 400);
-  }
-}
-
-export function decodeBase64(value: string): Uint8Array {
+function decodeBase64(value: string): Uint8Array {
   try {
     return Uint8Array.from(atob(value), (character) => character.charCodeAt(0));
   } catch {
@@ -276,7 +232,7 @@ export function decodeBase64(value: string): Uint8Array {
   }
 }
 
-export function encodeBase64(bytes: Uint8Array): string {
+function encodeBase64(bytes: Uint8Array): string {
   let binary = "";
   for (let offset = 0; offset < bytes.length; offset += 0x8000) {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
@@ -284,74 +240,18 @@ export function encodeBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function matchOutboxPath(path: string, basePath: string): { id: string; action: "dispatch" | "fail" } | undefined {
-  const prefix = `${basePath}/outbox/`;
-  if (!path.startsWith(prefix)) {
-    return undefined;
-  }
-  const [id, action] = path.slice(prefix.length).split("/").filter(Boolean);
-  if (!id || (action !== "dispatch" && action !== "fail")) {
-    return undefined;
-  }
-  return { id, action };
-}
-
-function matchAuthManagementPath(path: string, basePath: string): { resource: "users" | "roles" | "tokens"; id?: string } | undefined {
-  const prefix = `${basePath}/auth/`;
-  if (!path.startsWith(prefix)) {
-    return undefined;
-  }
-  const [resource, id] = path.slice(prefix.length).split("/").filter(Boolean);
-  if (resource !== "users" && resource !== "roles" && resource !== "tokens") {
-    return undefined;
-  }
-  return id ? { resource, id } : { resource };
-}
-
-function matchProviderLoginPath(path: string, basePath: string): { providerId: string } | undefined {
-  const prefix = `${basePath}/auth/providers/`;
-  if (!path.startsWith(prefix)) {
-    return undefined;
-  }
-  const [providerId, operation] = path.slice(prefix.length).split("/").filter(Boolean);
-  return providerId && operation === "login" ? { providerId } : undefined;
-}
-
-function matchProviderAuthorizationPath(path: string, basePath: string): { providerId: string; action: "authorize" | "callback" } | undefined {
-  const prefix = `${basePath}/auth/providers/`;
-  if (!path.startsWith(prefix)) return undefined;
-  const [providerId, action] = path.slice(prefix.length).split("/").filter(Boolean);
-  return providerId && (action === "authorize" || action === "callback") ? { providerId, action } : undefined;
-}
-
-function matchUserPasswordPath(path: string, basePath: string): { userId: string } | undefined {
-  const prefix = `${basePath}/auth/users/`;
-  if (!path.startsWith(prefix)) {
-    return undefined;
-  }
-  const [userId, operation] = path.slice(prefix.length).split("/").filter(Boolean);
-  return userId && operation === "password" ? { userId } : undefined;
-}
-
-function matchUserRecoveryPath(path: string, basePath: string): { userId: string } | undefined {
-  const prefix = `${basePath}/auth/users/`;
-  if (!path.startsWith(prefix)) return undefined;
-  const [userId, operation] = path.slice(prefix.length).split("/").filter(Boolean);
-  return userId && operation === "recovery" ? { userId } : undefined;
-}
-
-export function isOutboxStatus(value: unknown): value is "pending" | "dispatched" | "failed" {
+function isOutboxStatus(value: unknown): value is "pending" | "dispatched" | "failed" {
   return value === "pending" || value === "dispatched" || value === "failed";
 }
 
-export function requireAuth(auth: PasswordAuthService | undefined): PasswordAuthService {
+function requireAuth(auth: PasswordAuthService | undefined): PasswordAuthService {
   if (!auth) {
     throw new FramekitError("AUTH_NOT_CONFIGURED", "Auth is not configured for this app.", 501);
   }
   return auth;
 }
 
-export async function authenticatedTenantFromRequest(request: Request, auth: PasswordAuthService, cookie?: Required<NitroAuthCookieOptions>): Promise<TenantContext> {
+async function authenticatedTenantFromRequest(request: Request, auth: PasswordAuthService, cookie?: Required<NitroAuthCookieOptions>): Promise<TenantContext> {
   const token = sessionTokenFromRequest(request, cookie);
   if (!token) {
     throw new FramekitError("UNAUTHENTICATED", "Missing session token.", 401);
@@ -359,7 +259,7 @@ export async function authenticatedTenantFromRequest(request: Request, auth: Pas
   return (await auth.verifyBearerToken(token)).context;
 }
 
-export async function tenantFromRequest(
+async function tenantFromRequest(
   request: Request,
   auth?: PasswordAuthService,
   cookie?: Required<NitroAuthCookieOptions>,
@@ -383,7 +283,7 @@ export async function tenantFromRequest(
   };
 }
 
-export function sessionTokenFromEvent(event: H3Event, cookie?: Required<NitroAuthCookieOptions>): string | undefined {
+function sessionTokenFromEvent(event: H3Event, cookie?: Required<NitroAuthCookieOptions>): string | undefined {
   return bearerToken(event.req.headers.get("authorization")) ?? (cookie ? getCookie(event, cookie.name) : undefined);
 }
 
@@ -578,7 +478,7 @@ function isUnsafeMethod(method: string): boolean {
   return method !== "GET" && method !== "HEAD" && method !== "OPTIONS";
 }
 
-export function setSessionCookie(event: H3Event, token: string, expiresAt: string, cookie?: Required<NitroAuthCookieOptions>): void {
+function setSessionCookie(event: H3Event, token: string, expiresAt: string, cookie?: Required<NitroAuthCookieOptions>): void {
   if (!cookie) {
     return;
   }
@@ -592,7 +492,7 @@ export function setSessionCookie(event: H3Event, token: string, expiresAt: strin
   });
 }
 
-export function clearSessionCookie(event: H3Event, cookie?: Required<NitroAuthCookieOptions>): void {
+function clearSessionCookie(event: H3Event, cookie?: Required<NitroAuthCookieOptions>): void {
   if (!cookie) {
     return;
   }
@@ -618,14 +518,14 @@ function cookieValue(header: string | null, name: string): string | undefined {
   return undefined;
 }
 
-export function assertAuthManager(tenant: TenantContext): void {
+function assertAuthManager(tenant: TenantContext): void {
   if (tenant.permissions.includes("*") || tenant.permissions.includes("framekit.auth.manage") || tenant.roles.includes("administrator")) {
     return;
   }
   throw new FramekitError("FORBIDDEN", "Missing permission to manage authentication resources.", 403);
 }
 
-export function assertOperationPermission(tenant: TenantContext, permission: string, operation: string): void {
+function assertOperationPermission(tenant: TenantContext, permission: string, operation: string): void {
   if (tenant.permissions.includes("*") || tenant.permissions.includes(permission)) {
     return;
   }
@@ -666,7 +566,7 @@ function requestKey(request: Request, trustProxy: boolean): string {
   return request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || request.headers.get("x-real-ip") || "trusted-proxy-unknown";
 }
 
-export function mutationOptions(request: Request): { expectedRevision?: number; idempotencyKey?: string } {
+function mutationOptions(request: Request): { expectedRevision?: number; idempotencyKey?: string } {
   const ifMatch = request.headers.get("if-match")?.replaceAll('"', "");
   const expectedRevision = ifMatch === undefined ? undefined : Number(ifMatch);
   if (expectedRevision !== undefined && (!Number.isInteger(expectedRevision) || expectedRevision < 1)) {
@@ -678,7 +578,7 @@ export function mutationOptions(request: Request): { expectedRevision?: number; 
   };
 }
 
-export async function runHealthChecks(checks: Record<string, NitroHealthCheck>, timeoutMs: number) {
+async function runHealthChecks(checks: Record<string, NitroHealthCheck>, timeoutMs: number) {
   const boundedTimeoutMs = Math.max(1, Math.min(timeoutMs, 30_000));
   const entries = await Promise.all(Object.entries(checks).map(async ([name, check]) => {
     const controller = new AbortController();
@@ -711,7 +611,7 @@ export async function runHealthChecks(checks: Record<string, NitroHealthCheck>, 
   };
 }
 
-export function parseFilters(value: unknown): Record<string, FilterValue> | undefined {
+function parseFilters(value: unknown): Record<string, FilterValue> | undefined {
   if (typeof value !== "string" || value.trim() === "") {
     return undefined;
   }
@@ -731,7 +631,7 @@ export function parseFilters(value: unknown): Record<string, FilterValue> | unde
   return filters;
 }
 
-export function parseSort(value: unknown): { field: string; direction?: "asc" | "desc" } | undefined {
+function parseSort(value: unknown): { field: string; direction?: "asc" | "desc" } | undefined {
   if (typeof value !== "string" || value.trim() === "") {
     return undefined;
   }
@@ -746,7 +646,7 @@ export function parseSort(value: unknown): { field: string; direction?: "asc" | 
   return direction ? { field, direction } : { field };
 }
 
-export function parseFields(value: unknown): string[] | undefined {
+function parseFields(value: unknown): string[] | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -773,13 +673,13 @@ function toFilterValue(value: unknown): FilterValue {
   throw new FramekitError("VALIDATION_FAILED", "filters may only contain primitive values, arrays, or operator objects.", 422);
 }
 
-export function isPlainObject(value: unknown): value is Record<string, unknown> {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 }
 
-export function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal, after?: string): Response {
+function createRealtimeStream(runtime: FramekitRuntime, tenant: TenantContext, signal: AbortSignal, after?: string): Response {
   const encoder = new TextEncoder();
   let unsubscribe: (() => void) | undefined;
   let closed = false;
