@@ -4,6 +4,7 @@
     "lib": ["ES2023", "DOM"],
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    "customConditions": ["development"],
     "allowJs": true,
     "checkJs": true,
     "esModuleInterop": true,
