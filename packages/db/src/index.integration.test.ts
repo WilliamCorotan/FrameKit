@@ -236,10 +236,12 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
 
     const nextApp = defineApp({
       name: "Postgres Integration",
+      localization: app.localization,
       modules: [
         defineModule({
           id: "crm",
           name: "CRM",
+          settings: app.modules[0]!.settings,
           doctypes: [
             defineDocType({
               ...customerDocType,
@@ -255,6 +257,11 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       ]
     });
     const plan = await runtime.planMigration(tenant, nextApp);
+    expect(plan.changes).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "add_setting" }),
+      expect.objectContaining({ kind: "remove_setting" }),
+      expect.objectContaining({ kind: "change_setting" })
+    ]));
     await runtime.applyMigration(tenant, plan);
     await expect(runtime.migrationHistory(tenant)).resolves.toEqual([
       expect.objectContaining({ id: plan.id, checksum: plan.checksum, changes: expect.arrayContaining([expect.objectContaining({ field: "segment" })]) })
