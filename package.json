@@ -15,7 +15,7 @@
     "dev:frontend:solid": "pnpm --filter @framekit/example-frontend-solid dev",
     "dev:frontend:vanilla": "pnpm --filter @framekit/example-frontend-vanilla dev",
     "build:frontends": "pnpm --filter @framekit/sdk build && pnpm --filter './examples/frontends/*' build",
-    "lint": "tsc -p tsconfig.check.json --noEmit",
+    "lint": "tsc -p tsconfig.check.json --noEmit && pnpm typecheck:frontends",
     "release:candidate": "node scripts/release-candidate.mjs",
     "release:candidate:check": "node scripts/release-candidate.mjs --check",
     "release:prepare": "node scripts/prepare-release.mjs",

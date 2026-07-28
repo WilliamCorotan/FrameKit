@@ -4,19 +4,19 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { publicPackages } from "./public-packages.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const keep = process.argv.includes("--keep");
 const temporaryRoot = await mkdtemp(join(tmpdir(), "framekit-standalone-"));
 const packs = join(temporaryRoot, "packs");
 const harness = join(temporaryRoot, "harness");
-const packageNames = ["auth", "cli", "core", "db", "jobs", "nitro", "openapi", "realtime", "runtime", "sdk"];
 
 try {
   await mkdir(packs, { recursive: true });
   const tarballs = new Map();
-  for (const directory of packageNames) {
-    run("pnpm", ["--filter", `@framekit/${directory}`, "pack", "--pack-destination", packs], root);
+  for (const { directory, name } of publicPackages) {
+    run("pnpm", ["--filter", name, "pack", "--pack-destination", packs], root);
     const manifest = JSON.parse(await readFile(join(root, "packages", directory, "package.json"), "utf8"));
     const prefix = `${manifest.name.replace("@", "").replace("/", "-")}-${manifest.version}`;
     const filename = (await readdir(packs)).find((candidate) => candidate.startsWith(prefix) && candidate.endsWith(".tgz"));

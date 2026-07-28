@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { publicPackageDirectories } from "./public-packages.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const args = new Set(process.argv.slice(2));
@@ -18,18 +19,7 @@ for (let index = 2; index < process.argv.length; index += 1) {
 }
 
 const rootPackage = readJson("package.json");
-const packages = [
-  "auth",
-  "cli",
-  "core",
-  "db",
-  "jobs",
-  "nitro",
-  "openapi",
-  "realtime",
-  "runtime",
-  "sdk"
-].map((name) => readJson(`packages/${name}/package.json`));
+const packages = publicPackageDirectories.map((directory) => readJson(`packages/${directory}/package.json`));
 
 const version = values.get("--version") ?? rootPackage.version;
 const mismatched = packages.filter((pkg) => pkg.version !== version);

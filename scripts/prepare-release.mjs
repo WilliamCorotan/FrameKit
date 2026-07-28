@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { publicPackageDirectories } from "./public-packages.mjs";
 import { isValidSemVer } from "./semver.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -10,7 +11,6 @@ const args = process.argv.slice(2);
 const version = option("--version");
 const write = args.includes("--write");
 const tag = args.includes("--tag");
-const packageDirectories = ["auth", "cli", "core", "db", "jobs", "nitro", "openapi", "realtime", "runtime", "sdk"];
 
 if (!isValidSemVer(version)) {
   throw new Error("Usage: pnpm release:prepare -- --version <semver> [--write] [--tag]");
@@ -22,7 +22,7 @@ if (git(["tag", "--list", `v${version}`])) throw new Error(`Tag v${version} alre
 const commits = git(["log", "--pretty=format:- %s", `${lastTag() ? `${lastTag()}..HEAD` : "HEAD"}`]) || "- Initial release";
 const date = new Date().toISOString().slice(0, 10);
 const changelogEntry = `## ${version} - ${date}\n\n${commits}\n\n`;
-const paths = ["package.json", ...packageDirectories.map((directory) => `packages/${directory}/package.json`)];
+const paths = ["package.json", ...publicPackageDirectories.map((directory) => `packages/${directory}/package.json`)];
 
 process.stdout.write(`Framekit release ${version}\n`);
 process.stdout.write(`${paths.length} manifests, CHANGELOG.md${tag ? ", commit, and annotated tag" : ""}\n`);
@@ -43,7 +43,7 @@ await writeFile(changelogPath, changelog.replace(/^# Changelog\s*/, `# Changelog
 execFileSync("pnpm", ["install", "--lockfile-only"], { cwd: root, stdio: "inherit" });
 
 if (tag) {
-  execFileSync("git", ["add", "package.json", "pnpm-lock.yaml", "CHANGELOG.md", ...packageDirectories.map((directory) => `packages/${directory}/package.json`)], { cwd: root });
+  execFileSync("git", ["add", "package.json", "pnpm-lock.yaml", "CHANGELOG.md", ...publicPackageDirectories.map((directory) => `packages/${directory}/package.json`)], { cwd: root });
   execFileSync("git", ["commit", "-m", `chore(release): v${version}`], { cwd: root, stdio: "inherit" });
   execFileSync("git", ["tag", "-a", `v${version}`, "-m", `Framekit v${version}`], { cwd: root, stdio: "inherit" });
 }
