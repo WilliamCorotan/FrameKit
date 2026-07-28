@@ -1,0 +1,614 @@
+import { FramekitError } from "@framekit/core";
+import type { ApiTokenSession, ApiTokenStore, AuthAuditEvent, AuthAuditSink, AuthIdentityLink, AuthIdentityLinkingPolicy, AuthIdentityLinkStore, AuthIdentityProvider, AuthProviderIdentity, AuthLifecycleToken, AuthLifecycleTokenKind, AuthLifecycleTokenStore, AuthRole, AuthSession, AuthUser, CreatedApiToken, CreateApiTokenInput, PasswordAuthOptions, PublicApiToken, PublicAuthUser, RoleStore, SessionRevocationStore, UpsertUserInput } from "./contracts.js";
+import { base64UrlDecode, base64UrlEncode, constantEqual, hashApiToken, hashOpaqueToken, randomTokenSecret, sign } from "./crypto.js";
+import { InMemoryApiTokenStore, InMemoryAuthIdentityLinkStore, InMemoryAuthLifecycleTokenStore, InMemoryRoleStore, InMemorySessionRevocationStore, NoopAuthAuditSink } from "./in-memory-stores.js";
+import { hashPassword, verifyPassword, assertSecureAuthSecret } from "./password-policy.js";
+import { authErrorCode, authErrorTenant, normalizeEmail, normalizeExpiresAt, normalizeRequiredFutureDate, publicApiToken, publicUser, safeReturnTo } from "./shared.js";
+
+type SessionPayload = {
+  sub: string;
+  tenantId: string;
+  email: string;
+  name: string;
+  roles: string[];
+  permissions: string[];
+  exp: number;
+  jti?: string;
+};
+
+export class PasswordAuthService {
+  private readonly sessionTtlSeconds: number;
+  private readonly roleStore: RoleStore;
+  private readonly apiTokenStore: ApiTokenStore;
+  private readonly sessionRevocations: SessionRevocationStore;
+  private readonly audit: AuthAuditSink;
+  private readonly providers: Map<string, AuthIdentityProvider>;
+  private readonly identityLinks: AuthIdentityLinkStore;
+  private readonly lifecycleTokens: AuthLifecycleTokenStore;
+  private readonly identityLinkingPolicy: AuthIdentityLinkingPolicy;
+  private readonly maxFailedLoginAttempts: number;
+  private readonly lockoutSeconds: number;
+  private readonly invitationTtlSeconds: number;
+  private readonly recoveryTtlSeconds: number;
+
+  constructor(private readonly options: PasswordAuthOptions) {
+    assertSecureAuthSecret(options.secret);
+    this.sessionTtlSeconds = options.sessionTtlSeconds ?? 60 * 60 * 8;
+    this.roleStore = options.roleStore ?? new InMemoryRoleStore([]);
+    this.apiTokenStore = options.apiTokenStore ?? new InMemoryApiTokenStore([]);
+    this.sessionRevocations = options.sessionRevocations ?? new InMemorySessionRevocationStore();
+    this.audit = options.audit ?? new NoopAuthAuditSink();
+    this.providers = new Map((options.providers ?? []).map((provider) => [provider.id, provider]));
+    this.identityLinks = options.identityLinks ?? new InMemoryAuthIdentityLinkStore([]);
+    this.lifecycleTokens = options.lifecycleTokens ?? new InMemoryAuthLifecycleTokenStore([]);
+    this.identityLinkingPolicy = options.identityLinkingPolicy ?? { mode: "linked" };
+    this.maxFailedLoginAttempts = options.maxFailedLoginAttempts ?? 5;
+    this.lockoutSeconds = options.lockoutSeconds ?? 15 * 60;
+    this.invitationTtlSeconds = options.invitationTtlSeconds ?? 72 * 60 * 60;
+    this.recoveryTtlSeconds = options.recoveryTtlSeconds ?? 30 * 60;
+  }
+
+  async login(email: string, password: string, tenantId = "default"): Promise<AuthSession> {
+    let user = await this.options.userStore.findByEmail(normalizeEmail(email), tenantId);
+    if (!user) {
+      await this.recordAuthAudit({ tenantId, action: "login.failed", success: false, details: { email: normalizeEmail(email), reason: "not_found" } });
+      throw new FramekitError("INVALID_LOGIN", "Invalid email or password.", 401);
+    }
+    user = await this.normalizeExpiredLockout(user);
+    this.assertUserCanLogin(user);
+    if (!(await verifyPassword(password, user.passwordHash))) {
+      await this.recordFailedLogin(user);
+      await this.recordAuthAudit({ tenantId, targetUserId: user.id, action: "login.failed", success: false, details: { email: user.email, reason: "invalid_password" } });
+      throw new FramekitError("INVALID_LOGIN", "Invalid email or password.", 401);
+    }
+    if ((user.failedLoginAttempts ?? 0) > 0 || user.lockedUntil) {
+      user = await this.persistUserAuthState(user, { failedLoginAttempts: 0, lockedUntil: undefined });
+    }
+    const session = await this.createSession(user);
+    await this.recordAuthAudit({ tenantId, actorUserId: user.id, targetUserId: user.id, action: "login.succeeded", success: true, details: { sessionId: session.sessionId } });
+    return session;
+  }
+
+  async loginWithProvider(providerId: string, token: string, tenantId = "default"): Promise<AuthSession> {
+    const provider = this.providers.get(providerId);
+    if (!provider) {
+      throw new FramekitError("AUTH_PROVIDER_NOT_FOUND", `No auth provider with id "${providerId}"`, 404);
+    }
+    const identity = await provider.authenticate({ token, tenantId });
+    if (identity.tenantId && identity.tenantId !== tenantId) {
+      await this.recordAuthAudit({ tenantId, action: "provider_login.failed", success: false, details: { providerId, subject: identity.subject, reason: "tenant_mismatch" } });
+      throw new FramekitError("PROVIDER_TENANT_MISMATCH", "Provider identity tenant did not match the requested tenant.", 401);
+    }
+    return this.loginWithProviderIdentity(providerId, identity, tenantId);
+  }
+
+  async beginProviderAuthorization(providerId: string, input: { tenantId?: string; returnTo?: string } = {}): Promise<{ authorizationUrl: string }> {
+    const provider = this.providers.get(providerId);
+    if (!provider?.beginAuthorization) {
+      throw new FramekitError("OIDC_CODE_FLOW_NOT_CONFIGURED", `Provider "${providerId}" does not support authorization-code flow.`, 501);
+    }
+    const tenantId = input.tenantId ?? "default";
+    const result = await provider.beginAuthorization({ tenantId, returnTo: safeReturnTo(input.returnTo) });
+    await this.recordAuthAudit({ tenantId, action: "provider_authorization.started", success: true, details: { providerId } });
+    return { authorizationUrl: result.authorizationUrl };
+  }
+
+  async completeProviderAuthorization(providerId: string, input: { code: string; state: string }): Promise<{ session: AuthSession; returnTo: string }> {
+    const provider = this.providers.get(providerId);
+    if (!provider?.completeAuthorization) {
+      throw new FramekitError("OIDC_CODE_FLOW_NOT_CONFIGURED", `Provider "${providerId}" does not support authorization-code flow.`, 501);
+    }
+    try {
+      const result = await provider.completeAuthorization(input);
+      return { session: await this.loginWithProviderIdentity(providerId, result.identity, result.identity.tenantId ?? "default"), returnTo: result.returnTo };
+    } catch (error) {
+      await this.recordAuthAudit({ tenantId: authErrorTenant(error) ?? "default", action: "provider_authorization.failed", success: false, details: { providerId, reason: authErrorCode(error) } });
+      throw error;
+    }
+  }
+
+  private async loginWithProviderIdentity(providerId: string, identity: AuthProviderIdentity, tenantId: string): Promise<AuthSession> {
+    const resolvedTenantId = identity.tenantId ?? tenantId;
+    if (identity.providerId !== providerId) {
+      await this.recordAuthAudit({
+        tenantId: resolvedTenantId,
+        action: "provider_login.failed",
+        success: false,
+        details: { providerId, returnedProviderId: identity.providerId, subject: identity.subject, reason: "provider_mismatch" }
+      });
+      throw new FramekitError("PROVIDER_ID_MISMATCH", "Provider identity did not match the selected provider.", 401);
+    }
+    const user = await this.resolveProviderUser(identity, resolvedTenantId);
+    if (!user) {
+      await this.recordAuthAudit({
+        tenantId: resolvedTenantId,
+        action: "provider_login.failed",
+        success: false,
+        details: {
+          providerId,
+          subject: identity.subject,
+          email: normalizeEmail(identity.email),
+          policy: this.identityLinkingPolicy.mode,
+          reason: "user_not_found"
+        }
+      });
+      throw new FramekitError("PROVIDER_USER_NOT_FOUND", "Provider identity is not linked to a user.", 401);
+    }
+    this.assertUserCanLogin(user);
+    const session = await this.createSession(user);
+    await this.recordAuthAudit({
+      tenantId: resolvedTenantId,
+      actorUserId: user.id,
+      targetUserId: user.id,
+      action: "provider_login.succeeded",
+      success: true,
+      details: { providerId, subject: identity.subject, sessionId: session.sessionId }
+    });
+    return session;
+  }
+
+  async linkProviderIdentity(input: { tenantId: string; providerId: string; subject: string; userId: string; email?: string }): Promise<AuthIdentityLink> {
+    const user = await this.options.userStore.findById(input.tenantId, input.userId);
+    if (!user) {
+      throw new FramekitError("USER_NOT_FOUND", `No user with id "${input.userId}"`, 404);
+    }
+    const now = new Date().toISOString();
+    const existing = await this.identityLinks.find(input.tenantId, input.providerId, input.subject);
+    if (existing && existing.userId !== input.userId) {
+      await this.recordAuthAudit({
+        tenantId: input.tenantId,
+        targetUserId: input.userId,
+        action: "provider_identity.link_failed",
+        success: false,
+        details: { providerId: input.providerId, subject: input.subject, reason: "subject_collision" }
+      });
+      throw new FramekitError("PROVIDER_IDENTITY_COLLISION", "Provider subject is already linked to another user in this tenant.", 409);
+    }
+    const link = await this.identityLinks.upsert({
+      tenantId: input.tenantId,
+      providerId: input.providerId,
+      subject: input.subject,
+      userId: input.userId,
+      email: input.email ? normalizeEmail(input.email) : undefined,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now
+    });
+    await this.recordAuthAudit({
+      tenantId: input.tenantId,
+      targetUserId: input.userId,
+      action: "provider_identity.linked",
+      success: true,
+      details: { providerId: input.providerId, subject: input.subject }
+    });
+    return link;
+  }
+
+  async createInvitation(input: { tenantId: string; email: string; name: string; roles: string[]; permissions: string[]; expiresAt?: string }): Promise<{ token: string; expiresAt: string }> {
+    const email = normalizeEmail(input.email);
+    if (await this.options.userStore.findByEmail(email, input.tenantId)) {
+      await this.recordAuthAudit({ tenantId: input.tenantId, action: "invitation.create_failed", success: false, details: { email, reason: "user_exists" } });
+      throw new FramekitError("USER_EXISTS", "A user with this email already exists in the tenant.", 409);
+    }
+    const issued = await this.issueLifecycleToken({ ...input, email, kind: "invitation", ttlSeconds: this.invitationTtlSeconds });
+    await this.recordAuthAudit({ tenantId: input.tenantId, action: "invitation.created", success: true, details: { invitationId: issued.record.id, email, expiresAt: issued.record.expiresAt } });
+    return { token: issued.token, expiresAt: issued.record.expiresAt };
+  }
+
+  async acceptInvitation(input: { tenantId: string; token: string; password: string }): Promise<AuthSession> {
+    const record = await this.consumeLifecycleToken(input.tenantId, "invitation", input.token);
+    if (!record.email || !record.name) throw new FramekitError("INVALID_LIFECYCLE_TOKEN", "Invitation is incomplete.", 401);
+    if (await this.options.userStore.findByEmail(record.email, input.tenantId)) {
+      throw new FramekitError("USER_EXISTS", "A user with this email already exists in the tenant.", 409);
+    }
+    const user = await this.options.userStore.upsert({
+      id: crypto.randomUUID(), tenantId: input.tenantId, email: record.email, name: record.name,
+      passwordHash: await hashPassword(input.password), roles: record.roles ?? [], permissions: record.permissions ?? [], failedLoginAttempts: 0
+    });
+    await this.recordAuthAudit({ tenantId: input.tenantId, actorUserId: user.id, targetUserId: user.id, action: "invitation.accepted", success: true, details: { invitationId: record.id } });
+    return this.createSession(user);
+  }
+
+  async requestPasswordReset(tenantId: string, email: string): Promise<{ token?: string; expiresAt?: string }> {
+    const user = await this.options.userStore.findByEmail(normalizeEmail(email), tenantId);
+    if (!user || user.disabledAt) {
+      await this.recordAuthAudit({ tenantId, targetUserId: user?.id, action: "password_reset.requested", success: false, details: { reason: user?.disabledAt ? "disabled" : "not_found" } });
+      return {};
+    }
+    const issued = await this.issueLifecycleToken({ tenantId, userId: user.id, kind: "password_reset", ttlSeconds: this.recoveryTtlSeconds });
+    try {
+      await this.options.lifecycleDelivery?.({ kind: "password_reset", tenantId, userId: user.id, email: user.email, token: issued.token, expiresAt: issued.record.expiresAt });
+    } catch {
+      await this.recordAuthAudit({ tenantId, targetUserId: user.id, action: "password_reset.delivery_failed", success: false, details: { tokenId: issued.record.id } });
+    }
+    await this.recordAuthAudit({ tenantId, targetUserId: user.id, action: "password_reset.requested", success: true, details: { tokenId: issued.record.id, expiresAt: issued.record.expiresAt } });
+    return { token: issued.token, expiresAt: issued.record.expiresAt };
+  }
+
+  async createRecoveryToken(tenantId: string, userId: string): Promise<{ token: string; expiresAt: string }> {
+    const user = await this.options.userStore.findById(tenantId, userId);
+    if (!user) {
+      await this.recordAuthAudit({ tenantId, targetUserId: userId, action: "recovery.create_failed", success: false, details: { reason: "not_found" } });
+      throw new FramekitError("USER_NOT_FOUND", `No user with id "${userId}"`, 404);
+    }
+    try {
+      this.assertUserCanLogin(user);
+    } catch (error) {
+      await this.recordAuthAudit({ tenantId, targetUserId: userId, action: "recovery.create_failed", success: false, details: { reason: authErrorCode(error) } });
+      throw error;
+    }
+    const issued = await this.issueLifecycleToken({ tenantId, userId, kind: "recovery", ttlSeconds: this.recoveryTtlSeconds });
+    await this.recordAuthAudit({ tenantId, targetUserId: userId, action: "recovery.created", success: true, details: { tokenId: issued.record.id, expiresAt: issued.record.expiresAt } });
+    return { token: issued.token, expiresAt: issued.record.expiresAt };
+  }
+
+  async completePasswordRecovery(input: { tenantId: string; token: string; newPassword: string; kind?: "password_reset" | "recovery" }): Promise<void> {
+    const kind = input.kind ?? "password_reset";
+    const record = await this.consumeLifecycleToken(input.tenantId, kind, input.token);
+    if (!record.userId) throw new FramekitError("INVALID_LIFECYCLE_TOKEN", "Recovery token has no user.", 401);
+    const user = await this.options.userStore.findById(input.tenantId, record.userId);
+    if (!user) throw new FramekitError("USER_NOT_FOUND", "Recovery user no longer exists.", 404);
+    try {
+      this.assertUserCanLogin(user);
+    } catch (error) {
+      await this.recordAuthAudit({ tenantId: input.tenantId, targetUserId: record.userId, action: `${kind}.failed`, success: false, details: { tokenId: record.id, reason: authErrorCode(error) } });
+      throw error;
+    }
+    await this.options.userStore.upsert({ ...user, passwordHash: await hashPassword(input.newPassword), failedLoginAttempts: 0, lockedUntil: undefined });
+    await this.recordAuthAudit({ tenantId: input.tenantId, targetUserId: user.id, action: `${kind}.completed`, success: true, details: { tokenId: record.id } });
+  }
+
+  async verifyBearerToken(token: string): Promise<AuthSession | ApiTokenSession> {
+    if (token.startsWith("fkat_")) {
+      return this.verifyApiToken(token);
+    }
+    return this.verifyToken(token);
+  }
+
+  async verifyToken(token: string): Promise<AuthSession> {
+    const [encodedPayload, signature] = token.split(".");
+    if (!encodedPayload || !signature) {
+      throw new FramekitError("INVALID_SESSION", "Session token is malformed.", 401);
+    }
+    const expected = await sign(encodedPayload, this.options.secret);
+    if (!constantEqual(signature, expected)) {
+      throw new FramekitError("INVALID_SESSION", "Session token signature is invalid.", 401);
+    }
+    const payload = JSON.parse(base64UrlDecode(encodedPayload)) as SessionPayload;
+    if (payload.exp <= Math.floor(Date.now() / 1000)) {
+      throw new FramekitError("SESSION_EXPIRED", "Session token has expired.", 401);
+    }
+    if (payload.jti && await this.sessionRevocations.isRevoked(payload.jti)) {
+      throw new FramekitError("SESSION_REVOKED", "Session token has been revoked.", 401);
+    }
+    const user = await this.options.userStore.findById(payload.tenantId, payload.sub);
+    if (!user) {
+      throw new FramekitError("INVALID_SESSION", "Session user no longer exists.", 401);
+    }
+    this.assertUserCanLogin(user);
+    return this.sessionFromUser(user, token, new Date(payload.exp * 1000).toISOString(), payload.jti);
+  }
+
+  async verifyApiToken(token: string): Promise<ApiTokenSession> {
+    const tokenHash = await hashApiToken(token);
+    const record = await this.apiTokenStore.findByTokenHash(tokenHash);
+    if (!record || record.revokedAt) {
+      throw new FramekitError("INVALID_API_TOKEN", "API token is invalid or revoked.", 401);
+    }
+    if (record.expiresAt && new Date(record.expiresAt).getTime() <= Date.now()) {
+      throw new FramekitError("API_TOKEN_EXPIRED", "API token has expired.", 401);
+    }
+    const user = record.userId ? await this.options.userStore.findById(record.tenantId, record.userId) : undefined;
+    if (user) {
+      this.assertUserCanLogin(user);
+    }
+    const permissions = await this.permissionsFor(record.tenantId, record.roles, record.permissions);
+    return {
+      token,
+      apiToken: publicApiToken(record),
+      user: user ? publicUser(user) : undefined,
+      context: {
+        tenantId: record.tenantId,
+        userId: record.userId ?? `api-token:${record.id}`,
+        roles: record.roles,
+        permissions
+      }
+    };
+  }
+
+  async createSession(user: AuthUser): Promise<AuthSession> {
+    const expiresAt = Math.floor(Date.now() / 1000) + this.sessionTtlSeconds;
+    const sessionId = crypto.randomUUID();
+    const payload: SessionPayload = {
+      sub: user.id,
+      tenantId: user.tenantId,
+      email: user.email,
+      name: user.name,
+      roles: user.roles,
+      permissions: user.permissions,
+      exp: expiresAt,
+      jti: sessionId
+    };
+    const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+    const token = `${encodedPayload}.${await sign(encodedPayload, this.options.secret)}`;
+    return this.sessionFromUser(user, token, new Date(expiresAt * 1000).toISOString(), sessionId);
+  }
+
+  async refreshSession(token: string): Promise<AuthSession> {
+    const current = await this.verifyToken(token);
+    await this.revokeSession(token);
+    const user = await this.options.userStore.findById(current.context.tenantId, current.context.userId);
+    if (!user) {
+      throw new FramekitError("INVALID_SESSION", "Session user no longer exists.", 401);
+    }
+    const session = await this.createSession(user);
+    await this.recordAuthAudit({
+      tenantId: current.context.tenantId,
+      actorUserId: current.context.userId,
+      targetUserId: current.context.userId,
+      action: "session.refreshed",
+      success: true,
+      details: { previousSessionId: current.sessionId, sessionId: session.sessionId }
+    });
+    return session;
+  }
+
+  async revokeSession(token: string): Promise<void> {
+    const [encodedPayload, signature] = token.split(".");
+    if (!encodedPayload || !signature) {
+      throw new FramekitError("INVALID_SESSION", "Session token is malformed.", 401);
+    }
+    const expected = await sign(encodedPayload, this.options.secret);
+    if (!constantEqual(signature, expected)) {
+      throw new FramekitError("INVALID_SESSION", "Session token signature is invalid.", 401);
+    }
+    const payload = JSON.parse(base64UrlDecode(encodedPayload)) as SessionPayload;
+    if (payload.jti) {
+      await this.sessionRevocations.revoke(payload.jti, new Date(payload.exp * 1000).toISOString());
+      await this.recordAuthAudit({
+        tenantId: payload.tenantId,
+        actorUserId: payload.sub,
+        targetUserId: payload.sub,
+        action: "session.revoked",
+        success: true,
+        details: { sessionId: payload.jti }
+      });
+    }
+  }
+
+  async listUsers(tenantId: string): Promise<PublicAuthUser[]> {
+    return (await this.options.userStore.list(tenantId)).map(publicUser);
+  }
+
+  async upsertUser(input: UpsertUserInput): Promise<PublicAuthUser> {
+    const id = input.id ?? crypto.randomUUID();
+    const existing = await this.options.userStore.findById(input.tenantId, id);
+    if (!existing && !input.password) {
+      throw new FramekitError("VALIDATION_FAILED", "Password is required for new users.", 422);
+    }
+    const user = await this.options.userStore.upsert({
+      id,
+      tenantId: input.tenantId,
+      email: normalizeEmail(input.email),
+      name: input.name,
+      passwordHash: input.password ? await hashPassword(input.password) : existing!.passwordHash,
+      roles: input.roles,
+      permissions: input.permissions,
+      disabledAt: input.disabledAt ?? existing?.disabledAt,
+      lockedUntil: input.lockedUntil ?? existing?.lockedUntil,
+      failedLoginAttempts: existing?.failedLoginAttempts ?? 0
+    });
+    await this.recordAuthAudit({
+      tenantId: input.tenantId,
+      targetUserId: user.id,
+      action: existing ? "user.updated" : "user.created",
+      success: true,
+      details: { email: user.email, roles: user.roles, permissions: user.permissions, disabled: Boolean(user.disabledAt) }
+    });
+    return publicUser(user);
+  }
+
+  async deleteUser(tenantId: string, userId: string): Promise<void> {
+    await this.options.userStore.delete(tenantId, userId);
+    await this.recordAuthAudit({ tenantId, targetUserId: userId, action: "user.deleted", success: true });
+  }
+
+  async changePassword(tenantId: string, userId: string, currentPassword: string, newPassword: string): Promise<void> {
+    const user = await this.options.userStore.findById(tenantId, userId);
+    if (!user) {
+      throw new FramekitError("USER_NOT_FOUND", `No user with id "${userId}"`, 404);
+    }
+    this.assertUserCanLogin(user);
+    if (!(await verifyPassword(currentPassword, user.passwordHash))) {
+      await this.recordFailedLogin(user);
+      throw new FramekitError("INVALID_LOGIN", "Invalid email or password.", 401);
+    }
+    await this.options.userStore.upsert({
+      ...user,
+      passwordHash: await hashPassword(newPassword),
+      failedLoginAttempts: 0,
+      lockedUntil: undefined
+    });
+    await this.recordAuthAudit({ tenantId, actorUserId: userId, targetUserId: userId, action: "password.changed", success: true });
+  }
+
+  async resetPassword(tenantId: string, userId: string, newPassword: string): Promise<void> {
+    const user = await this.options.userStore.findById(tenantId, userId);
+    if (!user) {
+      throw new FramekitError("USER_NOT_FOUND", `No user with id "${userId}"`, 404);
+    }
+    await this.options.userStore.upsert({
+      ...user,
+      passwordHash: await hashPassword(newPassword),
+      failedLoginAttempts: 0,
+      lockedUntil: undefined
+    });
+    await this.recordAuthAudit({ tenantId, targetUserId: userId, action: "password.reset", success: true });
+  }
+
+  async listRoles(tenantId: string): Promise<AuthRole[]> {
+    return this.roleStore.list(tenantId);
+  }
+
+  async upsertRole(role: AuthRole): Promise<AuthRole> {
+    const saved = await this.roleStore.upsert(role);
+    await this.recordAuthAudit({ tenantId: role.tenantId, action: "role.upserted", success: true, details: { roleId: role.id, permissions: role.permissions } });
+    return saved;
+  }
+
+  async deleteRole(tenantId: string, roleId: string): Promise<void> {
+    await this.roleStore.delete(tenantId, roleId);
+    await this.recordAuthAudit({ tenantId, action: "role.deleted", success: true, details: { roleId } });
+  }
+
+  async listApiTokens(tenantId: string): Promise<PublicApiToken[]> {
+    return (await this.apiTokenStore.list(tenantId)).map(publicApiToken);
+  }
+
+  async createApiToken(input: CreateApiTokenInput): Promise<CreatedApiToken> {
+    const expiresAt = normalizeExpiresAt(input.expiresAt);
+    const id = input.id ?? crypto.randomUUID();
+    const secret = randomTokenSecret();
+    const token = `fkat_${id.replaceAll(/[^a-zA-Z0-9_-]+/g, "_")}_${secret}`;
+    const now = new Date().toISOString();
+    const record = await this.apiTokenStore.create({
+      tenantId: input.tenantId,
+      id,
+      name: input.name,
+      tokenHash: await hashApiToken(token),
+      userId: input.userId,
+      roles: input.roles,
+      permissions: input.permissions,
+      createdAt: now,
+      expiresAt
+    });
+    await this.recordAuthAudit({ tenantId: input.tenantId, targetUserId: input.userId, action: "api_token.created", success: true, details: { tokenId: record.id, roles: record.roles } });
+    return { ...publicApiToken(record), token };
+  }
+
+  async revokeApiToken(tenantId: string, tokenId: string): Promise<PublicApiToken> {
+    const revoked = await this.apiTokenStore.revoke(tenantId, tokenId, new Date().toISOString());
+    await this.recordAuthAudit({ tenantId, targetUserId: revoked.userId, action: "api_token.revoked", success: true, details: { tokenId } });
+    return publicApiToken(revoked);
+  }
+
+  async authAuditEvents(tenantId: string): Promise<AuthAuditEvent[]> {
+    return this.audit.list ? await this.audit.list(tenantId) : [];
+  }
+
+  private async sessionFromUser(user: AuthUser, token: string, expiresAt: string, sessionId?: string): Promise<AuthSession> {
+    const permissions = await this.permissionsFor(user.tenantId, user.roles, user.permissions);
+    return {
+      token,
+      sessionId: sessionId ?? "legacy",
+      user: publicUser(user),
+      context: {
+        tenantId: user.tenantId,
+        userId: user.id,
+        roles: user.roles,
+        permissions
+      },
+      expiresAt
+    };
+  }
+
+  private async permissionsFor(tenantId: string, roles: string[], directPermissions: string[]): Promise<string[]> {
+    if (directPermissions.includes("*")) {
+      return ["*"];
+    }
+    const rolePermissions = (await this.roleStore.list(tenantId))
+      .filter((role) => roles.includes(role.id))
+      .flatMap((role) => role.permissions);
+    return [...new Set([...directPermissions, ...rolePermissions])].sort();
+  }
+
+  private async resolveProviderUser(identity: AuthProviderIdentity, tenantId: string): Promise<AuthUser | undefined> {
+    const linked = await this.identityLinks.find(tenantId, identity.providerId, identity.subject);
+    if (linked) {
+      return this.options.userStore.findById(tenantId, linked.userId);
+    }
+    if (this.identityLinkingPolicy.mode === "linked") {
+      return undefined;
+    }
+    if (!this.identityLinkingPolicy.autoLink) return undefined;
+    const user = await this.options.userStore.findByEmail(normalizeEmail(identity.email), tenantId);
+    if (user) {
+      await this.linkProviderIdentity({
+        tenantId,
+        providerId: identity.providerId,
+        subject: identity.subject,
+        userId: user.id,
+        email: identity.email
+      });
+    }
+    return user;
+  }
+
+  private assertUserCanLogin(user: AuthUser): void {
+    if (user.disabledAt) {
+      throw new FramekitError("USER_DISABLED", "User account is disabled.", 403);
+    }
+    if (user.lockedUntil && new Date(user.lockedUntil).getTime() > Date.now()) {
+      throw new FramekitError("USER_LOCKED", "User account is temporarily locked.", 423, { lockedUntil: user.lockedUntil });
+    }
+  }
+
+  private async normalizeExpiredLockout(user: AuthUser): Promise<AuthUser> {
+    if (user.lockedUntil && new Date(user.lockedUntil).getTime() <= Date.now()) {
+      return this.persistUserAuthState(user, { failedLoginAttempts: 0, lockedUntil: undefined });
+    }
+    return user;
+  }
+
+  private async recordFailedLogin(user: AuthUser): Promise<void> {
+    const failedLoginAttempts = (user.failedLoginAttempts ?? 0) + 1;
+    const lockedUntil = failedLoginAttempts >= this.maxFailedLoginAttempts
+      ? new Date(Date.now() + this.lockoutSeconds * 1000).toISOString()
+      : user.lockedUntil;
+    await this.persistUserAuthState(user, { failedLoginAttempts, lockedUntil });
+  }
+
+  private async persistUserAuthState(user: AuthUser, patch: Partial<Pick<AuthUser, "failedLoginAttempts" | "lockedUntil">>): Promise<AuthUser> {
+    const next = { ...user, ...patch };
+    await this.options.userStore.upsert(next);
+    return next;
+  }
+
+  private async issueLifecycleToken(input: {
+    tenantId: string;
+    kind: AuthLifecycleTokenKind;
+    ttlSeconds: number;
+    expiresAt?: string;
+    email?: string;
+    userId?: string;
+    name?: string;
+    roles?: string[];
+    permissions?: string[];
+  }): Promise<{ token: string; record: AuthLifecycleToken }> {
+    const token = randomTokenSecret();
+    const createdAt = new Date().toISOString();
+    const expiresAt = input.expiresAt ? normalizeRequiredFutureDate(input.expiresAt) : new Date(Date.now() + input.ttlSeconds * 1000).toISOString();
+    const record = await this.lifecycleTokens.create({
+      id: crypto.randomUUID(), tenantId: input.tenantId, kind: input.kind, tokenHash: await hashOpaqueToken(token),
+      email: input.email, userId: input.userId, name: input.name, roles: input.roles ? [...input.roles] : undefined,
+      permissions: input.permissions ? [...input.permissions] : undefined, createdAt, expiresAt
+    });
+    return { token, record };
+  }
+
+  private async consumeLifecycleToken(tenantId: string, kind: AuthLifecycleTokenKind, token: string): Promise<AuthLifecycleToken> {
+    const record = await this.lifecycleTokens.consume(tenantId, kind, await hashOpaqueToken(token), new Date().toISOString());
+    if (!record) {
+      await this.recordAuthAudit({ tenantId, action: `${kind}.failed`, success: false, details: { reason: "invalid_expired_or_replayed" } });
+      throw new FramekitError("INVALID_LIFECYCLE_TOKEN", "Lifecycle token is invalid, expired, or already used.", 401);
+    }
+    return record;
+  }
+
+  private async recordAuthAudit(input: Omit<AuthAuditEvent, "id" | "createdAt">): Promise<void> {
+    await this.audit.record({
+      id: crypto.randomUUID(),
+      createdAt: new Date().toISOString(),
+      ...input
+    });
+  }
+}

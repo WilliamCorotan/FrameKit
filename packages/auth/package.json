@@ -28,7 +28,14 @@
   "description": "Framekit authentication stores and services.",
   "files": [
     "dist",
-    "src/index.ts"
+    "src/contracts.ts",
+    "src/crypto.ts",
+    "src/in-memory-stores.ts",
+    "src/index.ts",
+    "src/oidc-providers.ts",
+    "src/password-auth-service.ts",
+    "src/password-policy.ts",
+    "src/shared.ts"
   ],
   "engines": { "node": ">=22 <26" },
   "publishConfig": {
