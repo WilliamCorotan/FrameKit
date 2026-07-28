@@ -21,7 +21,7 @@ import {
 } from "./index.js";
 import { indexIdentifier } from "./migration-sql-helpers.js";
 import { framekitAuditEvents, framekitAuthIdentityLinks, framekitCustomFields, framekitOutboxEvents, framekitSessionRevocations, framekitViews } from "./schema.js";
-import { fixedSchema, type FixedSchemaTable } from "./schema-contract.js";
+import { fixedSchema, type FixedSchemaColumn, type FixedSchemaTable } from "./schema-contract.js";
 
 describe("db migration sql", () => {
   it("normalizes adversarial migration identifiers in linear time", () => {
@@ -68,7 +68,7 @@ describe("db migration sql", () => {
     const drizzleIndexes = [
       ...getTableConfig(framekitSessionRevocations).indexes,
       ...getTableConfig(framekitAuthIdentityLinks).indexes
-    ].map((index) => ({ name: index.config.name, unique: index.config.unique, columns: index.config.columns.map((column) => column.name) }));
+    ].map((index) => ({ name: index.config.name, unique: index.config.unique, columns: index.config.columns.map(indexColumnName) }));
     expect(parseIndexes(ddl).filter((index) => drizzleIndexes.some((candidate) => candidate.name === index.name))).toEqual(drizzleIndexes);
   });
 
@@ -92,7 +92,7 @@ describe("db migration sql", () => {
       expect(drizzle.indexes.map((index) => ({
         name: index.config.name,
         unique: index.config.unique,
-        columns: index.config.columns.map((column) => column.name)
+        columns: index.config.columns.map(indexColumnName)
       }))).toEqual(contract.indexes);
       expect(parseFixedDdl(ddl, contract)).toEqual({ columns: contract.columns, indexes: contract.indexes });
     }
@@ -143,10 +143,22 @@ function parseFixedDdl(ddl: string, contract: FixedSchemaTable): { columns: Fixe
   const columns = create.split(",\n").map((line) => {
     const match = /^\s*(\w+)\s+(text|integer|jsonb|timestamptz)(?:\s+(not null))?(?:\s+default\s+([^\s]+))?$/i.exec(line);
     if (!match) throw new Error(`Unparseable fixed-schema column: ${line}`);
-    return { name: match[1]!, type: match[2]!, nullable: !match[3], ...(match[4] === undefined ? {} : { default: match[4] }) };
+    return { name: match[1]!, type: fixedColumnType(match[2]!), nullable: !match[3], ...(match[4] === undefined ? {} : { default: match[4] }) };
   });
   const indexes = parseIndexes(ddl).filter((index) => contract.indexes.some((candidate) => candidate.name === index.name));
   return { columns, indexes };
+}
+
+function indexColumnName(column: unknown): string {
+  if (typeof column === "object" && column !== null && "name" in column && typeof column.name === "string") {
+    return column.name;
+  }
+  throw new Error("Structural schema indexes must reference named columns.");
+}
+
+function fixedColumnType(value: string): FixedSchemaColumn["type"] {
+  if (value === "text" || value === "integer" || value === "jsonb" || value === "timestamptz") return value;
+  throw new Error(`Unsupported fixed-schema column type: ${value}`);
 }
 
 function parseIndexes(ddl: string): Array<{ name: string; unique: boolean; columns: string[] }> {
