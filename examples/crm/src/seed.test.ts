@@ -45,6 +45,35 @@ describe("createDemoSeeder", () => {
     await expect(runtime.list(admin, "deal")).resolves.toHaveLength(1);
   });
 
+  it("adopts edited rows created by the legacy seeder", async () => {
+    const runtime = createRuntime(app);
+    const admin = { tenantId: "default", userId: "test", roles: ["administrator"], permissions: ["*"] };
+    const customer = await runtime.create(admin, "customer", {
+      name: "acme manufacturing",
+      status: "active",
+      owner: "Mina Torres",
+      annual_revenue: "1200000.00",
+      notes: "Edited legacy demo customer."
+    });
+    await runtime.create(admin, "contact", {
+      full_name: "Rowan Ibarra",
+      email: "edited@example.com",
+      customer: customer.id,
+      is_primary: true
+    });
+    await runtime.create(admin, "deal", {
+      title: "Renamed factory rollout",
+      customer: customer.id,
+      amount: "84000.00"
+    });
+
+    await createDemoSeeder(runtime)();
+
+    await expect(runtime.list(admin, "customer")).resolves.toHaveLength(1);
+    await expect(runtime.list(admin, "contact")).resolves.toHaveLength(1);
+    await expect(runtime.list(admin, "deal")).resolves.toHaveLength(1);
+  });
+
   it("allows retry after a failed in-flight seed", async () => {
     let attempts = 0;
     const runtime = {
