@@ -26,14 +26,16 @@
     "@framekit/core": "workspace:*",
     "@framekit/openapi": "workspace:*",
     "@framekit/runtime": "workspace:*",
-    "h3": "^2.0.1-rc.22"
+    "h3": "2.0.1-rc.22"
   },
   "description": "Nitro integration for Framekit runtimes.",
   "files": [
     "dist",
     "src/index.ts"
   ],
-  "engines": { "node": ">=22 <26" },
+  "engines": {
+    "node": ">=22 <26"
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true

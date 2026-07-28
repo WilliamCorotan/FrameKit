@@ -27,14 +27,16 @@
     "@framekit/core": "workspace:*",
     "@framekit/runtime": "workspace:*",
     "drizzle-orm": "^0.45.2",
-    "postgres": "^3.4.7"
+    "postgres": "^3.4.9"
   },
   "description": "Framekit Postgres and Drizzle persistence adapters.",
   "files": [
     "dist",
     "src/index.ts"
   ],
-  "engines": { "node": ">=22 <26" },
+  "engines": {
+    "node": ">=22 <26"
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true
