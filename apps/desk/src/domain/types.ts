@@ -1,0 +1,24 @@
+export type FieldDefinition = {
+  name: string; label: string; type: string; required?: boolean; options?: string[]; inList?: boolean; readOnly?: boolean; precision?: number; scale?: number;
+  validators?: Array<{ kind: "length"; min?: number; max?: number } | { kind: "range"; min?: string | number; max?: string | number } | { kind: "pattern"; pattern: "email" | "uuid" | "slug" | "alphanumeric" } | { kind: "domain"; values: Array<string | number | boolean> }>;
+  computed?: { operation: "sum" | "subtract" | "multiply" | "concat"; dependencies: string[]; separator?: string };
+  fields?: FieldDefinition[];
+};
+export type ChildRecord = { id?: string; position?: number; data: Record<string, unknown> };
+export type AttachmentMetadata = { id: string; name: string; contentType: string; size: number; storageKey: string; createdAt: string; createdBy: string };
+export type DocTypeDefinition = { name: string; label: string; description?: string; fields: FieldDefinition[]; ownership?: { transferRoles: string[]; transferPermissions: string[] }; views?: Array<{ id: string; doctype: string; type: "list" | "form"; fields: string[] }>; workflow?: { field: string; initialState: string; states: string[]; transitions: Array<{ action: string; from: string[]; to: string }> } };
+export type ModuleDefinition = { id: string; name: string; description?: string; doctypes: DocTypeDefinition[] };
+export type Metadata = { name: string; version: string; locale?: string; supportedLocales?: string[]; messages?: Record<string, string>; modules: ModuleDefinition[] };
+export type PublicSetting = { key: string; label: string; description?: string; type: "text" | "number" | "boolean" | "select" | "secret"; scope: "tenant" | "app"; required: boolean; options?: string[]; value?: string | number | boolean; configured: boolean; redacted: boolean };
+export type DocumentRecord = { id: string; doctype: string; revision: number; ownerId?: string; state?: string; documentStatus: "draft" | "submitted" | "cancelled"; data: Record<string, unknown>; updatedAt: string };
+export type OwnerTransferReceipt = { id: string; ownerId: string; revision: number; updatedAt: string };
+export type AuthUser = { id: string; email: string; name: string; roles: string[]; permissions: string[] };
+export type AuthRole = { id: string; name: string; permissions: string[] };
+export type ApiToken = { id: string; name: string; roles: string[]; permissions: string[]; createdAt: string; revokedAt?: string };
+export type CreatedApiToken = ApiToken & { token: string };
+export type AuditEvent = { id: string; userId: string; action: string; doctype: string; documentId: string; createdAt: string };
+export type OutboxEvent = { id: string; type: string; topic: string; status: "pending" | "dispatched" | "failed"; attempts: number; createdAt: string; error?: string };
+export type Diagnostics = { app: { name: string; version: string }; repository: TransportDiagnostic; audit: TransportDiagnostic; outbox: TransportDiagnostic; customization: TransportDiagnostic; warnings: string[] };
+export type TransportDiagnostic = { kind: string; durable: boolean; features: string[] };
+export type CustomField = { id: string; doctype: string; field: FieldDefinition };
+export type DeskSection = "documents" | "users" | "roles" | "tokens" | "audit" | "outbox" | "diagnostics" | "customization" | "settings";
