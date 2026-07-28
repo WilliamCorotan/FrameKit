@@ -4,8 +4,54 @@ import { hashPassword, InMemoryApiTokenStore, InMemoryAuthAuditStore, InMemoryRo
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createRuntime, InMemoryCustomizationStore, migrationChecksum, type RealtimePublisher, type RuntimeRealtimeEvent } from "@framekit/runtime";
 import { assertSecureProductionCredentials, createNitroHandler, createOpenTelemetryAdapters } from "./index.js";
+import { matchNitroRoute, normalizeNitroBasePath } from "./route-dispatcher.js";
+import { matchAttachmentPath } from "./route-matchers.js";
+import { FRAMEKIT_ROUTE_CATALOG } from "@framekit/openapi";
 
 describe("createNitroHandler", () => {
+  it("matches every catalog route to its actual group", () => {
+    for (const definition of FRAMEKIT_ROUTE_CATALOG) {
+      const path = definition.path.replace(/\{[^}]+\}/g, "example");
+      expect(matchNitroRoute(definition.method, path, "/api")).toBe(definition);
+    }
+  });
+
+  it("normalizes custom base paths and rejects wrong segments", () => {
+    expect(matchNitroRoute("GET", "/v1/doctypes/order/example/attachments/files/example", "/v1/")?.group).toBe("documents");
+    expect(matchNitroRoute("GET", "/health", "/v1")?.path).toBe("/health/live");
+    expect(matchNitroRoute("PUT", "/v1/auth/users/example", "/v1")?.group).toBe("auth");
+    expect(matchNitroRoute("PUT", "/v1/auth/roles/example", "/v1")?.group).toBe("auth");
+    expect(matchNitroRoute("GET", "/v1/auth/users/example/extra", "/v1")).toBeUndefined();
+    expect(matchNitroRoute("GET", "/v1/auth/users", "/api")).toBeUndefined();
+    expect(normalizeNitroBasePath(`v1${"/".repeat(30_000)}`)).toBe("/v1");
+  });
+
+  it("uses a normalized custom base path throughout dispatch", async () => {
+    const runtime = createRuntime(defineApp({ name: "Custom base", modules: [] }));
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, {
+      basePath: "v1/",
+      development: { allowHeaderIdentity: true }
+    }));
+
+    await expect(json(toWebHandler(h3), "/v1/meta", {
+      headers: { "x-user-id": "reader" }
+    })).resolves.toMatchObject({ name: "Custom base" });
+  });
+
+  it("preserves the empty base path as a root-mounted API", async () => {
+    const runtime = createRuntime(defineApp({ name: "Root API", modules: [] }));
+    const h3 = new H3();
+    h3.all("/**", createNitroHandler(runtime, {
+      basePath: "",
+      development: { allowHeaderIdentity: true }
+    }));
+
+    await expect(json(toWebHandler(h3), "/meta", {
+      headers: { "x-user-id": "reader" }
+    })).resolves.toMatchObject({ name: "Root API" });
+  });
+
   it("exposes authorized atomic document commands without persistence details", async () => {
     const item = defineDocType({
       name: "command_item", label: "Command Item", fields: [{ name: "name", label: "Name", type: "text", required: true }],
@@ -130,6 +176,9 @@ describe("createNitroHandler", () => {
     await json(fetch, `/api/doctypes/order/${created.id}/attachments/files/${uploaded.id}`, { method: "DELETE", headers: { ...headers, "if-match": "2" } });
     await expect(json(fetch, `/api/doctypes/order/${created.id}/attachments/files/${uploaded.id}`, { headers })).rejects.toMatchObject({ code: "ATTACHMENT_NOT_FOUND" });
     await expect(json(fetch, `/api/doctypes/order/${created.id}/attachments/files/%00`, { headers })).rejects.toMatchObject({ code: "INVALID_PATH" });
+    await expect(json(fetch, `/api/doctypes/order/${created.id}/attachments/files/%2F`, { headers })).rejects.toMatchObject({ code: "INVALID_PATH" });
+    expect(() => matchAttachmentPath(`/api/doctypes/order/${created.id}/attachments/files/%ZZ`, "/api")).toThrow(expect.objectContaining({ code: "INVALID_PATH" }));
+    await expect(json(fetch, `/api/doctypes/order/${created.id}/attachments/files/${uploaded.id}/extra`, { headers })).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 
   it("localizes metadata and keeps typed secret settings redacted over HTTP", async () => {
@@ -1065,6 +1114,11 @@ describe("createNitroHandler", () => {
       body: { id: "reader", name: "Reader", permissions: ["crm.customer"] }
     });
     expect(role).toMatchObject({ id: "reader" });
+    await expect(json(fetch, "/api/auth/roles/reader", {
+      method: "PUT",
+      headers,
+      body: { name: "Reader", permissions: ["crm.customer", "crm.updated"] }
+    })).resolves.toMatchObject({ id: "reader", permissions: ["crm.customer", "crm.updated"] });
 
     await json(fetch, "/api/auth/users", {
       method: "POST",
@@ -1078,6 +1132,16 @@ describe("createNitroHandler", () => {
         permissions: ["crm.customer"]
       }
     });
+    await expect(json(fetch, "/api/auth/users/worker", {
+      method: "PUT",
+      headers,
+      body: {
+        email: "worker@example.com",
+        name: "Updated Worker",
+        roles: ["reader"],
+        permissions: ["crm.customer"]
+      }
+    })).resolves.toMatchObject({ id: "worker", name: "Updated Worker" });
     await json(fetch, "/api/auth/users/worker/password", {
       method: "POST",
       headers,

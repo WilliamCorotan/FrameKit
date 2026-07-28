@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
-import { createOpenApiDocument } from "./index.js";
+import { createOpenApiDocument, FRAMEKIT_ROUTE_CATALOG } from "./index.js";
 
 describe("createOpenApiDocument", () => {
   it("generates paths and schemas from DocType metadata", () => {
@@ -37,6 +37,10 @@ describe("createOpenApiDocument", () => {
     });
 
     const doc = createOpenApiDocument(app, { basePath: "/api" });
+
+    const documentedRoutes = new Set(Object.entries(doc.paths).flatMap(([path, operations]) => Object.keys(operations).map((method) => `${method.toUpperCase()} ${path}`)));
+    const catalogRoutes = new Set(FRAMEKIT_ROUTE_CATALOG.map(({ method, path }) => `${method} ${path.replaceAll("{doctype}", "deal").replaceAll("{field}", "files")}`));
+    expect(documentedRoutes).toEqual(catalogRoutes);
 
     expect(doc.openapi).toBe("3.1.0");
     expect(doc.paths["/api/auth/login"]).toBeDefined();
