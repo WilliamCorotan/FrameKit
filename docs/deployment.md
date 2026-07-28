@@ -42,6 +42,10 @@ Operational expectations:
 
 BullMQ-backed jobs require Redis. Keep Redis private to the deployment network and monitor queue latency, failed job counts, and retry depth. Server processes should treat outbox dispatch and queue workers as separately scalable workloads.
 
+## Secret and attachment storage adapters
+
+Framekit supplies fail-closed ports and development/test adapters, not a production secret-manager or object-storage integration. Deployments that use secret settings must provide authenticated encryption or a managed-secret service through `SettingsSecretPort`; rotate keys independently and restrict direct database access. Deployments that use attachments must provide a durable `AttachmentStorage` implementation with the conditional delete and lease semantics required by the attachment lifecycle. Do not treat the in-memory adapters as durable storage. See [Localization and Typed Settings](localization-settings.md) and [Child Records and Attachments](children-and-attachments.md).
+
 ## Serverless And Edge
 
 Set `NITRO_PRESET` for the target platform supported by Nitro. Keep long-running work behind the queue/outbox ports; serverless runtimes should process outbox events through a scheduled function or managed queue.

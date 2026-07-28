@@ -14,3 +14,5 @@ Framekit tests the following production compatibility matrix. Versions outside t
 All public packages declare `node >=22 <26`. A change to a supported major, runtime range, protocol, or public TypeScript contract requires tests, release notes, and a semver assessment. Pre-1.0 releases may contain breaking changes only when called out in the changelog and migration notes.
 
 Database migrations must support rolling forward from the latest published minor. Operators should test backups and rollback artifacts before promotion. Browser support means functional behavior and accessibility checks, not pixel-identical rendering.
+
+The merged #42 baseline was verified on 2026-07-28 with live PostgreSQL 16 and Redis 8 checks, Chromium and Firefox full-stack Desk journeys, and Node 22/24 export checks. CI retains the complementary PostgreSQL 17 and Redis 7 matrix. Exact commands, counts, and hosted-run links are recorded in the [maturity verification record](maturity-roadmap.md#verification-record).

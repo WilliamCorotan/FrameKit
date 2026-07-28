@@ -254,16 +254,16 @@ export const deal = defineDocType({
 | Package | Purpose | Verification status |
 | --- | --- | --- |
 | `@framekit/core` | Pure metadata definitions: DocTypes, modules, apps, permissions, workflows, views. | Unit covered. |
-| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, migration planning, checksums, destructive guards, and migration apply records. | Unit covered; atomicity and concurrency hardening tracked in [#19](https://github.com/WilliamCorotan/FrameKit/issues/19). |
-| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, user/role admin, and provider-independent login ports. | Authenticated identity and lifecycle paths covered; OIDC depth is tracked in [#25](https://github.com/WilliamCorotan/FrameKit/issues/25). |
-| `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs, cookie transport, auth/admin routes, operations authorization, rate limiting, telemetry hooks, and health dependency checks. | In-process, built, forged-header, cross-tenant, and least-privilege checks covered; production-safe HTTP defaults are tracked in [#17](https://github.com/WilliamCorotan/FrameKit/issues/17). |
+| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, migration planning, checksums, destructive guards, and migration apply records. | Atomicity and concurrency paths covered; durable long-running saga coordination remains deferred. |
+| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, user/role admin, and provider-independent login ports. | Identity lifecycle and OIDC flows covered; native WebAuthn/TOTP remains deferred. |
+| `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs, cookie transport, auth/admin routes, operations authorization, rate limiting, telemetry hooks, and health dependency checks. | In-process, built, forged-header, cross-tenant, and least-privilege checks covered. |
 | `@framekit/openapi` | OpenAPI 3.1 generator from Framekit metadata and framework routes. | Unit covered. |
-| `@framekit/db` | Postgres adapters for documents, users, roles, API tokens, session revocations, audit, outbox, custom fields, views, naming series, and migration history. | Postgres integration covered; atomicity, query pushdown, and migration depth tracked in [#19](https://github.com/WilliamCorotan/FrameKit/issues/19), [#20](https://github.com/WilliamCorotan/FrameKit/issues/20), and [#21](https://github.com/WilliamCorotan/FrameKit/issues/21). |
-| `@framekit/jobs` | Queue port, BullMQ adapter, outbox dispatcher, scheduled job registry. | Unit and Redis/BullMQ integration covered; durable worker behavior tracked in [#22](https://github.com/WilliamCorotan/FrameKit/issues/22). |
-| `@framekit/realtime` | Event bus contract and in-memory publisher/subscriber for document events and SSE routes. | Unit and in-process smoke covered; durable replay is tracked in [#22](https://github.com/WilliamCorotan/FrameKit/issues/22). |
-| `@framekit/sdk` | HTTP client for auth lifecycle, provider login, metadata, documents, audit, outbox, customization, views, migrations, realtime, and admin APIs. | Unit covered; generated endpoint parity and standalone consumer verification are tracked in [#24](https://github.com/WilliamCorotan/FrameKit/issues/24). |
-| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and executable migration workflows. | CLI smoke covered; standalone consumer and publication proof tracked in [#24](https://github.com/WilliamCorotan/FrameKit/issues/24). |
-| `@framekit/desk` | React Desk UI generated from metadata, auth/admin/operations/customization surfaces. | Build and mocked browser journeys covered; real full-stack browser CI tracked in [#23](https://github.com/WilliamCorotan/FrameKit/issues/23). |
+| `@framekit/db` | Postgres adapters for documents, users, roles, API tokens, session revocations, audit, outbox, custom fields, views, naming series, and migration history. | Postgres integration, atomicity, query pushdown, and executable migration paths covered; production-scale load evidence remains deferred. |
+| `@framekit/jobs` | Queue port, BullMQ adapter, outbox dispatcher, scheduled job registry. | Unit and Redis/BullMQ integration covered; sustained load/fault evidence remains deferred. |
+| `@framekit/realtime` | Event bus contract and in-memory publisher/subscriber for document events and SSE routes. | Durable replay and full-stack authorization paths covered; sustained load evidence remains deferred. |
+| `@framekit/sdk` | HTTP client for auth lifecycle, provider login, metadata, documents, audit, outbox, customization, views, migrations, realtime, and admin APIs. | Endpoint parity and standalone-consumer verification covered. |
+| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and executable migration workflows. | CLI smoke and standalone consumer proof covered; the Desk template remains intentionally un-packaged. |
+| `@framekit/desk` | React Desk UI generated from metadata, auth/admin/operations/customization surfaces. | Build, mocked browser, and real full-stack Chromium/Firefox journeys covered. |
 
 ## Repository Layout
 
@@ -276,7 +276,7 @@ docs/              Architecture, deployment, and roadmap docs
 
 ## Deployment
 
-The intended production target is a Nitro Node server with Postgres and Redis. The current release is a beta: production-depth gates are present, while the remaining 1.0 metadata semantics are tracked in the [maturity roadmap](docs/maturity-roadmap.md).
+The intended production target is a Nitro Node server with Postgres and Redis. The current release is a beta: production-depth gates are present, while the remaining 1.0 work is operational hardening and explicit production boundaries—durable saga coordination, native MFA, load/soak evidence, deeper schema-drift detection, packaged Desk, and production secret/object-storage adapters. See the [maturity roadmap](docs/maturity-roadmap.md).
 
 ```bash
 docker compose up --build
@@ -350,11 +350,12 @@ pnpm audit:all
 
 Current verification status:
 
-- Full audit passes: lint, typecheck, tests, and build.
-- Unit/in-process suite passes locally: 11 files and 115 tests; 2 service-backed files and 13 tests skip without service environment variables.
+- Merged #42 baseline: `pnpm audit:all` passed lint, typecheck, coverage tests, and builds.
+- Unit/in-process suite: 161 passed and 18 skipped; runtime 37/37 and Nitro 22/22.
+- Coverage: 68.15% statements, 62.08% branches, 68.93% functions, and 70.62% lines.
 - Coverage gates enforce at least 60% statements/functions/lines and 50% branches across public package source.
 - Production build passes for packages, Desk, and CRM example.
-- Split CI covers package-local tests, coverage, Node 22/24 exports, Postgres 16/17, Redis 7/8, built smoke, standalone consumption, browsers, CodeQL, dependency audit, and SBOM generation.
+- Split CI covers package-local tests, coverage, Node 22/24 exports, Postgres 16/17, Redis 7/8, built smoke, standalone consumption, browsers, CodeQL, dependency audit, and SBOM generation. Live PG16/Redis8, built smoke, standalone, mocked browser 7/7, and Chromium/Firefox full-stack 8/8 evidence passed on that baseline.
 - In-process Nitro smoke covers auth lifecycle, provider login, OpenAPI, diagnostics, document CRUD, uniqueness, filters, cursor/projection, auth admin, password reset/change, customization, migrations, outbox, realtime history, and security/operations headers.
 
 ## Architecture
@@ -376,7 +377,7 @@ Postgres query pushdown and stable opaque cursor semantics are documented in [do
 
 ## Roadmap Status
 
-Framekit is currently assessed as a beta: 88% implemented toward a production-ready 1.0. Exact decimals, computed fields, declarative validators, ordered child records, managed attachments, localization, and typed settings are implemented. See the component scores and prioritized issues in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
+Framekit is currently assessed as a beta: 88% implemented toward a production-ready 1.0. Exact decimals, computed fields, declarative validators, ordered child records, managed attachments, localization, and typed settings are implemented. All feature issues are closed; [#60](https://github.com/WilliamCorotan/FrameKit/issues/60) is the remaining reviewed reconciliation. See component scores, verification evidence, and deliberate production boundaries in [docs/maturity-roadmap.md](docs/maturity-roadmap.md).
 
 ## License
 
