@@ -450,7 +450,7 @@ function listQuery(options: ListDocumentsOptions): string {
   if (options.offset !== undefined) query.set("offset", String(options.offset));
   if (options.cursor !== undefined) query.set("cursor", options.cursor);
   if (options.fields?.length) query.set("fields", options.fields.join(","));
-  if (options.filters) query.set("filters", JSON.stringify(options.filters));
+  if (options.filters && Object.keys(options.filters).length > 0) query.set("filters", JSON.stringify(options.filters));
   if (options.sort) query.set("sort", options.sort.direction ? `${options.sort.field}:${options.sort.direction}` : options.sort.field);
   const value = query.toString();
   return value ? `?${value}` : "";

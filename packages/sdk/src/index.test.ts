@@ -44,6 +44,7 @@ describe("generateSdkTypes", () => {
   it("serializes list sorting as field then direction", async () => {
     vi.mocked(ofetch).mockResolvedValue([] as never);
     await createClient({ baseUrl: "https://app.example" }).list("customer", {
+      filters: {},
       sort: { field: "name", direction: "asc" }
     });
     expect(vi.mocked(ofetch)).toHaveBeenCalledWith(
