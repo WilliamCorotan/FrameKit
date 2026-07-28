@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
+import * as authExports from "./index.js";
 import {
   createOidcAuthorizationCodeProvider,
   createOidcProvider,
@@ -15,6 +16,10 @@ import {
 } from "./index.js";
 
 describe("PasswordAuthService", () => {
+  it("does not expose internal adapter defaults from the package root", () => {
+    expect("NoopAuthAuditSink" in authExports).toBe(false);
+  });
+
   it("rejects weak or placeholder signing secrets in production", () => {
     vi.stubEnv("NODE_ENV", "production");
     try {
