@@ -47,15 +47,8 @@ import {
   createRollbackMigrationPlan,
   validateMigrationPlan
 } from "@framekit/runtime";
-import { indexExpressions, indexIdentifier, jsonPathSegment, rollbackFromChange } from "./runtime-adapters.js";
-
-export function sqlLiteral(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-export function sqlLiteralJson(value: unknown): string {
-  return sqlLiteral(JSON.stringify(value));
-}
+import { indexExpressions, indexIdentifier, jsonPathSegment, rollbackFromChange, sqlLiteral, sqlLiteralJson } from "./migration-sql-helpers.js";
+import { fixedIndexDdl, fixedSchema, fixedTableDdl } from "./schema-contract.js";
 
 export function createDocumentTableSql(): string {
   return `
@@ -180,9 +173,9 @@ export function createAuthIdentityLifecycleTablesSql(): string {
   return `
 create table if not exists framekit_auth_identity_links (
   tenant_id text not null, provider_id text not null, subject text not null, user_id text not null, email text,
-  created_at timestamptz not null, updated_at timestamptz not null,
-  constraint framekit_auth_identity_links_subject unique (tenant_id, provider_id, subject)
+  created_at timestamptz not null, updated_at timestamptz not null
 );
+create unique index if not exists framekit_auth_identity_links_subject on framekit_auth_identity_links (tenant_id, provider_id, subject);
 create index if not exists framekit_auth_identity_links_user on framekit_auth_identity_links (tenant_id, user_id);
 create table if not exists framekit_auth_lifecycle_tokens (
   id text not null, tenant_id text not null, kind text not null, token_hash text not null, email text, user_id text, name text,
@@ -208,41 +201,19 @@ create index if not exists framekit_auth_audit_events_lookup on framekit_auth_au
 
 export function createAuditTableSql(): string {
   return `
-create table if not exists framekit_audit_events (
-  tenant_id text not null,
-  id text not null,
-  user_id text not null,
-  action text not null,
-  doctype text not null,
-  document_id text not null,
-  created_at timestamptz not null
-);
-create unique index if not exists framekit_audit_events_identity on framekit_audit_events (tenant_id, id);
+${fixedTableDdl(fixedSchema.auditEvents)}
+${fixedIndexDdl(fixedSchema.auditEvents)}
 create index if not exists framekit_audit_events_lookup on framekit_audit_events (tenant_id, created_at desc);
 `;
 }
 
 export function createOutboxTableSql(): string {
   return `
-create table if not exists framekit_outbox_events (
-  tenant_id text not null,
-  id text not null,
-  type text not null,
-  topic text not null,
-  payload jsonb not null,
-  status text not null,
-  attempts integer not null default 0,
-  created_at timestamptz not null,
-  processed_at timestamptz,
-  error text,
-  lease_owner text,
-  lease_expires_at timestamptz,
-  next_attempt_at timestamptz
-);
+${fixedTableDdl(fixedSchema.outboxEvents)}
 alter table framekit_outbox_events add column if not exists lease_owner text;
 alter table framekit_outbox_events add column if not exists lease_expires_at timestamptz;
 alter table framekit_outbox_events add column if not exists next_attempt_at timestamptz;
-create unique index if not exists framekit_outbox_events_identity on framekit_outbox_events (tenant_id, id);
+${fixedIndexDdl(fixedSchema.outboxEvents)}
 create index if not exists framekit_outbox_events_pending on framekit_outbox_events (tenant_id, status, created_at asc);
 create index if not exists framekit_outbox_events_claim on framekit_outbox_events (tenant_id, status, next_attempt_at, lease_expires_at, created_at asc);
 `;
@@ -263,31 +234,16 @@ create index if not exists framekit_realtime_events_channel_cursor on framekit_r
 
 export function createCustomFieldTableSql(): string {
   return `
-create table if not exists framekit_custom_fields (
-  tenant_id text not null,
-  id text not null,
-  doctype text not null,
-  field jsonb not null,
-  created_at timestamptz not null,
-  updated_at timestamptz not null
-);
-create unique index if not exists framekit_custom_fields_identity on framekit_custom_fields (tenant_id, id);
+${fixedTableDdl(fixedSchema.customFields)}
+${fixedIndexDdl(fixedSchema.customFields)}
 create index if not exists framekit_custom_fields_lookup on framekit_custom_fields (tenant_id, doctype);
 `;
 }
 
 export function createViewTableSql(): string {
   return `
-create table if not exists framekit_views (
-  tenant_id text not null,
-  id text not null,
-  doctype text not null,
-  type text not null,
-  fields jsonb not null,
-  created_at timestamptz not null,
-  updated_at timestamptz not null
-);
-create unique index if not exists framekit_views_identity on framekit_views (tenant_id, id);
+${fixedTableDdl(fixedSchema.views)}
+${fixedIndexDdl(fixedSchema.views)}
 create index if not exists framekit_views_lookup on framekit_views (tenant_id, doctype, type);
 `;
 }

@@ -50,7 +50,7 @@ import {
 import { framekitDocuments } from "./schema.js";
 import type { PostgresMutationUnitOfWorkOptions } from "./types.js";
 import { createMutationTablesSql } from "./ddl.js";
-import { rowToRecord } from "./document-repository.js";
+import { postgresRevisionConflict, rowToRecord } from "./document-mapping.js";
 
 export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
   private readonly sql: Sql;
@@ -353,14 +353,6 @@ function canonicalUniqueValue(value: unknown): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-export function postgresRevisionConflict(doctype: string, id: string, expectedRevision: number, actualRevision: number): FramekitError {
-  return new FramekitError("REVISION_CONFLICT", `${doctype} "${id}" changed since it was read`, 409, {
-    doctype,
-    id,
-    expectedRevision,
-    actualRevision
-  });
-}
 
 function assertIdempotencyFingerprint(key: string, expected: string, actual: string): void {
   if (expected !== actual) {

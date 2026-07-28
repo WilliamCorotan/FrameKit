@@ -47,6 +47,7 @@ import {
   createRollbackMigrationPlan,
   validateMigrationPlan
 } from "@framekit/runtime";
+import { fixedIndex, fixedSchema } from "./schema-contract.js";
 export const framekitDocuments = pgTable(
   "framekit_documents",
   {
@@ -161,7 +162,7 @@ export const framekitAuditEvents = pgTable("framekit_audit_events", {
   doctype: text("doctype").notNull(),
   documentId: text("document_id").notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull()
-});
+}, (table) => [uniqueIndex(fixedIndex(fixedSchema.auditEvents, "framekit_audit_events_identity").name).on(table.tenantId, table.id)]);
 
 export const framekitOutboxEvents = pgTable("framekit_outbox_events", {
   tenantId: text("tenant_id").notNull(),
@@ -170,14 +171,14 @@ export const framekitOutboxEvents = pgTable("framekit_outbox_events", {
   topic: text("topic").notNull(),
   payload: jsonb("payload").notNull().$type<Record<string, unknown>>(),
   status: text("status").notNull().$type<OutboxEvent["status"]>(),
-  attempts: integer("attempts").notNull(),
+  attempts: integer("attempts").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
   processedAt: timestamp("processed_at", { withTimezone: true }),
   error: text("error"),
   leaseOwner: text("lease_owner"),
   leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
   nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true })
-});
+}, (table) => [uniqueIndex(fixedIndex(fixedSchema.outboxEvents, "framekit_outbox_events_identity").name).on(table.tenantId, table.id)]);
 
 export const framekitDocumentUniqueValues = pgTable(
   "framekit_document_unique_values",
@@ -213,7 +214,7 @@ export const framekitCustomFields = pgTable("framekit_custom_fields", {
   field: jsonb("field").notNull().$type<CustomFieldDefinition["field"]>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull()
-});
+}, (table) => [uniqueIndex(fixedIndex(fixedSchema.customFields, "framekit_custom_fields_identity").name).on(table.tenantId, table.id)]);
 
 export const framekitViews = pgTable("framekit_views", {
   tenantId: text("tenant_id").notNull(),
@@ -223,7 +224,7 @@ export const framekitViews = pgTable("framekit_views", {
   fields: jsonb("fields").notNull().$type<string[]>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull()
-});
+}, (table) => [uniqueIndex(fixedIndex(fixedSchema.views, "framekit_views_identity").name).on(table.tenantId, table.id)]);
 
 export const framekitSettingValues = pgTable("framekit_setting_values", {
   appName: text("app_name").notNull(),

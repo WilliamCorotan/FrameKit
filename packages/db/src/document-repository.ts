@@ -50,7 +50,7 @@ import {
 import { framekitDocuments } from "./schema.js";
 import type { PostgresRepositoryOptions } from "./types.js";
 import { createDocumentTableSql } from "./ddl.js";
-import { postgresRevisionConflict } from "./mutation-repository.js";
+import { postgresRevisionConflict, rowToRecord } from "./document-mapping.js";
 
 export class PostgresDocumentRepository implements DocumentRepository {
   private readonly sql: Sql;
@@ -374,21 +374,6 @@ function selectedRowToRecord(row: {
   createdAt: Date;
   updatedAt: Date;
 }): DocumentRecord {
-  return {
-    tenantId: row.tenantId,
-    doctype: row.doctype,
-    id: row.id,
-    revision: row.revision,
-    documentStatus: row.documentStatus,
-    ownerId: row.ownerId ?? undefined,
-    state: row.state ?? undefined,
-    data: row.data,
-    createdAt: row.createdAt.toISOString(),
-    updatedAt: row.updatedAt.toISOString()
-  };
-}
-
-export function rowToRecord(row: typeof framekitDocuments.$inferSelect): DocumentRecord {
   return {
     tenantId: row.tenantId,
     doctype: row.doctype,

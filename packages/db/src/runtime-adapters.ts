@@ -49,7 +49,8 @@ import {
 } from "@framekit/runtime";
 import { framekitAuditEvents, framekitCustomFields, framekitMigrations, framekitOutboxEvents, framekitSettingValues, framekitViews } from "./schema.js";
 import type { PostgresMigrationStoreOptions, PostgresRealtimePublisherOptions, PostgresRepositoryOptions } from "./types.js";
-import { createAuditTableSql, createCustomFieldTableSql, createMigrationTableSql, createMutationTablesSql, createNamingSeriesTableSql, createOutboxTableSql, createPostgresMigrationStatements, createRealtimeTableSql, createSettingValueTableSql, createViewTableSql, executableStatements, sqlLiteral, validateExecutableMigration } from "./ddl.js";
+import { createAuditTableSql, createCustomFieldTableSql, createMigrationTableSql, createMutationTablesSql, createNamingSeriesTableSql, createOutboxTableSql, createPostgresMigrationStatements, createRealtimeTableSql, createSettingValueTableSql, createViewTableSql, executableStatements, validateExecutableMigration } from "./ddl.js";
+import { indexIdentifier, sqlLiteral } from "./migration-sql-helpers.js";
 
 export class PostgresAuditStore implements AuditStore {
   private readonly sql: Sql;
@@ -1244,63 +1245,6 @@ async function resynchronizeUniqueValues(
         and data ->> ${constraint.field} <> ''
     `;
   }
-}
-
-export function rollbackFromChange(change: MigrationChange): MigrationRollback {
-  if (change.rollback) {
-    return change.rollback;
-  }
-  switch (change.kind) {
-    case "add_doctype":
-      return { kind: "remove_doctype", doctype: change.doctype, field: "*", destructive: true, from: change.to };
-    case "remove_doctype":
-      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing DocType "${change.doctype}" cannot be rolled back automatically.`, 409);
-    case "add_field":
-      return { kind: "remove_field", doctype: change.doctype, field: change.field, destructive: true, from: change.to };
-    case "remove_field":
-      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing field ${change.doctype}.${change.field} cannot restore deleted values automatically.`, 409);
-    case "change_field_type":
-      return { kind: "change_field_type", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
-    case "change_collection_schema":
-      return { kind: "change_collection_schema", doctype: change.doctype, field: change.field, destructive: true, from: change.to, to: change.from };
-    case "add_index":
-      return { kind: "remove_index", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
-    case "remove_index":
-      return { kind: "add_index", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
-    case "add_unique_constraint":
-      return { kind: "remove_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, from: change.to };
-    case "remove_unique_constraint":
-      return { kind: "add_unique_constraint", doctype: change.doctype, field: change.field, destructive: false, to: change.from };
-    case "change_row_policy":
-      return { kind: "change_row_policy", doctype: change.doctype, field: "row_policy", destructive: true, from: change.to, to: change.from };
-    case "add_setting":
-      return { kind: "remove_setting", doctype: "settings", field: change.field, destructive: true, from: change.to };
-    case "remove_setting":
-      throw new FramekitError("IRREVERSIBLE_MIGRATION", `Removing setting ${change.field} cannot be rolled back automatically.`, 409);
-    case "change_setting":
-      return { kind: "change_setting", doctype: "settings", field: change.field, destructive: true, from: change.to, to: change.from };
-  }
-}
-
-export function indexIdentifier(change: Pick<MigrationChange, "doctype" | "field">, suffix: "idx" | "uniq"): string {
-  return `framekit_documents_${identifierPart(change.doctype)}_${identifierPart(change.field)}_${suffix}`;
-}
-
-function identifierPart(value: string): string {
-  const normalized = value.replaceAll(/[^a-zA-Z0-9_]+/g, "_");
-  let start = 0;
-  let end = normalized.length;
-  while (normalized[start] === "_") start += 1;
-  while (end > start && normalized[end - 1] === "_") end -= 1;
-  return normalized.slice(start, end).toLowerCase();
-}
-
-export function indexExpressions(fields: string): string[] {
-  return fields.split(",").map((field) => `(data ->> ${sqlLiteral(field)})`);
-}
-
-export function jsonPathSegment(value: string): string {
-  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"");
 }
 
 function rowToMigration(row: typeof framekitMigrations.$inferSelect): MigrationRecord {
