@@ -4,6 +4,7 @@ dist
 .output
 .vite
 coverage
+test-results
 *.tsbuildinfo
 .env
 .release
