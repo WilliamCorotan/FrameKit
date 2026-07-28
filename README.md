@@ -340,6 +340,28 @@ Scaffold commands refuse to overwrite generated paths by default. Use `--dry-run
 
 It does not scaffold the React Desk. Run the repository Desk separately or build a frontend against `@framekit/sdk`; a packaged Desk template is deferred until its assets, configuration, and upgrade contract can be shipped as one supported unit.
 
+### Frontend framework templates
+
+Runnable, copyable SDK examples are available for React, Vue, Svelte, Solid,
+and vanilla TypeScript under [`examples/frontends`](examples/frontends). Each
+template connects to the CRM example, demonstrates bearer login/logout, checks
+health and metadata, lists customers, and creates customers with idempotent SDK
+mutations.
+
+Start the API and one frontend in separate terminals:
+
+```bash
+pnpm dev
+pnpm dev:frontend:react
+```
+
+Swap `react` for `vue`, `svelte`, `solid`, or `vanilla`. Use
+`pnpm verify:frontends` to typecheck and build all five. These examples are
+frontend starters, not a promise that `framekit create-app` packages the full
+Desk application. The local CRM demo accepts `admin@example.com` /
+`admin12345`; templates keep that development credential and the returned token
+in memory only.
+
 ## Verification
 
 Every iteration should pass:

@@ -501,6 +501,9 @@ describe("createNitroHandler", () => {
     expect(allowed.status).toBe(204);
     expect(allowed.headers.get("access-control-allow-origin")).toBe("https://desk.example.test");
     expect(allowed.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(allowed.headers.get("access-control-allow-headers")).toBe(
+      "authorization,content-type,if-match,idempotency-key,x-tenant-id,x-user-id,x-roles,x-permissions"
+    );
     expect(allowed.headers.get("access-control-expose-headers")).toBe("x-next-cursor,x-request-id");
     expect(allowed.headers.get("vary")).toContain("Origin");
 

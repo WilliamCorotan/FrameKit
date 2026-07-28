@@ -1020,9 +1020,13 @@ function applyCors(event: H3Event, cors: NormalizedCorsOptions | undefined, allo
   event.res.headers.set("access-control-expose-headers", "x-next-cursor,x-request-id");
   event.res.headers.append("vary", "Origin");
   event.res.headers.set("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
-  event.res.headers.set("access-control-allow-headers", allowHeaderIdentity
-    ? "authorization,content-type,if-match,idempotency-key,x-tenant-id,x-user-id,x-roles,x-permissions"
-    : "authorization,content-type,if-match,idempotency-key,x-tenant-id");
+  // Browser SDK clients send identity-context headers in every mode. They are
+  // accepted by CORS but remain untrusted unless development header identity
+  // is explicitly enabled.
+  event.res.headers.set(
+    "access-control-allow-headers",
+    "authorization,content-type,if-match,idempotency-key,x-tenant-id,x-user-id,x-roles,x-permissions"
+  );
   if (cors.credentials) {
     event.res.headers.set("access-control-allow-credentials", "true");
   }
