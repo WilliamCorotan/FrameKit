@@ -41,6 +41,17 @@ describe("generateSdkTypes", () => {
     expect(FRAMEKIT_HTTP_ENDPOINTS.map(([method]) => method).sort()).toEqual(methods);
   });
 
+  it("serializes list sorting as field then direction", async () => {
+    vi.mocked(ofetch).mockResolvedValue([] as never);
+    await createClient({ baseUrl: "https://app.example" }).list("customer", {
+      sort: { field: "name", direction: "asc" }
+    });
+    expect(vi.mocked(ofetch)).toHaveBeenCalledWith(
+      "https://app.example/api/doctypes/customer?sort=name%3Aasc",
+      expect.any(Object)
+    );
+  });
+
   it("covers health, delete, and typed migration request semantics", async () => {
     vi.mocked(ofetch).mockResolvedValue({} as never);
     const client = createClient({ baseUrl: "http://localhost:3000", token: "session" });

@@ -451,7 +451,7 @@ function listQuery(options: ListDocumentsOptions): string {
   if (options.cursor !== undefined) query.set("cursor", options.cursor);
   if (options.fields?.length) query.set("fields", options.fields.join(","));
   if (options.filters) query.set("filters", JSON.stringify(options.filters));
-  if (options.sort) query.set("sort", `${options.sort.direction ?? "asc"}:${options.sort.field}`);
+  if (options.sort) query.set("sort", options.sort.direction ? `${options.sort.field}:${options.sort.direction}` : options.sort.field);
   const value = query.toString();
   return value ? `?${value}` : "";
 }
