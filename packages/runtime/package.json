@@ -27,7 +27,13 @@
   "description": "Framekit runtime services for documents, workflows, and permissions.",
   "files": [
     "dist",
-    "src/index.ts"
+    "src/index.ts",
+    "src/internal/adapters/memory.ts",
+    "src/internal/migrations.ts",
+    "src/internal/query.ts",
+    "src/internal/runtime.ts",
+    "src/internal/types.ts",
+    "src/internal/validation.ts"
   ],
   "engines": { "node": ">=22 <26" },
   "publishConfig": {
