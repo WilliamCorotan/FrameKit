@@ -39,6 +39,7 @@ pnpm dev:desk
 ```
 
 The Desk usually runs at `http://localhost:5173`. If that port is occupied, Vite will choose the next available port.
+Desk uses the API's HttpOnly session cookie; it does not persist bearer tokens in browser storage.
 
 Development-only CRM login:
 
@@ -276,11 +277,13 @@ docs/              Architecture, deployment, and roadmap docs
 
 ## Deployment
 
-The intended production target is a Nitro Node server with Postgres and Redis. The current release is a beta: production-depth gates are present, while the remaining 1.0 work is operational hardening and explicit production boundaries—durable saga coordination, native MFA, load/soak evidence, deeper schema-drift detection, packaged Desk, and production secret/object-storage adapters. See the [maturity roadmap](docs/maturity-roadmap.md).
+The intended production target is a Nitro Node server with private or managed Postgres and Redis services. The current release is a beta: production-depth gates are present, while the remaining 1.0 work is operational hardening and explicit production boundaries—durable saga coordination, native MFA, load/soak evidence, deeper schema-drift detection, packaged Desk, and production secret/object-storage adapters. See the [maturity roadmap](docs/maturity-roadmap.md).
 
 ```bash
 docker compose up --build
 ```
+
+`docker-compose.yml` is a local/reference stack, not a production deployment template. Its Postgres and Redis ports bind only to `127.0.0.1`. It defaults to the local `framekit` password. To override it, set both `FRAMEKIT_POSTGRES_PASSWORD` (the raw password used by Postgres) and `FRAMEKIT_POSTGRES_URL` (the CRM connection URL with its password percent-encoded); for example, `p@:/#ss` becomes `p%40%3A%2F%23ss` in the URL. For production, provision unique credentials through the platform secret manager and point `DATABASE_URL` and `REDIS_URL` at private or managed services rather than exposing the bundled stores.
 
 When `DATABASE_URL` is set, the CRM example uses Postgres for:
 
@@ -301,7 +304,7 @@ See [docs/compatibility.md](docs/compatibility.md) for supported runtimes, servi
 
 ## Environment
 
-Copy `.env.example` only for local development. Production deployments start from `.env.production.example` and provision blank secrets through the deployment platform:
+Copy `.env.example` only for local development. Production deployments start from `.env.production.example` and provision blank secrets through the deployment platform; do not reuse the Compose defaults:
 
 ```bash
 cp .env.example .env

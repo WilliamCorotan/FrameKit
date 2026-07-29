@@ -2,13 +2,24 @@
 
 Framekit apps use Nitro as the default host engine.
 
-## Node Container
+## Local Reference Stack
 
 ```bash
 docker compose up --build
 ```
 
-The full example stack includes the Nitro API, Postgres, and Redis. When `DATABASE_URL` is set, the CRM example uses durable Postgres stores for documents, users, audit events, outbox events, custom fields, views, and naming series.
+`docker-compose.yml` is a local/reference stack, not a production deployment template. It includes the Nitro API, Postgres, and Redis; Postgres and Redis publish only to `127.0.0.1`. The local password defaults to `framekit`.
+
+To override the local password, set this pair together:
+
+```bash
+FRAMEKIT_POSTGRES_PASSWORD='p@:/#ss'
+FRAMEKIT_POSTGRES_URL='postgresql://framekit:p%40%3A%2F%23ss@postgres:5432/framekit'
+```
+
+`FRAMEKIT_POSTGRES_PASSWORD` is passed to Postgres unchanged. `FRAMEKIT_POSTGRES_URL` is passed as the CRM's `DATABASE_URL`; its password component must be percent-encoded as a URI user-info value. Compose does not URL-encode interpolated values, so never interpolate the raw password into a connection URL. When `DATABASE_URL` is set, the CRM example uses durable Postgres stores for documents, users, audit events, outbox events, custom fields, views, and naming series.
+
+Do not deploy the bundled Postgres or Redis services to production. Provision a private network or managed Postgres and Redis service, create distinct least-privilege runtime credentials, supply them through the deployment platform's secret manager, and set `DATABASE_URL` and `REDIS_URL` accordingly. Do not reuse the Compose password default or expose either data service on a public interface.
 
 Recommended production environment:
 
@@ -21,7 +32,7 @@ Recommended production environment:
 - `FRAMEKIT_TRUST_PROXY`: keep `false` unless a trusted proxy sanitizes and replaces forwarded host/protocol headers.
 - `NITRO_PRESET=node-server`: Node container output.
 
-Start from `.env.production.example` and supply its blank secret values through your deployment platform. The root `.env.example` contains development-only credentials and must not be promoted to production. `docker-compose.yml` refuses to start until the production credentials and origin allowlist are provided.
+Start from `.env.production.example` and supply its blank secret values through your deployment platform. The root `.env.example` contains development-only credentials and must not be promoted to production. The local/reference `docker-compose.yml` refuses to start until the required application credentials and origin allowlist are provided.
 
 Run `pnpm audit:all` before building the image. For durable deployments, run the app once with Postgres connectivity so store `migrate()` calls can create or update framework tables.
 

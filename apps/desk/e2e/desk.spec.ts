@@ -52,22 +52,115 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("signs in, restores a session, and signs out", async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem("framekit.token", "legacy-bearer-token"));
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "Metadata operations console" })).toBeVisible();
+  await expect(page.evaluate(() => window.localStorage.getItem("framekit.token"))).resolves.toBeNull();
   await expect(page.getByLabel("Email")).toHaveValue("admin@example.com");
+  await page.getByLabel("Password").fill("incorrect-password");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("status")).toContainText("Invalid email or password");
+  await page.getByLabel("Password").fill("admin12345");
   await page.getByRole("button", { name: "Sign in" }).click();
 
   await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Desk sections" })).toBeVisible();
-  await expect(page.evaluate(() => window.localStorage.getItem("framekit.token"))).resolves.toBe("desk-token");
+  await expect(page.evaluate(() => ({ local: window.localStorage.length, session: window.sessionStorage.length }))).resolves.toEqual({ local: 0, session: 0 });
 
   await page.reload();
   await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "Sign out" }).click();
   await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
-  await expect(page.evaluate(() => window.localStorage.getItem("framekit.token"))).resolves.toBeNull();
+  await expect(page.evaluate(() => ({ local: window.localStorage.length, session: window.sessionStorage.length }))).resolves.toEqual({ local: 0, session: 0 });
+});
+
+test("waits for the session probe before allowing sign in", async ({ page }) => {
+  let releaseProbe!: () => void;
+  await page.route(`${apiOrigin}/api/auth/me`, async (route) => {
+    await new Promise<void>((resolve) => { releaseProbe = resolve; });
+    return jsonError(route, 401, "UNAUTHENTICATED", "Missing session token.");
+  });
+
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Checking your session" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign in" })).toHaveCount(0);
+
+  releaseProbe();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
+});
+
+test("waits for server logout before allowing sign in again", async ({ page }) => {
+  await signIn(page);
+  let releaseLogout!: () => void;
+  await page.route(`${apiOrigin}/api/auth/logout`, async (route) => {
+    await new Promise<void>((resolve) => { releaseLogout = resolve; });
+    return empty(route);
+  });
+
+  const logoutRequest = page.waitForRequest(`${apiOrigin}/api/auth/logout`);
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await logoutRequest;
+  await expect(page.getByRole("heading", { name: "Signing you out" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign in" })).toHaveCount(0);
+  releaseLogout();
+
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
+});
+
+test("clears Desk UI when a cookie session expires", async ({ page }) => {
+  await signIn(page);
+  await page.route(`${apiOrigin}/api/doctypes/customer?**`, (route) => jsonError(route, 401, "UNAUTHENTICATED", "Session expired"));
+  await page.getByRole("button", { name: "Refresh records" }).click();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+});
+
+test("ignores a delayed old-session success after logout and re-login", async ({ page }) => {
+  await signIn(page);
+  let releaseOldRequest!: () => void;
+  let requests = 0;
+  await page.route(`${apiOrigin}/api/doctypes/customer?**`, async (route) => {
+    requests += 1;
+    if (requests !== 1) return route.fallback();
+    await new Promise<void>((resolve) => { releaseOldRequest = resolve; });
+    return json(route, [{ id: "STALE-RECORD", doctype: "customer", revision: 1, documentStatus: "draft", data: {}, updatedAt: "2026-07-06T00:00:00.000Z" }]);
+  });
+
+  const oldRequest = page.waitForRequest((request) => request.url().includes("/api/doctypes/customer?"));
+  await page.getByRole("button", { name: "Refresh records" }).click();
+  await oldRequest;
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
+  releaseOldRequest();
+  await expect(page.getByText("STALE-RECORD")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
+});
+
+test("ignores a delayed old-session 401 after logout and re-login", async ({ page }) => {
+  await signIn(page);
+  let releaseOldRequest!: () => void;
+  let requests = 0;
+  await page.route(`${apiOrigin}/api/doctypes/customer?**`, async (route) => {
+    requests += 1;
+    if (requests !== 1) return route.fallback();
+    await new Promise<void>((resolve) => { releaseOldRequest = resolve; });
+    return jsonError(route, 401, "UNAUTHENTICATED", "Expired old session");
+  });
+
+  const oldRequest = page.waitForRequest((request) => request.url().includes("/api/doctypes/customer?"));
+  await page.getByRole("button", { name: "Refresh records" }).click();
+  await oldRequest;
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
+  releaseOldRequest();
+  await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
 });
 
 test("covers document list, create, edit, delete, pagination, search, and workflow form controls", async ({ page }) => {
@@ -298,6 +391,7 @@ async function signIn(page: Page) {
 }
 
 async function mockDeskApi(page: Page) {
+  let sessionActive = false;
   const now = "2026-07-06T00:00:00.000Z";
   const customers: RecordItem[] = [
     {
@@ -350,10 +444,20 @@ async function mockDeskApi(page: Page) {
     const body = request.postDataJSON?.() as Record<string, unknown> | undefined;
 
     if (path === "/api/auth/login" && method === "POST") {
-      return json(route, { token: "desk-token" });
+      if (body?.password !== "admin12345") {
+        return jsonError(route, 401, "INVALID_LOGIN", "Invalid email or password");
+      }
+      sessionActive = true;
+      return json(route, {});
     }
     if (path === "/api/auth/logout" && method === "POST") {
+      sessionActive = false;
       return empty(route);
+    }
+    if (path === "/api/auth/me" && method === "GET") {
+      return sessionActive
+        ? json(route, { user: users[0], context: { tenantId: "default", userId: "admin" } })
+        : jsonError(route, 401, "UNAUTHENTICATED", "Missing session token.");
     }
     if (path === "/api/meta" && method === "GET") {
       return json(route, metadata);

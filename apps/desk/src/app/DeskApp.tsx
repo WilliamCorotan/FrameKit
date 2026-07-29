@@ -7,10 +7,36 @@ import { AdminPanel, OperationsPanel } from "../sections/Panels";
 
 export function DeskApp() {
   const controller = useDeskController();
-  const { token, email, setEmail, password, setPassword, metadata, doctypes, active, section, setSection, setActiveDocType, records, hasNextPage, selected, draft, setDraft, ownerDraft, setOwnerDraft, query, setQuery, page, setPage, status, setStatus, listFields, formFields, availableTransitions, login, logout, refresh, selectRecord, save, uploadAttachment, deleteAttachment, transition, changeDocumentStatus, transferOwner, removeDocument, startNew } = controller;
+  const { authenticated, sessionChecked, loggingOut, email, setEmail, password, setPassword, metadata, doctypes, active, section, setSection, setActiveDocType, records, hasNextPage, selected, draft, setDraft, ownerDraft, setOwnerDraft, query, setQuery, page, setPage, status, setStatus, listFields, formFields, availableTransitions, login, logout, refresh, selectRecord, save, uploadAttachment, deleteAttachment, transition, changeDocumentStatus, transferOwner, removeDocument, startNew } = controller;
   const message = (key: string, fallback: string) => metadata?.messages?.[key] ?? fallback;
 
-  if (!token) {
+  if (!sessionChecked) {
+    return (
+      <main className="login-shell" id="main-content">
+        <section className="login-panel" aria-labelledby="session-title">
+          <div className="mark"><Boxes size={24} /> Framekit</div>
+          <p className="eyebrow">Desk sign in</p>
+          <h1 id="session-title">Checking your session</h1>
+          <p className="status" role="status" aria-live="polite">Loading authentication…</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (loggingOut) {
+    return (
+      <main className="login-shell" id="main-content">
+        <section className="login-panel" aria-labelledby="logout-title">
+          <div className="mark"><Boxes size={24} /> Framekit</div>
+          <p className="eyebrow">Desk sign out</p>
+          <h1 id="logout-title">Signing you out</h1>
+          <p className="status" role="status" aria-live="polite">Ending the server session…</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (!authenticated) {
     return (
       <main className="login-shell" id="main-content">
         <form className="login-panel" aria-labelledby="login-title" onSubmit={(event) => { event.preventDefault(); void login(); }}>
@@ -59,8 +85,8 @@ export function DeskApp() {
       </aside>
 
       <section className="workbench" aria-label="Desk workbench" id="desk-main" tabIndex={-1}>
-        {section === "users" || section === "roles" || section === "tokens" ? <AdminPanel section={section} token={token} status={status} setStatus={setStatus} /> : null}
-        {section === "audit" || section === "outbox" || section === "diagnostics" || section === "customization" || section === "settings" ? <OperationsPanel section={section} token={token} doctypes={doctypes} status={status} setStatus={setStatus} locale={metadata?.locale} /> : null}
+        {section === "users" || section === "roles" || section === "tokens" ? <AdminPanel section={section} status={status} setStatus={setStatus} /> : null}
+        {section === "audit" || section === "outbox" || section === "diagnostics" || section === "customization" || section === "settings" ? <OperationsPanel section={section} doctypes={doctypes} status={status} setStatus={setStatus} locale={metadata?.locale} /> : null}
         {section === "documents" ? (
         <>
         <header className="topbar">
