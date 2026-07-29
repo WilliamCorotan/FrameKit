@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   DeskSection,
   DocumentRecord,
@@ -6,13 +6,27 @@ import type {
   Metadata,
   OwnerTransferReceipt
 } from "../domain/types";
-import { encodeBase64, errorMessage, fetchJson } from "../transport/client";
+import { beginAuthGeneration, encodeBase64, errorMessage, fetchJson, requestLogout } from "../transport/client";
 import { orderedFields, validDeskFieldValue } from "../validation/fields";
 
 const pageSize = 5;
 
+function removeLegacySessionToken() {
+  try {
+    window.localStorage.removeItem("framekit.token");
+  } catch {
+    // Storage can be unavailable in a privacy-restricted browser context.
+  }
+}
+
 export function useDeskController() {
-  const [token, setToken] = useState(() => window.localStorage.getItem("framekit.token") ?? "");
+  const [authenticated, setAuthenticated] = useState(() => {
+    removeLegacySessionToken();
+    return false;
+  });
+  const [sessionChecked, setSessionChecked] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const invalidateSessionRef = useRef<() => void>(() => undefined);
   const [email, setEmail] = useState("admin@example.com");
   const [password, setPassword] = useState("admin12345");
   const [metadata, setMetadata] = useState<Metadata>();
@@ -34,12 +48,32 @@ export function useDeskController() {
   const active = doctypes.find((doctype) => doctype.name === activeDocType) ?? doctypes[0];
   const message = (key: string, fallback: string) => metadata?.messages?.[key] ?? fallback;
 
-  useEffect(() => {
-    if (!token) {
-      return;
-    }
+  function clearSession() {
+    beginAuthGeneration();
+    setAuthenticated(false);
+    setMetadata(undefined);
+    setRecords([]);
+    setSelected(undefined);
+  }
+  invalidateSessionRef.current = clearSession;
 
-    fetchJson<Metadata>(`/api/meta?locale=${encodeURIComponent(navigator.language)}`, { token })
+  useEffect(() => {
+    const clear = () => invalidateSessionRef.current();
+    window.addEventListener("framekit:unauthenticated", clear);
+    return () => window.removeEventListener("framekit:unauthenticated", clear);
+  }, []);
+
+  useEffect(() => {
+    void fetchJson("/api/auth/me")
+      .then(() => setAuthenticated(true))
+      .catch(() => setAuthenticated(false))
+      .finally(() => setSessionChecked(true));
+  }, []);
+
+  useEffect(() => {
+    if (!authenticated) return;
+
+    void fetchJson<Metadata>(`/api/meta?locale=${encodeURIComponent(navigator.language)}`)
       .then((next) => {
         setMetadata(next);
         setActiveDocType(next.modules.flatMap((module) => module.doctypes)[0]?.name ?? "customer");
@@ -48,7 +82,7 @@ export function useDeskController() {
       .catch((error: unknown) => {
         setStatus(error instanceof Error ? error.message : "Failed to load metadata");
       });
-  }, [token]);
+  }, [authenticated]);
 
   useEffect(() => {
     if (active && section === "documents") {
@@ -57,31 +91,38 @@ export function useDeskController() {
   }, [active?.name, query, page, section]);
 
   async function login() {
+    if (loggingOut) return;
     try {
       setStatus("Signing in…");
-      const session = await fetchJson<{ token: string }>("/api/auth/login", {
+      beginAuthGeneration();
+      await fetchJson("/api/auth/login", {
         method: "POST",
         body: { email, password }
       });
-      window.localStorage.setItem("framekit.token", session.token);
-      setToken(session.token);
+      setAuthenticated(true);
       setStatus("Ready");
     } catch (error) {
       setStatus(errorMessage(error));
+    } finally {
+      setSessionChecked(true);
     }
   }
 
   async function logout() {
-    try {
-      await fetchJson("/api/auth/logout", { method: "POST", token });
-    } catch {
-      // A stale remote session must not prevent local sign-out.
-    }
-    window.localStorage.removeItem("framekit.token");
-    setToken("");
+    beginAuthGeneration();
+    removeLegacySessionToken();
+    setLoggingOut(true);
+    setAuthenticated(false);
     setMetadata(undefined);
     setRecords([]);
     setSelected(undefined);
+    try {
+      await requestLogout();
+    } catch {
+      // A stale remote session must not prevent local sign-out.
+    } finally {
+      setLoggingOut(false);
+    }
   }
 
   async function refresh(doctype = activeDocType, search = query, targetPage = page) {
@@ -94,7 +135,7 @@ export function useDeskController() {
       if (search) {
         params.set("search", search);
       }
-      const result = await fetchJson<DocumentRecord[]>(`/api/doctypes/${doctype}?${params}`, { token });
+      const result = await fetchJson<DocumentRecord[]>(`/api/doctypes/${doctype}?${params}`);
       const list = result.slice(0, pageSize);
       setHasNextPage(result.length > pageSize);
       setRecords(list);
@@ -135,13 +176,11 @@ export function useDeskController() {
         ? await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, {
             method: "PATCH",
             body: payload,
-            token,
             expectedRevision: selected.revision
           })
         : await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}`, {
             method: "POST",
             body: payload,
-            token
           });
       selectRecord(record);
       if (creating) {
@@ -162,7 +201,6 @@ export function useDeskController() {
       setStatus("Uploading…");
       await fetchJson(`/api/doctypes/${active.name}/${selected.id}/attachments/${field.name}`, {
         method: "POST",
-        token,
         expectedRevision: selected.revision,
         body: {
           name: file.name,
@@ -170,7 +208,7 @@ export function useDeskController() {
           data: encodeBase64(new Uint8Array(await file.arrayBuffer()))
         }
       });
-      selectRecord(await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { token }));
+      selectRecord(await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`));
       setStatus("Uploaded");
     } catch (error) {
       setStatus(errorMessage(error));
@@ -185,10 +223,9 @@ export function useDeskController() {
       setStatus("Deleting attachment…");
       await fetchJson(`/api/doctypes/${active.name}/${selected.id}/attachments/${field.name}/${attachmentId}`, {
         method: "DELETE",
-        token,
         expectedRevision: selected.revision
       });
-      selectRecord(await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`, { token }));
+      selectRecord(await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}`));
       setStatus("Attachment deleted");
     } catch (error) {
       setStatus(errorMessage(error));
@@ -203,8 +240,7 @@ export function useDeskController() {
       setStatus("Transitioning…");
       selectRecord(await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/transition`, {
         method: "POST",
-        body: { action },
-        token
+        body: { action }
       }));
       await refresh(active.name, query, page);
       setStatus("Transitioned");
@@ -221,7 +257,6 @@ export function useDeskController() {
       setStatus(action === "submit" ? "Submitting…" : "Cancelling…");
       selectRecord(await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${selected.id}/${action}`, {
         method: "POST",
-        token,
         expectedRevision: selected.revision
       }));
       await refresh(active.name, query, page);
@@ -240,13 +275,12 @@ export function useDeskController() {
       const receipt = await fetchJson<OwnerTransferReceipt>(`/api/doctypes/${active.name}/${selected.id}/owner`, {
         method: "POST",
         body: { ownerId: ownerDraft },
-        token,
         expectedRevision: selected.revision
       });
       setRecords((current) => current.filter((record) => record.id !== receipt.id));
       selectRecord(undefined);
       try {
-        const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${receipt.id}`, { token });
+        const record = await fetchJson<DocumentRecord>(`/api/doctypes/${active.name}/${receipt.id}`);
         selectRecord(record);
         setRecords((current) => [record, ...current.filter((item) => item.id !== record.id)]);
         setStatus("Owner transferred");
@@ -264,7 +298,7 @@ export function useDeskController() {
     }
     try {
       setStatus("Deleting…");
-      await fetchJson(`/api/doctypes/${active.name}/${selected.id}`, { method: "DELETE", token });
+      await fetchJson(`/api/doctypes/${active.name}/${selected.id}`, { method: "DELETE" });
       const targetPage = records.length === 1 && page > 0 ? page - 1 : page;
       setPage(targetPage);
       await refresh(active.name, query, targetPage);
@@ -293,7 +327,9 @@ export function useDeskController() {
     : [];
 
   return {
-    token,
+    authenticated,
+    sessionChecked,
+    loggingOut,
     email,
     setEmail,
     password,

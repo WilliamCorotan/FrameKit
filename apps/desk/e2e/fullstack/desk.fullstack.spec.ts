@@ -14,7 +14,7 @@ test("uses real auth, restores the session, reports server errors, and signs out
   await page.getByLabel("Password").fill("admin12345");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
-  await expect(page.evaluate(() => window.localStorage.getItem("framekit.token"))).resolves.toBeTruthy();
+  await expect(page.evaluate(() => ({ local: window.localStorage.length, session: window.sessionStorage.length }))).resolves.toEqual({ local: 0, session: 0 });
 
   await page.reload();
   await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
@@ -25,9 +25,9 @@ test("uses real auth, restores the session, reports server errors, and signs out
 test("runs real document CRUD, deletion, workflow, and pagination", async ({ page, request }, testInfo) => {
   const suffix = `${testInfo.project.name}-${Date.now()}`;
   const paginationMarker = `pager${crypto.randomUUID().replaceAll("-", "")}`;
-  const token = await loginApi(request);
+  await loginApi(request);
   for (let index = 0; index < 7; index += 1) {
-    await createCustomer(request, token, `${paginationMarker}-${index}`);
+    await createCustomer(request, `${paginationMarker}-${index}`);
   }
 
   await signIn(page);
@@ -154,19 +154,18 @@ async function recordIds(page: Page): Promise<string[]> {
   return page.locator(".list button.row strong").allTextContents();
 }
 
-async function loginApi(request: APIRequestContext): Promise<string> {
+async function loginApi(request: APIRequestContext): Promise<void> {
   const response = await request.post(`${apiOrigin}/api/auth/login`, {
     data: { email: "admin@example.com", password: "admin12345" },
     headers: { ...tenantHeaders, origin: "http://127.0.0.1:4174" }
   });
   expect(response.ok()).toBe(true);
-  return (await response.json() as { token: string }).token;
 }
 
-async function createCustomer(request: APIRequestContext, token: string, name: string): Promise<void> {
+async function createCustomer(request: APIRequestContext, name: string): Promise<void> {
   const response = await request.post(`${apiOrigin}/api/doctypes/customer`, {
     data: { name, status: "active", owner: "Browser", annual_revenue: "1000.00" },
-    headers: { ...tenantHeaders, authorization: `Bearer ${token}` }
+    headers: { ...tenantHeaders, origin: "http://127.0.0.1:4174" }
   });
   expect(response.ok()).toBe(true);
 }

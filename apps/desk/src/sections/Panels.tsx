@@ -3,7 +3,7 @@ import { RefreshCw, Save } from "lucide-react";
 import type { ApiToken, AuditEvent, AuthRole, AuthUser, CreatedApiToken, CustomField, Diagnostics, DocTypeDefinition, OutboxEvent, PublicSetting } from "../domain/types";
 import { csv, errorMessage, fetchJson } from "../transport/client";
 
-export function AdminPanel({ section, token, status, setStatus }: { section: "users" | "roles" | "tokens"; token: string; status: string; setStatus: (status: string) => void }) {
+export function AdminPanel({ section, status, setStatus }: { section: "users" | "roles" | "tokens"; status: string; setStatus: (status: string) => void }) {
   const [users, setUsers] = useState<AuthUser[]>([]);
   const [roles, setRoles] = useState<AuthRole[]>([]);
   const [tokens, setTokens] = useState<ApiToken[]>([]);
@@ -18,13 +18,13 @@ export function AdminPanel({ section, token, status, setStatus }: { section: "us
     try {
       setStatus("Syncing…");
       if (section === "users") {
-        setUsers(await fetchJson<AuthUser[]>("/api/auth/users", { token }));
+        setUsers(await fetchJson<AuthUser[]>("/api/auth/users"));
       }
       if (section === "roles") {
-        setRoles(await fetchJson<AuthRole[]>("/api/auth/roles", { token }));
+        setRoles(await fetchJson<AuthRole[]>("/api/auth/roles"));
       }
       if (section === "tokens") {
-        setTokens(await fetchJson<ApiToken[]>("/api/auth/tokens", { token }));
+        setTokens(await fetchJson<ApiToken[]>("/api/auth/tokens"));
       }
       setStatus("Ready");
     } catch (error) {
@@ -38,7 +38,6 @@ export function AdminPanel({ section, token, status, setStatus }: { section: "us
       if (section === "users") {
         await fetchJson<AuthUser>("/api/auth/users", {
           method: "POST",
-          token,
           body: {
             id: form.id,
             email: form.email,
@@ -52,14 +51,12 @@ export function AdminPanel({ section, token, status, setStatus }: { section: "us
       if (section === "roles") {
         await fetchJson<AuthRole>("/api/auth/roles", {
           method: "POST",
-          token,
           body: { id: form.id, name: form.name, permissions: csv(form.permissions) }
         });
       }
       if (section === "tokens") {
         const created = await fetchJson<CreatedApiToken>("/api/auth/tokens", {
           method: "POST",
-          token,
           body: { id: form.id, name: form.name, roles: csv(form.roles), permissions: csv(form.permissions) }
         });
         setCreatedToken(created.token);
@@ -78,7 +75,7 @@ export function AdminPanel({ section, token, status, setStatus }: { section: "us
     try {
       setStatus("Deleting…");
       const path = section === "users" ? `/api/auth/users/${id}` : section === "roles" ? `/api/auth/roles/${id}` : `/api/auth/tokens/${id}`;
-      await fetchJson(path, { method: "DELETE", token });
+      await fetchJson(path, { method: "DELETE" });
       await refresh();
     } catch (error) {
       setStatus(errorMessage(error));
@@ -131,7 +128,7 @@ export function AdminPanel({ section, token, status, setStatus }: { section: "us
   );
 }
 
-export function OperationsPanel({ section, token, doctypes, status, setStatus, locale }: { section: "audit" | "outbox" | "diagnostics" | "customization" | "settings"; token: string; doctypes: DocTypeDefinition[]; status: string; setStatus: (status: string) => void; locale?: string }) {
+export function OperationsPanel({ section, doctypes, status, setStatus, locale }: { section: "audit" | "outbox" | "diagnostics" | "customization" | "settings"; doctypes: DocTypeDefinition[]; status: string; setStatus: (status: string) => void; locale?: string }) {
   const [audit, setAudit] = useState<AuditEvent[]>([]);
   const [outbox, setOutbox] = useState<OutboxEvent[]>([]);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | undefined>();
@@ -148,19 +145,19 @@ export function OperationsPanel({ section, token, doctypes, status, setStatus, l
     try {
       setStatus("Syncing…");
       if (section === "audit") {
-        setAudit(await fetchJson<AuditEvent[]>("/api/audit?limit=50", { token }));
+        setAudit(await fetchJson<AuditEvent[]>("/api/audit?limit=50"));
       }
       if (section === "outbox") {
-        setOutbox(await fetchJson<OutboxEvent[]>("/api/outbox?limit=50", { token }));
+        setOutbox(await fetchJson<OutboxEvent[]>("/api/outbox?limit=50"));
       }
       if (section === "diagnostics") {
-        setDiagnostics(await fetchJson<Diagnostics>("/api/diagnostics", { token }));
+        setDiagnostics(await fetchJson<Diagnostics>("/api/diagnostics"));
       }
       if (section === "customization") {
-        setCustomFields(await fetchJson<CustomField[]>("/api/custom-fields", { token }));
+        setCustomFields(await fetchJson<CustomField[]>("/api/custom-fields"));
       }
       if (section === "settings") {
-        const loaded = await fetchJson<PublicSetting[]>(`/api/settings${locale ? `?locale=${encodeURIComponent(locale)}` : ""}`, { token });
+        const loaded = await fetchJson<PublicSetting[]>(`/api/settings${locale ? `?locale=${encodeURIComponent(locale)}` : ""}`);
         setSettings(loaded);
         setSettingDrafts(Object.fromEntries(loaded.filter((setting) => !setting.redacted && setting.value !== undefined).map((setting) => [setting.key, setting.value!] )));
       }
@@ -175,7 +172,6 @@ export function OperationsPanel({ section, token, doctypes, status, setStatus, l
       setStatus("Saving…");
       await fetchJson<CustomField>("/api/custom-fields", {
         method: "POST",
-        token,
         body: {
           doctype: form.doctype ?? doctypes[0]?.name,
           field: {
@@ -198,7 +194,7 @@ export function OperationsPanel({ section, token, doctypes, status, setStatus, l
   async function markOutbox(id: string, action: "dispatch" | "fail") {
     try {
       setStatus("Updating…");
-      await fetchJson(`/api/outbox/${id}/${action}`, { method: "POST", token, body: action === "fail" ? { error: "Marked failed from Desk" } : undefined });
+      await fetchJson(`/api/outbox/${id}/${action}`, { method: "POST", body: action === "fail" ? { error: "Marked failed from Desk" } : undefined });
       await refresh();
     } catch (error) {
       setStatus(errorMessage(error));
@@ -218,7 +214,7 @@ export function OperationsPanel({ section, token, doctypes, status, setStatus, l
         setStatus("Enter a finite number before saving.");
         return;
       }
-      await fetchJson(`/api/settings/${encodeURIComponent(setting.key)}`, { method: "PUT", token, body: { value } });
+      await fetchJson(`/api/settings/${encodeURIComponent(setting.key)}`, { method: "PUT", body: { value } });
       setSettingDrafts((current) => ({ ...current, ...(setting.type === "secret" ? { [setting.key]: "" } : {}) }));
       await refresh();
       setStatus("Saved");

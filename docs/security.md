@@ -22,6 +22,7 @@ Do not treat CORS as authentication. Every protected route still requires a bear
 ## Cookies And CSRF
 
 Session cookies default to `HttpOnly` and `SameSite=Lax`. In production they default to `Secure`, and Framekit rejects an explicit insecure cookie. `SameSite=None` is also rejected unless `Secure` is enabled.
+The bundled Desk uses this cookie transport with credentialed requests and does not persist session bearer tokens in `localStorage` or `sessionStorage`.
 
 For every state-changing request authenticated by the session cookie, the adapter requires an `Origin` matching either the canonical request origin or an explicitly trusted/CORS origin. The same requirement applies before password login, provider login, and session refresh can establish or rotate a cookie, even when no session cookie exists yet. Missing origins receive `403 CSRF_ORIGIN_REQUIRED`; mismatches receive `403 CSRF_ORIGIN_DENIED`. Disallowed actual cross-origin requests are rejected, not merely deprived of CORS response headers. Bearer-authenticated requests that do not issue cookies are not subject to this cookie-origin check because browsers do not attach bearer tokens automatically.
 
