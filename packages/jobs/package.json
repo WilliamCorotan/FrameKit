@@ -25,7 +25,7 @@
   "dependencies": {
     "@framekit/core": "workspace:*",
     "@framekit/runtime": "workspace:*",
-    "bullmq": "^5.81.2"
+    "bullmq": "^6.0.3"
   },
   "description": "Framekit job queue and outbox helpers.",
   "files": [
