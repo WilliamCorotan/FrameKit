@@ -23,7 +23,7 @@
   },
   "dependencies": {
     "@framekit/core": "workspace:*",
-    "jose": "^6.2.4"
+    "jose": "^6.2.8"
   },
   "description": "Framekit authentication stores and services.",
   "files": [
