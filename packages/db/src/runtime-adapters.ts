@@ -433,7 +433,7 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
           const after = this.deliveredCursors.get(channel) ?? "0";
           const rows = await this.sql<RealtimeSqlRow[]>`
             select cursor::text, channel, type, payload, created_at from framekit_realtime_events
-            where channel = ${channel} and cursor > ${after}::bigint order by cursor asc limit 1000
+            where channel = ${channel} and cursor > ${after}::bigint order by framekit_realtime_events.cursor asc limit 1000
           `;
           if (rows.length === 0) break;
           for (const row of rows) {
