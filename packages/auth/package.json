@@ -17,7 +17,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run --root ../.. packages/auth/src/index.test.ts",
+    "test": "vitest run --root ../.. packages/auth/src/index.test.ts packages/auth/src/mfa.test.ts packages/auth/src/password-mfa.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepack": "pnpm build"
   },
@@ -35,9 +35,12 @@
     "src/oidc-providers.ts",
     "src/password-auth-service.ts",
     "src/password-policy.ts",
-    "src/shared.ts"
+    "src/shared.ts",
+    "src/mfa.ts"
   ],
-  "engines": { "node": ">=22 <26" },
+  "engines": {
+    "node": ">=22 <26"
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true

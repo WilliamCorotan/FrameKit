@@ -181,6 +181,24 @@ export class FramekitClient {
     return this.request("/api/views", { method: "POST", body: { doctype, type, fields } });
   }
 
+  mfaStatus<T = { enabled: boolean; pending: boolean; recoveryCodes: number }>(): Promise<T> {
+    return this.request("/api/auth/mfa/status");
+  }
+  beginMfaEnrollment<T = { secret: string; expiresAt: string }>(): Promise<T> {
+    return this.request("/api/auth/mfa/enroll", { method: "POST" });
+  }
+  confirmMfaEnrollment<T = { recoveryCodes: string[] }>(code: string): Promise<T> {
+    return this.request("/api/auth/mfa/confirm", { method: "POST", body: { code } });
+  }
+  disableMfa(code: string, recoveryCode = false): Promise<{ ok: boolean }> {
+    return this.request("/api/auth/mfa/disable", { method: "POST", body: { code, recoveryCode } });
+  }
+  async completeMfaChallenge<T = { token: string }>(challengeToken: string, code: string, recoveryCode = false): Promise<T> {
+    const session = await this.request<T>("/api/auth/mfa/complete", { method: "POST", body: { challengeToken, code, recoveryCode }, skipAuth: true });
+    if (typeof session === "object" && session && "token" in session && typeof session.token === "string") this.token = session.token;
+    return session;
+  }
+
   async login<T = { token: string }>(email: string, password: string): Promise<T> {
     const session = await this.request<T>("/api/auth/login", { method: "POST", body: { email, password }, skipAuth: true });
     if (typeof session === "object" && session && "token" in session && typeof session.token === "string") {

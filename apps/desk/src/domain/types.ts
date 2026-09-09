@@ -21,4 +21,4 @@ export type OutboxEvent = { id: string; type: string; topic: string; status: "pe
 export type Diagnostics = { app: { name: string; version: string }; repository: TransportDiagnostic; audit: TransportDiagnostic; outbox: TransportDiagnostic; customization: TransportDiagnostic; warnings: string[] };
 export type TransportDiagnostic = { kind: string; durable: boolean; features: string[] };
 export type CustomField = { id: string; doctype: string; field: FieldDefinition };
-export type DeskSection = "documents" | "users" | "roles" | "tokens" | "audit" | "outbox" | "diagnostics" | "customization" | "settings";
+export type DeskSection = "security" | "documents" | "users" | "roles" | "tokens" | "audit" | "outbox" | "diagnostics" | "customization" | "settings";

@@ -20,6 +20,7 @@ export const FRAMEKIT_ROUTE_CATALOG = [
   route("GET", "/api/outbox", "platform"), route("POST", "/api/outbox/{id}/dispatch", "platform"), route("POST", "/api/outbox/{id}/fail", "platform"),
   route("GET", "/api/custom-fields", "platform"), route("POST", "/api/custom-fields", "platform"), route("GET", "/api/views", "platform"), route("POST", "/api/views", "platform"),
   route("GET", "/api/settings", "platform"), route("PUT", "/api/settings/{key}", "platform"),
+  route("GET", "/api/auth/mfa/status", "auth"), route("POST", "/api/auth/mfa/enroll", "auth"), route("POST", "/api/auth/mfa/confirm", "auth"), route("POST", "/api/auth/mfa/disable", "auth"), route("POST", "/api/auth/mfa/complete", "auth"),
   route("POST", "/api/auth/login", "auth"), route("POST", "/api/auth/refresh", "auth"), route("POST", "/api/auth/logout", "auth"), route("GET", "/api/auth/me", "auth"),
   route("POST", "/api/auth/providers/{id}/login", "auth"), route("GET", "/api/auth/providers/{id}/authorize", "auth"), route("GET", "/api/auth/providers/{id}/callback", "auth"),
   route("POST", "/api/auth/invitations", "auth"), route("POST", "/api/auth/invitations/accept", "auth"), route("POST", "/api/auth/identity-links", "auth"),

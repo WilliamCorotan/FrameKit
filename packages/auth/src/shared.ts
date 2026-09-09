@@ -71,7 +71,7 @@ export function runtimeEnvironment(): string | undefined {
 
 export function safeReturnTo(value: string | undefined): string {
   const returnTo = value ?? "/";
-  if (!returnTo.startsWith("/") || returnTo.startsWith("//") || returnTo.includes("\\")) {
+  if (!returnTo.startsWith("/") || returnTo.startsWith("//") || returnTo.includes("\\") || /[\u0000-\u0020\u007f]/.test(returnTo)) {
     throw new FramekitError("INVALID_RETURN_TO", "returnTo must be a same-origin absolute path.", 422);
   }
   return returnTo;

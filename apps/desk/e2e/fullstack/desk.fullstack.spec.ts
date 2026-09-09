@@ -22,6 +22,51 @@ test("uses real auth, restores the session, reports server errors, and signs out
   await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
 });
 
+test("persists the Desk MFA recovery and disable journey in Postgres", async ({ page }, testInfo) => {
+    const suffix = `${testInfo.project.name}-${crypto.randomUUID().replaceAll("-", "")}`;
+    const email = `mfa-${suffix}@example.test`;
+    const password = "mfa-browser-password-123";
+    await page.goto("/");
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Users" }).click();
+    await page.getByLabel("ID").fill(`mfa-${suffix}`);
+    await page.getByLabel("Name").fill("MFA Browser User");
+    await page.getByLabel("Email").fill(email);
+    await page.getByLabel("Password").fill(password);
+    await page.getByLabel("Permissions").fill("crm.customer.read");
+    await page.getByRole("button", { name: "Save Users" }).click();
+    await expect(page.getByText(email)).toBeVisible();
+    await page.getByRole("button", { name: "Sign out" }).click();
+    await page.getByLabel("Email").fill(email);
+    await page.getByLabel("Password").fill(password);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.getByRole("button", { name: "Account security" })).toBeVisible();
+    await page.getByRole("button", { name: "Account security" }).click();
+    await page.getByRole("button", { name: "Set up authenticator" }).click();
+    const setupKey = (await page.getByText(/^Setup key:/).textContent())!.replace("Setup key: ", "");
+    const enrollmentCode = await totp(setupKey, Math.floor(Date.now() / 30_000));
+    await page.getByLabel("Authenticator code").fill(enrollmentCode);
+    await page.getByRole("button", { name: "Confirm authenticator" }).click();
+    await expect(page.getByRole("heading", { name: "Save your recovery codes" })).toBeVisible();
+    const recoveryCodes = await page.locator("li code").allTextContents();
+    expect(recoveryCodes).toHaveLength(8);
+
+    await page.getByRole("button", { name: "I saved my codes — sign in again" }).click();
+    await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+    await page.getByLabel("Password").fill(password);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.getByLabel("Authenticator code")).toBeVisible();
+    await page.getByLabel("Use a recovery code").check();
+    await page.getByRole("textbox", { name: "Recovery code" }).fill(recoveryCodes[0]!);
+    await page.getByRole("button", { name: "Verify and sign in" }).click();
+    await expect(page.getByRole("heading", { name: "Account security" })).toBeVisible();
+    await page.getByLabel("Use an unused recovery code").check();
+    await page.getByRole("textbox", { name: "Recovery code" }).fill(recoveryCodes[1]!);
+    await page.getByRole("button", { name: "Disable authenticator" }).click();
+    await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+});
+
 test("runs real document CRUD, deletion, workflow, and pagination", async ({ page, request }, testInfo) => {
   const suffix = `${testInfo.project.name}-${Date.now()}`;
   const paginationMarker = `pager${crypto.randomUUID().replaceAll("-", "")}`;
@@ -168,4 +213,29 @@ async function createCustomer(request: APIRequestContext, name: string): Promise
     headers: { ...tenantHeaders, origin: "http://127.0.0.1:4174" }
   });
   expect(response.ok()).toBe(true);
+}
+
+async function totp(secret: string, step: number): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", new Uint8Array(decodeBase32(secret)), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const counter = new Uint8Array(8);
+  new DataView(counter.buffer).setBigUint64(0, BigInt(step), false);
+  const digest = new Uint8Array(await crypto.subtle.sign("HMAC", key, counter));
+  const offset = digest[digest.length - 1]! & 15;
+  return String((new DataView(digest.buffer).getUint32(offset, false) & 0x7fffffff) % 1_000_000).padStart(6, "0");
+}
+
+function decodeBase32(value: string): Uint8Array {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0;
+  let buffer = 0;
+  const bytes: number[] = [];
+  for (const character of value) {
+    buffer = (buffer << 5) | alphabet.indexOf(character);
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 255);
+    }
+  }
+  return new Uint8Array(bytes);
 }

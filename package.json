@@ -35,7 +35,12 @@
     "typecheck:frontends": "pnpm --filter './examples/frontends/*' typecheck",
     "verify:frontends": "pnpm typecheck:frontends && pnpm build:frontends",
     "verify:frontends:standalone": "node scripts/verify-frontend-templates.mjs",
-    "audit:all": "pnpm lint && pnpm typecheck && pnpm test:coverage && pnpm build"
+    "audit:all": "pnpm lint && pnpm typecheck && pnpm test:coverage && pnpm build",
+    "test:storage": "node scripts/verify-storage-services.mjs",
+    "verify:operations": "node scripts/verify-operations.mjs",
+    "verify:recovery": "node scripts/verify-recovery.mjs",
+    "docs:api": "node scripts/generate-api-reference.mjs",
+    "verify:crash": "node scripts/verify-crash.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.0",

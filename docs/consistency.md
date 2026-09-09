@@ -24,11 +24,40 @@ Modules register command metadata with a stable ID, required permission, allowed
 
 `atomic` commands require a batch-capable `MutationUnitOfWork`. Postgres writes every affected document, normalized unique reservation, audit event, outbox event, and the command idempotency result in one database transaction. Any revision conflict, hook error, constraint failure, or injected durable-stage failure rolls the whole batch back. Framekit fails with `COMMAND_ATOMICITY_UNAVAILABLE` instead of silently falling back to partial writes. Realtime publication occurs only after commit and is not part of database atomicity.
 
-`saga` commands are explicitly non-atomic. Every operation must declare an allowed compensation operation. Each local step retains its own mutation transaction, revision check, audit, outbox, and derived idempotency key. On failure, completed steps are compensated in reverse order; `COMMAND_SAGA_FAILED` reports the original error and every compensation failure. This is not a durable distributed workflow engine: a process crash between a step and its compensation requires operator recovery from audit/outbox evidence. External systems invoked by hooks are never rolled back by a database transaction and must be independently idempotent.
+`saga` commands are explicitly non-atomic. Every operation declares an allowed compensation operation. Each local step commits its document, revision check, audit, outbox, and deterministic receipt in its own transaction. Configure `PostgresSagaStore` and `PostgresMutationUnitOfWork` against the same database:
+
+```ts
+const sagas = new PostgresSagaStore({ connection });
+await sagas.migrate();
+const runtime = createRuntime(app, {
+  // Include the remaining production adapters as usual.
+  repository,
+  mutations: new PostgresMutationUnitOfWork({ connection }),
+  sagas,
+  sagaLeaseMs: 30_000,
+});
+```
+
+The runtime starts and closes the saga adapter with its other owned resources. A supplied shared PostgreSQL connection remains owned by the composition. Production apps declaring saga commands reject a missing durable journal or a mutation adapter without transactional saga fencing. Development without a journal retains the older in-memory compensation behavior and provides no crash recovery.
+
+## Saga recovery contract
+
+Journaled sagas require an idempotency key. `framekit_sagas` records the tenant/key, initiating user's command fingerprint, original operations, phase, active step, compensation cursor, owner lease, and final receipt. The fingerprint binds the initiating user and original operations; roles and permissions are checked from the current authenticated context on every retry. Modifying the request or changing the initiating user fails with `IDEMPOTENCY_KEY_REUSED`. Successful receipt replay also checks current row visibility and command row policy.
+
+Before a step starts, the runtime records its active index. The mutation transaction locks that journal row and checks owner, unexpired lease, phase, and step before reading a receipt or writing any document. It holds the lock through commit. A new claim or phase transition waits for this lock, so it cannot overtake an uncertain old transaction. A lease may expire while a transaction holds the lock; recovery waits for that transaction, then consults its committed receipt. The old owner cannot checkpoint or start another step after losing its lease.
+
+If forward execution fails, the journal enters `compensating` under the same row lock before inspecting receipts. Recovery includes the active step, even if its commit succeeded but its response or progress checkpoint was lost. Committed steps are compensated in reverse order. Already committed compensation receipts are replayed before preparing another compensation. A failed compensation stops reverse execution, retains its cursor and failure, and releases the lease for a later retry. It never restarts forward execution.
+
+`completed` and `compensated` records are terminal. Completed retries return an authorized receipt; compensated retries fail with `COMMAND_SAGA_TERMINAL`. A post-completion realtime publication failure cannot initiate compensation. Durable outbox events remain available for delivery.
+
+Recovery is triggered by repeating `executeDocumentCommand()` with the same key and original request as the same initiating user, using current authorization. There is no autonomous saga recovery worker. Leases default to 30 seconds and can be configured from 1 millisecond to 15 minutes; use a duration that accommodates normal preparation and hook latency. Each progress checkpoint renews the lease. `COMMAND_SAGA_BUSY` means another owner is active; `COMMAND_SAGA_LEASE_LOST` means this attempt must stop and retry after the current lease becomes available.
+
+The guarantee covers local PostgreSQL document mutations, audit/outbox writes, and receipts. Hooks that contact external systems must implement their own idempotency and recovery. Pre-write hooks can run again after a crash, and a database compensation does not reverse external effects. This coordinator is not a cross-database transaction or a distributed workflow engine.
 
 Operational guidance:
 
-- Keep commands small; metadata defaults to 100 operations and cannot exceed 1,000. Split larger workloads into independently retryable command IDs/keys and monitor database transaction duration and lock waits.
-- Use a unique `Idempotency-Key` for each logical command. Reusing it with different operations is rejected; a completed atomic replay returns the original ordered results without duplicate audit/outbox writes.
-- Do not target the same document twice in one command. Cross-record ordering dependencies and forward links to records created later in the same batch are intentionally unsupported.
-- For saga recovery, inspect `COMMAND_SAGA_FAILED.details.compensationFailures`, the per-record audit trail, and pending outbox events. Repair or replay failed compensations with their expected current revisions; never assume the original command was all-or-nothing.
+- Keep commands small; metadata defaults to 100 operations and cannot exceed 1,000. Monitor database transaction duration and journal lock waits.
+- Use a unique idempotency key for each logical command. Do not target the same document twice; forward links to records created later in a batch remain unsupported.
+- Inspect `PostgresSagaStore.get(tenantId, key)`, `COMMAND_SAGA_FAILED.details.compensationFailures`, audit records, and outbox events before retrying a failed saga. Retry the original request after resolving transient failures or restoring the initiating user's required permissions.
+- Compensations use the declared expected revisions. A concurrent business change may prevent compensation. Reconcile that conflict through separately authorized business actions; do not silently overwrite newer data, alter the journal's fingerprint, or delete its receipt to force a retry. Such reconciliation is an operator action, not an automatic compensation rewrite.
+- Retain saga journals together with their forward and compensation mutation receipts for the entire supported retry period. No automatic saga pruning is provided. Deleting a terminal journal or a mutation receipt can make old keys executable again or make committed outcomes unverifiable. Never prune running or compensating sagas. Expiring replay protection requires an explicit application retention policy and coordinated archival of the journal and its receipts.

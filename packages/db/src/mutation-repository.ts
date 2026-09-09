@@ -51,18 +51,19 @@ import { framekitDocuments } from "./schema.js";
 import type { PostgresMutationUnitOfWorkOptions } from "./types.js";
 import { createMutationTablesSql } from "./ddl.js";
 import { postgresRevisionConflict, rowToRecord } from "./document-mapping.js";
+import { closeAdapterSql, postgresForOptions } from "./connection.js";
 
 export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
   private readonly sql: Sql;
   private readonly faultInjector?: PostgresMutationUnitOfWorkOptions["faultInjector"];
 
   constructor(options: PostgresMutationUnitOfWorkOptions) {
-    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.sql = postgresForOptions(options);
     this.faultInjector = options.faultInjector;
   }
 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
-  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
@@ -73,7 +74,7 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
     return {
       kind: "postgres",
       durable: true,
-      features: ["atomic-mutations", "optimistic-concurrency", "durable-uniqueness", "idempotency"]
+      features: ["atomic-mutations", "optimistic-concurrency", "durable-uniqueness", "idempotency", "saga-fencing"]
     };
   }
 
@@ -105,6 +106,7 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
     }
     try {
       return await this.sql.begin(async (tx) => {
+        await assertSagaFence(tx, command);
         if (command.idempotencyKey) {
           await tx`select pg_advisory_xact_lock(hashtextextended(${`${command.tenant.tenantId}:${command.idempotencyKey}`}, 0))`;
           const replay = await tx<{ fingerprint: string; result: DocumentRecord | null }[]>`
@@ -210,6 +212,7 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
     commands: MutationCommand[],
     options: { tenant: TenantContext; idempotencyKey?: string; idempotencyFingerprint: string }
   ): Promise<MutationBatchResult> {
+    if (commands.some((command) => command.sagaFence)) throw new FramekitError("COMMAND_SAGA_FENCE_INVALID", "Saga steps must execute individually.", 422);
     const principalSignature = (tenant: TenantContext) => JSON.stringify({
       tenantId: tenant.tenantId,
       userId: tenant.userId,
@@ -318,6 +321,25 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
       throw mapMutationError(error, activeCommand);
     }
   }
+}
+
+async function assertSagaFence(tx: postgres.TransactionSql, command: MutationCommand): Promise<void> {
+  const fence = command.sagaFence;
+  if (!fence) return;
+  if (!command.idempotencyKey || !fence.key || !fence.owner || !Number.isSafeInteger(fence.step) || fence.step < 0
+    || !["running", "compensating"].includes(fence.phase)) {
+    throw new FramekitError("COMMAND_SAGA_FENCE_INVALID", "Invalid saga mutation fence.", 422);
+  }
+  // Hold the row lock through the mutation, hooks, effects, and receipt commit.
+  // Claims and phase transitions wait here, draining unknown transaction outcomes.
+  await tx`select key from framekit_sagas where tenant_id = ${command.tenant.tenantId} and key = ${fence.key} for update`;
+  const [valid] = await tx`
+    select key from framekit_sagas where tenant_id = ${command.tenant.tenantId} and key = ${fence.key}
+      and owner = ${fence.owner} and lease_until > clock_timestamp()
+      and progress->>'phase' = ${fence.phase}
+      and (progress->>${fence.phase === "running" ? "activeStep" : "compensationIndex"})::integer = ${fence.step}
+  `;
+  if (!valid) throw new FramekitError("COMMAND_SAGA_LEASE_LOST", "Saga ownership or active phase changed before the mutation.", 409);
 }
 
 async function replaceUniqueValues(sql: postgres.TransactionSql, command: MutationCommand): Promise<void> {

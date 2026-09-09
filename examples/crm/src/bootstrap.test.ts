@@ -15,7 +15,7 @@ describe("createBootstrapAdmin", () => {
   });
 
   it.skipIf(!process.env.DATABASE_URL)("reports durable atomic mutation diagnostics with PostgreSQL configured", async () => {
-    const { runtime } = await import("./app.js");
+    const { runtime, closeApplication } = await import("./app.js");
     try {
       const diagnostics = await runtime.diagnostics();
 
@@ -28,7 +28,7 @@ describe("createBootstrapAdmin", () => {
         "Durable document mutations are not atomic; configure a backend MutationUnitOfWork."
       );
     } finally {
-      await runtime.close();
+      await closeApplication();
     }
   });
 });

@@ -17,3 +17,8 @@ Production wiring should:
 5. Call `close()` on shutdown and allow in-flight handlers to settle before the process exits.
 
 The in-memory adapters preserve the same API for tests, but they are not durable and do not coordinate across processes.
+# Durable schedules
+
+`BullMqScheduler` persists cron or fixed-interval schedules in Redis. Schedule IDs are stable: upserting an ID updates one logical schedule rather than creating another. Delivery is at least once, so handlers must be idempotent. Redis downtime can skip elapsed intervals; jobs are generated again from the next eligible tick rather than replaying every missed run. Use an IANA `timezone` with cron schedules when wall-clock timing matters. Removing a schedule prevents future generations but does not cancel an already active job.
+
+Durable schedules retain the latest 100 completed and 1,000 failed jobs by default. Set `completedRetention` and `failedRetention` to bounded counts (0–100,000); export failure diagnostics before history expires. Removing a schedule prevents future generation but does not erase retained history or cancel active handlers.

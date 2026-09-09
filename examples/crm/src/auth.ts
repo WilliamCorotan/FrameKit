@@ -1,10 +1,15 @@
-import { createOidcAuthorizationCodeProvider, PasswordAuthService } from "@framekit/auth";
+import type { SettingsSecretPort } from "@framekit/runtime";
+import { createOidcAuthorizationCodeProvider, PasswordAuthService, MfaService } from "@framekit/auth";
 import { createAuthStores } from "./stores.js";
 
-export async function createAuth({ secret, email, password }: { secret: string; email: string; password: string }) {
-  const stores = await createAuthStores(email, password);
+export async function createAuth({ secret, email, password, storeOptions, mfaSecrets }: { secret: string; email: string; password: string; storeOptions?: Parameters<typeof createAuthStores>[2]; mfaSecrets?: SettingsSecretPort }) {
+  const stores = await createAuthStores(email, password, storeOptions);
   return new PasswordAuthService({
     secret,
+    ...(mfaSecrets ? { mfa: new MfaService(stores.mfaStore, {
+      seal: (value, context) => mfaSecrets.seal(value, { appName: "Framekit CRM", scopeId: JSON.stringify([context.tenantId, context.userId]), key: `${context.purpose}:${context.enrollmentId}` }),
+      unseal: (value, context) => mfaSecrets.unseal(value, { appName: "Framekit CRM", scopeId: JSON.stringify([context.tenantId, context.userId]), key: `${context.purpose}:${context.enrollmentId}` })
+    }, { allowAttempt: stores.allowMfaAttempt }) } : {}),
     userStore: stores.userStore,
     roleStore: stores.roleStore,
     apiTokenStore: stores.apiTokenStore,

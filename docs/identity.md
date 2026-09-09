@@ -16,8 +16,22 @@ Custom `UserStore` implementations must provide the required atomic `updateLogin
 
 `updateLoginState` increments failed attempts from the stored count and preserves any longer existing lock. Successful login clears the count and lock only for an enabled, currently unlocked user; expired-lock cleanup must preserve a concurrently extended lock. `updatePassword` changes only the password hash and clears login failure state; self-service writes require an enabled, unlocked user. Administrator resets may use `allowDisabled` to reset a locked or disabled user's password while preserving their disabled status. Both operations return `undefined` when their conditions fail and must never insert a missing user.
 
-## MFA decision
-
-Framekit does not claim native MFA enrollment or verification in this release. OIDC deployments should enforce MFA and recovery assurance at the identity provider. Password-only deployments must add an application-owned step-up provider before protecting high-assurance workloads. Native WebAuthn/TOTP enrollment, challenge persistence, backup-code rotation, assurance (`acr`/`amr`) policy, and factor-recovery administration remain explicitly deferred; recovery tokens are not an MFA bypass and cannot sign in disabled users.
+## Production identity stores
 
 Production deployments should configure the Postgres identity-link, lifecycle-token, OIDC-state, and auth-audit stores. In-memory defaults are development-only and do not support multi-process callbacks.
+
+## Native MFA
+
+`MfaService` supports RFC 6238 SHA-1 TOTP (six digits, 30-second steps, one adjacent step in either direction), confirmation before activation, and eight single-use 128-bit recovery codes. The secret port authenticates the tenant, user, enrollment and purpose. The required attempt limiter must be shared across processes; `PostgresMfaStore` provides revision CAS with database-clock write deadlines and a shared five-attempt/five-minute window. Memory implementations are for development/tests.
+
+Configure `PasswordAuthOptions.mfa` with a durable store and encrypted secret port. CRM uses its settings keyring for this purpose when configured; a PostgreSQL-backed CRM deliberately leaves MFA unavailable without a persistent keyring. Memory-only development can use a process-local key. Preserve disabled factor tombstones and `sessionVersion`: deleting them can invalidate replay guarantees or allow older sessions to become valid again.
+
+All session-issuing authentication paths use the MFA gate, including password/provider login and lifecycle recovery. A correct primary authentication for an enrolled user returns `MFA_REQUIRED` (401), with a signed, five-minute `challengeToken` and expiry in error details. It does not issue a session cookie. Submit the token plus a TOTP or recovery code to `POST /api/auth/mfa/complete`. Each challenge permits one attempt; after an incorrect code, repeat primary authentication. Never treat a challenge token as a session or put it in browser storage or logs.
+
+`GET /api/auth/mfa/status`, `POST /api/auth/mfa/enroll`, `/confirm`, and `/disable` operate on the authenticated user. Enrollment and disabling require primary authentication within five minutes. Confirmation returns recovery codes once and invalidates the prior session; save the codes before signing in again. Disable requires a fresh authenticator code or an unused recovery code and invalidates MFA-bound sessions. A lost-authenticator flow uses one recovery code to sign in and another to disable before enrolling a replacement. Store the codes outside the authenticator device.
+
+Interactive session mutations to auth users, roles, tokens, invitations and identity links require MFA proof within five minutes when a factor is enabled. Repeat sign-in with MFA to satisfy this step-up check. Refresh preserves the original authentication/proof times, so it does not extend the step-up window. Separately issued API tokens remain automation credentials governed by their scoped permissions and revocation policy; enabling human MFA is not an API-token rotation operation.
+
+The SDK exposes status, enrollment, confirmation, disabling and challenge completion. Desk supports authenticator/recovery sign-in and the Account security setup/replacement flow. Provision independent backup key storage, recovery runbooks, notification/audit review and provider-specific testing before deploying.
+
+OIDC browser callbacks render a no-JavaScript MFA form when a factor is required. The signed challenge stays in the form body, with no-store and restrictive CSP headers. Form completion issues a cookie only after verification and redirects to a validated local path; JSON clients retain the existing challenge API. Provider-specific authorization and assurance (`acr`/`amr`) policy still require operator testing.

@@ -21,9 +21,14 @@ FRAMEKIT_POSTGRES_URL='postgresql://framekit:p%40%3A%2F%23ss@postgres:5432/frame
 
 Do not deploy the bundled Postgres or Redis services to production. Provision a private network or managed Postgres and Redis service, create distinct least-privilege runtime credentials, supply them through the deployment platform's secret manager, and set `DATABASE_URL` and `REDIS_URL` accordingly. Do not reuse the Compose password default or expose either data service on a public interface.
 
+Required production storage configuration and recovery details are in [Production storage](storage.md). The CRM now rejects missing database, settings keyring, or S3 configuration when `NODE_ENV=production`; the reference Compose stack requires an externally provisioned private bucket.
+
 Recommended production environment:
 
 - `DATABASE_URL`: Postgres connection string for document, auth, audit, customization, naming series, migration, and outbox stores.
+- `FRAMEKIT_SETTINGS_ACTIVE_KEY` and `FRAMEKIT_SETTINGS_KEYS`: active key ID and encryption keyring supplied by the secret manager.
+- `FRAMEKIT_S3_BUCKET` and `AWS_REGION`: private attachment bucket; optionally `FRAMEKIT_S3_ENDPOINT` for an HTTPS-compatible provider.
+- `FRAMEKIT_DB_POOL_MAX` and `FRAMEKIT_DB_CONNECTION_BUDGET`: per-process pool size and total query/listener budget (defaults 10 and 11).
 - `REDIS_URL`: Redis connection string for BullMQ-backed queues.
 - `FRAMEKIT_AUTH_SECRET`: at least 32 characters from a cryptographically random source, used to sign sessions.
 - `FRAMEKIT_ADMIN_EMAIL` and `FRAMEKIT_ADMIN_PASSWORD`: explicitly provisioned initial CRM admin credentials; example values are rejected.
@@ -55,7 +60,7 @@ BullMQ-backed jobs require Redis. Keep Redis private to the deployment network a
 
 ## Secret and attachment storage adapters
 
-Framekit supplies fail-closed ports and development/test adapters, not a production secret-manager or object-storage integration. Deployments that use secret settings must provide authenticated encryption or a managed-secret service through `SettingsSecretPort`; rotate keys independently and restrict direct database access. Deployments that use attachments must provide a durable `AttachmentStorage` implementation with the conditional delete and lease semantics required by the attachment lifecycle. Do not treat the in-memory adapters as durable storage. See [Localization and Typed Settings](localization-settings.md) and [Child Records and Attachments](children-and-attachments.md).
+Framekit supplies `@framekit/storage` with authenticated AES-GCM settings encryption, historical-key rotation, and PostgreSQL/S3 attachment generations with atomic leases and conditional cleanup. Configure the keyring and private bucket as described in [storage](storage.md). Operators still own credential provisioning, key backup/rotation, bucket policy and the paired database/object backup chain. Custom adapters must honor the same failure and cleanup contracts; memory adapters are development-only.
 
 ## Serverless And Edge
 
@@ -79,3 +84,31 @@ pnpm audit:all
 Add service-backed smoke checks for Postgres, Redis, and the built Nitro server before promoting a release candidate.
 
 See [Deployment Security](security.md) for the threat model, cookie/CSRF behavior, CORS rules, proxy trust boundary, and production checklist.
+
+## Operations qualification
+
+After building packages, run `DATABASE_URL=... pnpm verify:operations` against a disposable database. It uses a random tenant and removes only that tenant's probe records. It verifies restart idempotency, competing revision fences, concurrent create/replay/update/read cycles, and final persisted counts. The default is 30 seconds, eight workers and four total raw/ORM query connections. Set `FRAMEKIT_SOAK_SECONDS` (up to 86400), `FRAMEKIT_SOAK_CONCURRENCY`, and `FRAMEKIT_DB_POOL_MAX` to exercise your deployment profile. The bounded latency sample and results are written to `.release/operations.json`, or `FRAMEKIT_OPERATIONS_REPORT`.
+
+This is a runtime/Postgres component probe. It does not establish an HTTP capacity limit, a failover guarantee, or a production SLO. Run a longer soak and an HTTP workload representative of your data, permissions and attachments on the candidate deployment. Define acceptable latency, error rate, recovery time and data-loss objectives before interpreting the results.
+
+Operational runbooks must cover these events:
+
+- **Database interruption:** stop admitting writes when readiness fails, preserve mutation idempotency keys, reconnect, and verify the stored outcome before retrying an ambiguous operation. Do not assume a lost response means rollback.
+- **Queue or dispatcher interruption:** let leases expire and another owner claim work; preserve event/job IDs in downstream idempotency handling. Inspect dead letters before requeueing. Retry only after fixing the cause, with bounded attempts and backoff.
+- **Attachment service interruption:** preserve immutable generation tombstones and owned upload leases; run deletion repair and follow the quiesced reconciliation procedure in [storage](storage.md).
+- **Restore:** restore the database, matching bucket contents and historical settings keys to an isolated environment first. Validate record counts, references, secret resolution, tenant separation, and idempotency receipts before switching traffic. Replaying an outbox after restore can repeat external effects, so downstream deduplication state must cover the restored interval.
+- **Retention:** choose audit, outbox, idempotency and object-tombstone retention from your recovery window and obligations. Do not delete active leases or idempotency receipts while callers may retry. Alert on pending-age, dead-letter count, attachment repair failures, pool saturation and failed readiness.
+
+`pnpm verify:recovery` performs an isolated PostgreSQL custom-format dump/restore plus object-byte and historical-key recovery. It requires `pg_dump`/`pg_restore` at least as new as the test server, a disposable `DATABASE_URL` role allowed to create databases, and `FRAMEKIT_TEST_S3_ENDPOINT` with fixture bucket permissions. The command creates two randomly named databases and one bucket, removes/restores the fixture object, verifies restored data and tenant isolation, then cleans up only those fixtures. It never restores over the supplied database. A passing fixture drill does not replace recovery testing of your production backup chain.
+
+### Expired authentication records
+
+Schedule bounded batches of `PostgresAuthLifecycleTokenStore.pruneExpired(limit)` and `PostgresOidcAuthorizationStateStore.pruneExpired(limit)` and `PostgresMfaStore.pruneExpiredAttempts(limit)` on the administrative worker. Limits default to 1,000 and must be 1–10,000. Database-clock expiration and `SKIP LOCKED` permit concurrent cleaners without deleting live records. MFA factors and disabled-factor session-version tombstones are never pruned by these APIs. Retain saga receipts, mutation receipts, and audit records until an explicit application retention policy makes replay expiry acceptable.
+
+### Process crash probe
+
+After building packages, run `DATABASE_URL=<disposable-postgres> pnpm verify:crash`. The harness starts its own child processes, kills them with SIGKILL after a runtime commit and inside an uncommitted transaction, and checks durable receipt replay and transaction rollback. It removes only its randomly named tenant data. This complements `verify:operations` and `verify:recovery`; it does not certify database failover, regional recovery, or application HTTP capacity.
+
+### Node server request and shutdown bounds
+
+The generated server and CRM bridge cap request bodies at 16 MiB by default (`FRAMEKIT_MAX_REQUEST_BYTES`, positive safe integer bytes) and return 413 before passing oversized content to Nitro. Responses stream with backpressure, including SSE; client disconnects abort the adapter request and response stream. Shutdown aborts active requests and closes adapter resources, with a five-second deadline (`FRAMEKIT_SHUTDOWN_TIMEOUT_MS`, 1–60,000 milliseconds); an exceeded deadline exits non-zero. Account for encoded attachment size when choosing a request limit. Configure matching limits and timeouts at the reverse proxy.

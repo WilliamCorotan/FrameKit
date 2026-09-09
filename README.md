@@ -255,15 +255,17 @@ export const deal = defineDocType({
 | Package | Purpose | Verification status |
 | --- | --- | --- |
 | `@framekit/core` | Pure metadata definitions: DocTypes, modules, apps, permissions, workflows, views. | Unit covered. |
-| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, migration planning, checksums, destructive guards, and migration apply records. | Atomicity and concurrency paths covered; durable long-running saga coordination remains deferred. |
-| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, user/role admin, and provider-independent login ports. | Identity lifecycle and OIDC flows covered; native WebAuthn/TOTP remains deferred. |
+| `@framekit/runtime` | Application services and ports for documents, audit, outbox, customization, naming, realtime, migration planning, checksums, destructive guards, and migration apply records. | Atomicity, concurrency and journaled saga recovery with PostgreSQL fencing covered. |
+| `@framekit/auth` | Password hashing, signed sessions, refresh/logout, revocation, lockout, API tokens, auth audit, user/role admin, and provider-independent login ports. | Identity lifecycle, OIDC, native TOTP/recovery MFA and recent-authentication controls covered. WebAuthn remains outside this release. |
 | `@framekit/nitro` | Nitro/H3 adapter for generated framework APIs, cookie transport, auth/admin routes, operations authorization, rate limiting, telemetry hooks, and health dependency checks. | In-process, built, forged-header, cross-tenant, and least-privilege checks covered. |
 | `@framekit/openapi` | OpenAPI 3.1 generator from Framekit metadata and framework routes. | Unit covered. |
-| `@framekit/db` | Postgres adapters for documents, users, roles, API tokens, session revocations, audit, outbox, custom fields, views, naming series, and migration history. | Postgres integration, atomicity, query pushdown, and executable migration paths covered; production-scale load evidence remains deferred. |
+| `@framekit/db` | Postgres adapters for documents, users, roles, API tokens, session revocations, audit, outbox, custom fields, views, naming series, and migration history. | Postgres integration, migrations, schema inspection, component soak and crash recovery covered; deployment capacity requires qualification. |
 | `@framekit/jobs` | Queue port, BullMQ adapter, outbox dispatcher, scheduled job registry. | Unit and Redis/BullMQ integration covered; sustained load/fault evidence remains deferred. |
 | `@framekit/realtime` | Event bus contract and in-memory publisher/subscriber for document events and SSE routes. | Durable replay and full-stack authorization paths covered; sustained load evidence remains deferred. |
 | `@framekit/sdk` | HTTP client for auth lifecycle, provider login, metadata, documents, audit, outbox, customization, views, migrations, realtime, and admin APIs. | Endpoint parity and standalone-consumer verification covered. |
-| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and executable migration workflows. | CLI smoke and standalone consumer proof covered; the Desk template remains intentionally un-packaged. |
+| `@framekit/cli` | App/module/DocType scaffolding, generated SDK types, and executable migration workflows. | CLI and packed consumer proof include Desk installation and configuration-preserving upgrade. |
+| `@framekit/storage` | Context-bound AES-GCM keyrings and durable PostgreSQL/S3 attachments. | Encryption, rotation, leases, cleanup races and restore checks covered. |
+| `@framekit/desk-assets` | Installable Desk assets with versioned runtime configuration. | Packed installation and browser checks covered. |
 | `@framekit/desk` | React Desk UI generated from metadata, auth/admin/operations/customization surfaces. | Build, mocked browser, and real full-stack Chromium/Firefox journeys covered. |
 
 ## Repository Layout
@@ -277,7 +279,7 @@ docs/              Architecture, deployment, and roadmap docs
 
 ## Deployment
 
-The intended production target is a Nitro Node server with private or managed Postgres and Redis services. The current release is a beta: production-depth gates are present, while the remaining 1.0 work is operational hardening and explicit production boundaries—durable saga coordination, native MFA, load/soak evidence, deeper schema-drift detection, packaged Desk, and production secret/object-storage adapters. See the [maturity roadmap](docs/maturity-roadmap.md).
+The intended production target is a Nitro Node server with private or managed Postgres and Redis services. The current release is a beta with durable saga recovery, native MFA, component load/restore evidence, relational schema inspection, packaged Desk, and production storage adapters. Release promotion still requires hosted security/CI evidence and qualification against the operator’s actual infrastructure and application. See the [maturity roadmap](docs/maturity-roadmap.md).
 
 ```bash
 docker compose up --build
@@ -341,7 +343,7 @@ Scaffold commands refuse to overwrite generated paths by default. Use `--dry-run
 - `Dockerfile`
 - A starter `Note` DocType
 
-It does not scaffold the React Desk. Run the repository Desk separately or build a frontend against `@framekit/sdk`; a packaged Desk template is deferred until its assets, configuration, and upgrade contract can be shipped as one supported unit.
+Use `framekit create-app my-app --desk` to install Desk at `/desk/`, or `framekit install-desk public/desk` for an existing app. See [Desk distribution](docs/desk-distribution.md). The starter uses memory adapters for development and refuses production startup until durable runtime and authentication adapters are configured; the CRM composition is the production integration reference.
 
 ### Frontend framework templates
 
@@ -407,3 +409,5 @@ Framekit is currently assessed as a beta: 88% implemented toward a production-re
 ## License
 
 Framekit is licensed under the [Apache License 2.0](LICENSE).
+
+The [public API reference](docs/api-reference.md), [versioned upgrade example](docs/upgrade-example.md), and [current qualification record](docs/maturity-roadmap.md#final-local-qualification-september-working-tree) describe the expanded framework contracts and release boundaries.

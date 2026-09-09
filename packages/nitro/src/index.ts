@@ -449,7 +449,8 @@ function isCookieIssuingAuthRoute(method: string, path: string, basePath: string
   if (method !== "POST") {
     return false;
   }
-  return path === `${basePath}/auth/login`
+  return path === `${basePath}/auth/mfa/complete`
+    || path === `${basePath}/auth/login`
     || path === `${basePath}/auth/refresh`
     || path === `${basePath}/auth/invitations/accept`
     || Boolean(routeProviderLoginPath(path, basePath));

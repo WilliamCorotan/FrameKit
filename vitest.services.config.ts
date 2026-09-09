@@ -3,7 +3,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     include: [
-      "packages/db/src/index.integration.test.ts",
+      "packages/db/src/*.integration.test.ts",
       "examples/crm/src/bootstrap.test.ts"
     ],
     pool: "forks",

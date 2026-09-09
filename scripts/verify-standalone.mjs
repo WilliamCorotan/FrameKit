@@ -24,7 +24,7 @@ try {
     const tarball = join(packs, filename);
     const packedManifest = JSON.parse(execFileSync("tar", ["-xOf", tarball, "package/package.json"], { encoding: "utf8" }));
     if (JSON.stringify(packedManifest).includes("workspace:")) throw new Error(`${manifest.name} tarball retained a workspace dependency.`);
-    for (const path of ["package/dist/index.js", "package/dist/index.d.ts", "package/src/index.ts", "package/LICENSE"]) {
+    for (const path of [...new Set([manifest.main, manifest.types, manifest.exports["."].development.default, "./LICENSE"])].map((path) => `package/${path.replace(/^\.\//, "")}`)) {
       execFileSync("tar", ["-tzf", tarball, path], { stdio: "ignore" });
     }
     tarballs.set(manifest.name, tarball);
@@ -39,7 +39,12 @@ try {
   }, null, 2));
   await writeFile(join(harness, "pnpm-workspace.yaml"), overridesYaml(tarballs));
   run("pnpm", ["install", "--no-frozen-lockfile"], harness);
-  run("pnpm", ["exec", "framekit", "create-app", "standalone-app"], harness);
+  run("pnpm", ["exec", "framekit", "create-app", "standalone-app", "--desk"], harness);
+  const deskRoot = join(harness, "standalone-app", "public", "desk");
+  const originalConfig = await readFile(join(deskRoot, "framekit-config.js"), "utf8");
+  run("pnpm", ["exec", "framekit", "install-desk", "standalone-app/public/desk", "--force"], harness);
+  if (await readFile(join(deskRoot, "framekit-config.js"), "utf8") !== originalConfig) throw new Error("Desk upgrade changed runtime configuration.");
+  if (!(await readFile(join(deskRoot, "index.html"), "utf8")).includes("framekit-config.js")) throw new Error("Packed Desk entry is incomplete.");
 
   const appRoot = join(harness, "standalone-app");
   const appManifestPath = join(appRoot, "package.json");

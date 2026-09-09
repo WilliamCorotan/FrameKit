@@ -1,8 +1,10 @@
 import type { MigrationConversionArtifact, MigrationPlan, MutationCommand, RuntimeRealtimeEvent } from "@framekit/runtime";
+import type { PostgresConnection } from "./connection.js";
 
 export type PostgresRepositoryOptions = {
   connectionString: string;
   max?: number;
+  connection?: PostgresConnection;
   onQuery?: (query: { sql: string; params: unknown[] }) => void;
 };
 

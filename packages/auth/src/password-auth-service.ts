@@ -1,4 +1,6 @@
-import { FramekitError } from "@framekit/core";
+import { FramekitError, type TenantContext } from "@framekit/core";
+import type { MfaSessionProof } from "./contracts.js";
+import type { MfaCodeOptions, MfaService } from "./mfa.js";
 import type { ApiTokenSession, ApiTokenStore, AuthAuditEvent, AuthAuditSink, AuthIdentityLink, AuthIdentityLinkingPolicy, AuthIdentityLinkStore, AuthIdentityProvider, AuthProviderIdentity, AuthLifecycleToken, AuthLifecycleTokenKind, AuthLifecycleTokenStore, AuthRole, AuthSession, AuthUser, CreatedApiToken, CreateApiTokenInput, PasswordAuthOptions, PublicApiToken, PublicAuthUser, RoleStore, SessionRevocationStore, UpsertUserInput } from "./contracts.js";
 import { base64UrlDecode, base64UrlEncode, constantEqual, hashApiToken, hashOpaqueToken, randomTokenSecret, sign } from "./crypto.js";
 import { InMemoryApiTokenStore, InMemoryAuthIdentityLinkStore, InMemoryAuthLifecycleTokenStore, InMemoryRoleStore, InMemorySessionRevocationStore, NoopAuthAuditSink } from "./in-memory-stores.js";
@@ -6,6 +8,7 @@ import { hashPassword, verifyPassword, assertSecureAuthSecret } from "./password
 import { authErrorCode, authErrorTenant, normalizeEmail, normalizeExpiresAt, normalizeRequiredFutureDate, publicApiToken, publicUser, safeReturnTo } from "./shared.js";
 
 type SessionPayload = {
+  purpose?: "session";
   sub: string;
   tenantId: string;
   email: string;
@@ -15,6 +18,20 @@ type SessionPayload = {
   exp: number;
   jti?: string;
   cb?: string;
+  mfa?: MfaSessionProof;
+  mfaVersion?: string;
+  authenticatedAt?: number;
+};
+
+type MfaChallengePayload = {
+  purpose: "mfa_challenge";
+  sub: string;
+  tenantId: string;
+  exp: number;
+  jti: string;
+  cb: string;
+  enrollmentId: string;
+  authenticatedAt: number;
 };
 
 export class PasswordAuthService {
@@ -99,7 +116,15 @@ export class PasswordAuthService {
     }
     try {
       const result = await provider.completeAuthorization(input);
-      return { session: await this.loginWithProviderIdentity(providerId, result.identity, result.identity.tenantId ?? "default"), returnTo: result.returnTo };
+      const returnTo = safeReturnTo(result.returnTo);
+      try {
+        return { session: await this.loginWithProviderIdentity(providerId, result.identity, result.identity.tenantId ?? "default"), returnTo };
+      } catch (error) {
+        if (error instanceof FramekitError && error.code === "MFA_REQUIRED" && error.details && typeof error.details === "object") {
+          throw new FramekitError(error.code, error.message, error.statusCode, { ...(error.details as Record<string, unknown>), returnTo });
+        }
+        throw error;
+      }
     } catch (error) {
       await this.recordAuthAudit({ tenantId: authErrorTenant(error) ?? "default", action: "provider_authorization.failed", success: false, details: { providerId, reason: authErrorCode(error) } });
       throw error;
@@ -264,15 +289,7 @@ export class PasswordAuthService {
   }
 
   async verifyToken(token: string): Promise<AuthSession> {
-    const [encodedPayload, signature] = token.split(".");
-    if (!encodedPayload || !signature) {
-      throw new FramekitError("INVALID_SESSION", "Session token is malformed.", 401);
-    }
-    const expected = await sign(encodedPayload, this.options.secret);
-    if (!constantEqual(signature, expected)) {
-      throw new FramekitError("INVALID_SESSION", "Session token signature is invalid.", 401);
-    }
-    const payload = JSON.parse(base64UrlDecode(encodedPayload)) as SessionPayload;
+    const payload = await this.readSessionPayload(token);
     if (payload.exp <= Math.floor(Date.now() / 1000)) {
       throw new FramekitError("SESSION_EXPIRED", "Session token has expired.", 401);
     }
@@ -287,7 +304,8 @@ export class PasswordAuthService {
       throw new FramekitError("INVALID_SESSION", "Session credentials are no longer valid.", 401);
     }
     this.assertUserCanLogin(user);
-    return this.sessionFromUser(user, token, new Date(payload.exp * 1000).toISOString(), payload.jti);
+    await this.assertMfaProof(user, payload.mfa, payload.mfaVersion);
+    return this.sessionFromUser(user, token, new Date(payload.exp * 1000).toISOString(), payload.jti, payload.mfa, payload.authenticatedAt);
   }
 
   async verifyApiToken(token: string): Promise<ApiTokenSession> {
@@ -320,10 +338,187 @@ export class PasswordAuthService {
     };
   }
 
+  async completeMfaChallenge(challengeToken: string, code: string, options: MfaCodeOptions = {}): Promise<AuthSession> {
+    const mfa = this.requireMfa();
+    const payload = await this.readMfaChallenge(challengeToken);
+    // Consume before checking the factor: every challenge grants exactly one attempt.
+    const record = await this.consumeLifecycleToken(payload.tenantId, "mfa_challenge", challengeToken);
+    if (record.id !== payload.jti || record.userId !== payload.sub) throw this.invalidMfaChallenge();
+    const user = await this.options.userStore.findById(payload.tenantId, payload.sub);
+    if (!user || !constantEqual(payload.cb, await this.sessionCredentialBinding(user))) throw this.invalidMfaChallenge();
+    this.assertUserCanLogin(user);
+    const verified = options.recoveryCode === true
+      ? await mfa.useRecoveryCode(user.tenantId, user.id, code, payload.enrollmentId)
+      : await mfa.verifyChallenge(user.tenantId, user.id, code, payload.enrollmentId);
+    if (!verified) throw new FramekitError("MFA_CODE_INVALID", "MFA code is invalid.", 401);
+    if (payload.exp * 1000 <= Date.now()) throw this.invalidMfaChallenge();
+    const session = await this.issueSession(user, { enrollmentId: payload.enrollmentId, verifiedAt: Date.now() }, payload.authenticatedAt, payload.enrollmentId);
+    await this.recordAuthAudit({ tenantId: user.tenantId, actorUserId: user.id, targetUserId: user.id, action: "mfa.login_succeeded", success: true, details: { sessionId: session.sessionId, recoveryCode: options.recoveryCode === true } });
+    return session;
+  }
+
+  /** Context must come from a verified session, never from request-supplied identity fields. */
+  async getMfaStatus(context: TenantContext): Promise<{ enabled: boolean; pending: boolean; recoveryCodes: number }> {
+    const user = await this.mfaContextUser(context);
+    return this.options.mfa?.status(user.tenantId, user.id) ?? { enabled: false, pending: false, recoveryCodes: 0 };
+  }
+
+  /** HTTP callers must also enforce assertRecentPrimaryAuth on the original session token. */
+  async beginMfaEnrollment(context: TenantContext): Promise<{ secret: string; expiresAt: string }> {
+    const user = await this.mfaContextUser(context);
+    return this.requireMfa().beginEnrollment(user.tenantId, user.id);
+  }
+
+  async confirmMfaEnrollment(context: TenantContext, code: string): Promise<{ recoveryCodes: string[] }> {
+    const user = await this.mfaContextUser(context);
+    return this.requireMfa().confirmEnrollment(user.tenantId, user.id, code);
+  }
+
+  /** HTTP callers must also enforce assertRecentPrimaryAuth on the original session token. */
+  async disableMfa(context: TenantContext, code: string, options: MfaCodeOptions = {}): Promise<void> {
+    const user = await this.mfaContextUser(context);
+    await this.requireMfa().disable(user.tenantId, user.id, code, options);
+  }
+
+  async assertRecentPrimaryAuth(token: string, maxAgeSeconds = 300): Promise<AuthSession> {
+    this.validateProofMaxAge(maxAgeSeconds);
+    const session = await this.verifyToken(token);
+    if (session.authenticatedAt === undefined || Date.now() - session.authenticatedAt >= maxAgeSeconds * 1000) {
+      throw new FramekitError("AUTH_REAUTHENTICATION_REQUIRED", "Sign in again before changing authentication settings.", 401);
+    }
+    return session;
+  }
+
+  async enforceRecentMfa(token: string, maxAgeSeconds = 300): Promise<AuthSession> {
+    this.validateProofMaxAge(maxAgeSeconds);
+    const session = await this.verifyToken(token);
+    if (session.mfa && Date.now() - session.mfa.verifiedAt >= maxAgeSeconds * 1000) {
+      throw new FramekitError("MFA_STEP_UP_REQUIRED", "Sign in with MFA again before this operation.", 401);
+    }
+    return session;
+  }
+
+  private validateProofMaxAge(maxAgeSeconds: number): void {
+    if (!Number.isSafeInteger(maxAgeSeconds) || maxAgeSeconds <= 0) throw new TypeError("Authentication proof age must be a positive integer.");
+  }
+
+  private requireMfa(): MfaService {
+    if (!this.options.mfa) throw new FramekitError("MFA_NOT_CONFIGURED", "MFA is not configured.", 501);
+    return this.options.mfa;
+  }
+
+  private async mfaContextUser(context: TenantContext): Promise<AuthUser> {
+    const user = await this.options.userStore.findById(context.tenantId, context.userId);
+    if (!user) throw new FramekitError("INVALID_SESSION", "Session user no longer exists.", 401);
+    this.assertUserCanLogin(user);
+    return user;
+  }
+
+  private async currentCredentialUser(user: AuthUser): Promise<AuthUser> {
+    const current = await this.options.userStore.findById(user.tenantId, user.id);
+    if (!current || !constantEqual(current.passwordHash, user.passwordHash)) {
+      throw new FramekitError("INVALID_SESSION", "Session credentials are no longer valid.", 401);
+    }
+    this.assertUserCanLogin(current);
+    return current;
+  }
+
+  private async assertMfaProof(user: AuthUser, proof: MfaSessionProof | undefined, version: string | undefined): Promise<void> {
+    const binding = await this.options.mfa?.getSessionBinding(user.tenantId, user.id);
+    if (binding?.enrollmentId !== proof?.enrollmentId || binding?.version !== version) {
+      throw new FramekitError("INVALID_SESSION", "Session MFA verification is no longer valid.", 401);
+    }
+  }
+
+  private async requireMfaChallenge(user: AuthUser, enrollmentId: string, authenticatedAt: number): Promise<never> {
+    const exp = Math.floor(Date.now() / 1000) + 300;
+    const payload: MfaChallengePayload = {
+      purpose: "mfa_challenge", sub: user.id, tenantId: user.tenantId,
+      exp, jti: crypto.randomUUID(), cb: await this.sessionCredentialBinding(user), enrollmentId, authenticatedAt
+    };
+    const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+    const challengeToken = `${encodedPayload}.${await sign(encodedPayload, this.options.secret)}`;
+    const expiresAt = new Date(exp * 1000).toISOString();
+    await this.lifecycleTokens.create({
+      id: payload.jti, tenantId: user.tenantId, userId: user.id, kind: "mfa_challenge",
+      tokenHash: await hashOpaqueToken(challengeToken), createdAt: new Date().toISOString(), expiresAt
+    });
+    throw new FramekitError("MFA_REQUIRED", "Complete MFA to sign in.", 401, { challengeToken, expiresAt });
+  }
+
+  private invalidMfaChallenge(): FramekitError {
+    return new FramekitError("INVALID_MFA_CHALLENGE", "MFA challenge is invalid or expired.", 401);
+  }
+
+  private async readMfaChallenge(token: string): Promise<MfaChallengePayload> {
+    const payload = await this.readSignedPayload(token, "INVALID_MFA_CHALLENGE");
+    if (payload.purpose !== "mfa_challenge" || !this.validSubject(payload)
+      || typeof payload.jti !== "string" || !payload.jti
+      || typeof payload.enrollmentId !== "string" || !payload.enrollmentId
+      || !this.validTimestamp(payload.authenticatedAt)
+      || (payload.exp as number) * 1000 <= Date.now()) throw this.invalidMfaChallenge();
+    return payload as MfaChallengePayload;
+  }
+
+  private async readSessionPayload(token: string): Promise<SessionPayload> {
+    const payload = await this.readSignedPayload(token, "INVALID_SESSION");
+    if ((payload.purpose !== undefined && payload.purpose !== "session") || !this.validSubject(payload)
+      || (payload.jti !== undefined && typeof payload.jti !== "string")
+      || (payload.mfaVersion !== undefined && (typeof payload.mfaVersion !== "string" || !payload.mfaVersion))
+      || (payload.authenticatedAt !== undefined && !this.validTimestamp(payload.authenticatedAt))) {
+      throw new FramekitError("INVALID_SESSION", "Session token payload is invalid.", 401);
+    }
+    if (payload.mfa !== undefined) {
+      const proof = payload.mfa as Partial<MfaSessionProof> | null;
+      if (!proof || typeof proof !== "object" || typeof proof.enrollmentId !== "string" || !proof.enrollmentId || !this.validTimestamp(proof.verifiedAt)) {
+        throw new FramekitError("INVALID_SESSION", "Session MFA proof is invalid.", 401);
+      }
+    }
+    return payload as SessionPayload;
+  }
+
+  private validSubject(payload: Record<string, unknown>): boolean {
+    return typeof payload.sub === "string" && Boolean(payload.sub)
+      && typeof payload.tenantId === "string" && Boolean(payload.tenantId)
+      && typeof payload.cb === "string" && Boolean(payload.cb)
+      && typeof payload.exp === "number" && Number.isSafeInteger(payload.exp) && payload.exp > 0 && payload.exp <= 8_640_000_000_000;
+  }
+
+  private validTimestamp(value: unknown): value is number {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= Date.now();
+  }
+
+  private async readSignedPayload(token: string, errorCode: string): Promise<Record<string, unknown>> {
+    const invalid = () => new FramekitError(errorCode, "Authentication token is invalid.", 401);
+    if (typeof token !== "string" || token.length > 65_536) throw invalid();
+    const parts = token.split(".");
+    if (parts.length !== 2 || !parts[0] || !parts[1]) throw invalid();
+    const [encodedPayload, signature] = parts as [string, string];
+    if (!constantEqual(signature, await sign(encodedPayload, this.options.secret))) throw invalid();
+    try {
+      const payload: unknown = JSON.parse(base64UrlDecode(encodedPayload));
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw invalid();
+      return payload as Record<string, unknown>;
+    } catch {
+      throw invalid();
+    }
+  }
+
   async createSession(user: AuthUser): Promise<AuthSession> {
+    const current = await this.currentCredentialUser(user);
+    const authenticatedAt = Date.now();
+    const binding = await this.options.mfa?.getSessionBinding(current.tenantId, current.id);
+    if (binding?.enrollmentId) await this.requireMfaChallenge(current, binding.enrollmentId, authenticatedAt);
+    return this.issueSession(current, undefined, authenticatedAt, binding?.version);
+  }
+
+  private async issueSession(user: AuthUser, mfa: MfaSessionProof | undefined, authenticatedAt: number | undefined, mfaVersion: string | undefined): Promise<AuthSession> {
+    user = await this.currentCredentialUser(user);
+    await this.assertMfaProof(user, mfa, mfaVersion);
     const expiresAt = Math.floor(Date.now() / 1000) + this.sessionTtlSeconds;
     const sessionId = crypto.randomUUID();
     const payload: SessionPayload = {
+      purpose: "session",
       sub: user.id,
       tenantId: user.tenantId,
       email: user.email,
@@ -332,21 +527,28 @@ export class PasswordAuthService {
       permissions: user.permissions,
       exp: expiresAt,
       jti: sessionId,
-      cb: await this.sessionCredentialBinding(user)
+      cb: await this.sessionCredentialBinding(user),
+      mfa,
+      mfaVersion,
+      authenticatedAt
     };
     const encodedPayload = base64UrlEncode(JSON.stringify(payload));
     const token = `${encodedPayload}.${await sign(encodedPayload, this.options.secret)}`;
-    return this.sessionFromUser(user, token, new Date(expiresAt * 1000).toISOString(), sessionId);
+    return this.sessionFromUser(user, token, new Date(expiresAt * 1000).toISOString(), sessionId, mfa, authenticatedAt);
   }
 
   async refreshSession(token: string): Promise<AuthSession> {
     const current = await this.verifyToken(token);
+    const payload = await this.readSessionPayload(token);
     await this.revokeSession(token);
     const user = await this.options.userStore.findById(current.context.tenantId, current.context.userId);
     if (!user) {
       throw new FramekitError("INVALID_SESSION", "Session user no longer exists.", 401);
     }
-    const session = await this.createSession(user);
+    if (!constantEqual(payload.cb!, await this.sessionCredentialBinding(user))) {
+      throw new FramekitError("INVALID_SESSION", "Session credentials are no longer valid.", 401);
+    }
+    const session = await this.issueSession(user, current.mfa, current.authenticatedAt, payload.mfaVersion);
     await this.recordAuthAudit({
       tenantId: current.context.tenantId,
       actorUserId: current.context.userId,
@@ -359,15 +561,7 @@ export class PasswordAuthService {
   }
 
   async revokeSession(token: string): Promise<void> {
-    const [encodedPayload, signature] = token.split(".");
-    if (!encodedPayload || !signature) {
-      throw new FramekitError("INVALID_SESSION", "Session token is malformed.", 401);
-    }
-    const expected = await sign(encodedPayload, this.options.secret);
-    if (!constantEqual(signature, expected)) {
-      throw new FramekitError("INVALID_SESSION", "Session token signature is invalid.", 401);
-    }
-    const payload = JSON.parse(base64UrlDecode(encodedPayload)) as SessionPayload;
+    const payload = await this.readSessionPayload(token);
     if (payload.jti) {
       await this.sessionRevocations.revoke(payload.jti, new Date(payload.exp * 1000).toISOString());
       await this.recordAuthAudit({
@@ -491,7 +685,7 @@ export class PasswordAuthService {
     return this.audit.list ? await this.audit.list(tenantId) : [];
   }
 
-  private async sessionFromUser(user: AuthUser, token: string, expiresAt: string, sessionId?: string): Promise<AuthSession> {
+  private async sessionFromUser(user: AuthUser, token: string, expiresAt: string, sessionId?: string, mfa?: MfaSessionProof, authenticatedAt?: number): Promise<AuthSession> {
     const permissions = await this.permissionsFor(user.tenantId, user.roles, user.permissions);
     return {
       token,
@@ -503,7 +697,9 @@ export class PasswordAuthService {
         roles: user.roles,
         permissions
       },
-      expiresAt
+      expiresAt,
+      mfa,
+      authenticatedAt
     };
   }
 

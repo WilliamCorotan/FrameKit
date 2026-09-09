@@ -66,10 +66,27 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Start S3 integration fixture
+        run: |
+          docker run -d --name framekit-s3 -p 9000:9000 -e MINIO_ROOT_USER=framekit-test -e MINIO_ROOT_PASSWORD=framekit-test-password minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://localhost:9000/minio/health/ready; then exit 0; fi
+            sleep 1
+          done
+          docker logs framekit-s3
+          exit 1
+      - run: pnpm test:storage
+        env:
+          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit
+          FRAMEKIT_TEST_S3_ENDPOINT: http://localhost:9000
       - run: pnpm test:services
         env:
           DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit
           REDIS_URL: redis://localhost:6379
+      - run: pnpm --filter @framekit/db... build
+      - run: pnpm verify:crash
+        env:
+          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit
       - run: pnpm test:services:coverage
         if: matrix.postgres == 16 && matrix.redis == 7
         env:
@@ -105,8 +122,10 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter @framekit/desk exec playwright install --with-deps chromium
+      - run: pnpm --filter @framekit/desk exec playwright install --with-deps chromium firefox
       - run: pnpm test:desk:browser
+      - run: pnpm --filter @framekit/nitro test:browser
+      - run: pnpm --filter @framekit/desk-assets test:browser
       - run: pnpm verify:frontends:standalone
       - run: pnpm test:frontends:browser
 

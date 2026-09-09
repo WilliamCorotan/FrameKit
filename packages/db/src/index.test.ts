@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { migrationChecksum, type MigrationPlan } from "@framekit/runtime";
 import {
@@ -17,13 +17,32 @@ import {
   createSessionRevocationTableSql,
   createUserTableSql,
   createViewTableSql,
-  PostgresMigrationStore
+  PostgresMigrationStore, PostgresRealtimePublisher
+  , createPostgresConnection
 } from "./index.js";
 import { indexIdentifier } from "./migration-sql-helpers.js";
 import { framekitAuditEvents, framekitAuthIdentityLinks, framekitCustomFields, framekitOutboxEvents, framekitSessionRevocations, framekitViews } from "./schema.js";
 import { fixedSchema, type FixedSchemaColumn, type FixedSchemaTable } from "./schema-contract.js";
 
 describe("db migration sql", () => {
+  it("closes both realtime connections after listener setup fails", async () => {
+    const publisher = new PostgresRealtimePublisher({ connectionString: "postgres://example.test/framekit" }) as unknown as { listenerReady: Promise<void>; listenerSql: { end: ReturnType<typeof vi.fn> }; sql: { end: ReturnType<typeof vi.fn> }; close(): Promise<void> };
+    publisher.listenerReady = Promise.reject(new Error("listener failed"));
+    publisher.listenerReady.catch(() => undefined);
+    publisher.listenerSql = { end: vi.fn().mockResolvedValue(undefined) };
+    publisher.sql = { end: vi.fn().mockResolvedValue(undefined) };
+    const first = publisher.close(); const second = publisher.close();
+    expect(second).toBe(first);
+    await expect(first).rejects.toBeInstanceOf(AggregateError);
+    expect(publisher.listenerSql.end).toHaveBeenCalledTimes(1);
+    expect(publisher.sql.end).toHaveBeenCalledTimes(1);
+  });
+  it("validates an explicit Postgres connection budget", () => {
+    expect(() => createPostgresConnection({ connectionString: "postgres://example.test/framekit", max: 2, listenerConnections: 1, totalBudget: 2 })).toThrow("budget");
+    expect(() => createPostgresConnection({ connectionString: "postgres://example.test/framekit", max: 2, listenerConnections: -1 })).toThrow("listener");
+    expect(() => createPostgresConnection({ connectionString: "postgres://example.test/framekit", max: 2, listenerConnections: 1.5 })).toThrow("listener");
+    expect(() => createPostgresConnection({ connectionString: "not a postgres url", max: 2 })).toThrow("Invalid Postgres connection configuration");
+  });
   it("normalizes adversarial migration identifiers in linear time", () => {
     expect(indexIdentifier({
       doctype: `${"_".repeat(10_000)}Customer`,

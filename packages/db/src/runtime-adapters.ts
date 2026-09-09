@@ -51,18 +51,19 @@ import { framekitAuditEvents, framekitCustomFields, framekitMigrations, framekit
 import type { PostgresMigrationStoreOptions, PostgresRealtimePublisherOptions, PostgresRepositoryOptions } from "./types.js";
 import { createAuditTableSql, createCustomFieldTableSql, createMigrationTableSql, createMutationTablesSql, createNamingSeriesTableSql, createOutboxTableSql, createPostgresMigrationStatements, createRealtimeTableSql, createSettingValueTableSql, createViewTableSql, executableStatements, validateExecutableMigration } from "./ddl.js";
 import { indexIdentifier, sqlLiteral } from "./migration-sql-helpers.js";
+import { closeAdapterSql, postgresForOptions } from "./connection.js";
 
 export class PostgresAuditStore implements AuditStore {
   private readonly sql: Sql;
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
-    this.db = drizzle(this.sql);
+    this.sql = postgresForOptions(options);
+    this.db = drizzle(options.connection?.drizzleSql ?? this.sql);
   }
 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
-  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
@@ -104,8 +105,8 @@ export class PostgresOutboxStore implements OutboxStore {
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
-    this.db = drizzle(this.sql);
+    this.sql = postgresForOptions(options);
+    this.db = drizzle(options.connection?.drizzleSql ?? this.sql);
   }
 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
@@ -124,7 +125,7 @@ export class PostgresOutboxStore implements OutboxStore {
   }
 
   async close(): Promise<void> {
-    await this.sql.end({ timeout: 5 });
+    await closeAdapterSql(this.sql);
   }
 
   async record(event: OutboxEvent): Promise<void> {
@@ -270,10 +271,11 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
   private readonly faultInjector?: PostgresRealtimePublisherOptions["faultInjector"];
   private listener?: Awaited<ReturnType<Sql["listen"]>>;
   private listenerReady?: Promise<void>;
+  private closePromise?: Promise<void>;
   private closed = false;
 
   constructor(options: PostgresRealtimePublisherOptions) {
-    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.sql = postgresForOptions(options);
     this.listenerSql = postgres(options.connectionString, { max: 1 });
     this.faultInjector = options.faultInjector;
   }
@@ -373,16 +375,24 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.closeInternal();
+    return this.closePromise;
+  }
+
+  private async closeInternal(): Promise<void> {
     this.closed = true;
-    await this.listenerReady;
-    await this.listener?.unlisten();
+    const errors: unknown[] = [];
+    try { await this.listenerReady; } catch (error) { errors.push(error); }
+    try { await this.listener?.unlisten(); } catch (error) { errors.push(error); }
     this.listeners.clear();
     await Promise.allSettled([...this.deliveryPumps.values()]);
-    await Promise.all([this.listenerSql.end({ timeout: 1 }), this.sql.end({ timeout: 1 })]);
+    const closed = await Promise.allSettled([this.listenerSql.end({ timeout: 1 }), closeAdapterSql(this.sql, 1)]);
+    errors.push(...closed.filter((result): result is PromiseRejectedResult => result.status === "rejected").map((result) => result.reason));
     this.deliveredCursors.clear();
     this.channelReady.clear();
+    if (errors.length) throw new AggregateError(errors, "Realtime publisher shutdown failed.");
   }
 
   async dispose(): Promise<void> { await this.close(); }
@@ -457,12 +467,12 @@ export class PostgresCustomizationStore implements CustomizationStore {
   private readonly db: PostgresJsDatabase;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
-    this.db = drizzle(this.sql);
+    this.sql = postgresForOptions(options);
+    this.db = drizzle(options.connection?.drizzleSql ?? this.sql);
   }
 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
-  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
@@ -549,11 +559,11 @@ export class PostgresNamingSeriesStore implements NamingSeriesStore {
   private readonly sql: Sql;
 
   constructor(options: PostgresRepositoryOptions) {
-    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
+    this.sql = postgresForOptions(options);
   }
 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
-  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
@@ -589,13 +599,13 @@ export class PostgresMigrationStore implements MigrationStore {
 
   constructor(options: PostgresMigrationStoreOptions) {
     this.conversionRegistry = createOnlineConversionRegistry(options.conversionRegistry ?? []);
-    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
-    this.db = drizzle(this.sql);
+    this.sql = postgresForOptions(options);
+    this.db = drizzle(options.connection?.drizzleSql ?? this.sql);
     this.faultInjector = options.faultInjector;
   }
 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
-  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {

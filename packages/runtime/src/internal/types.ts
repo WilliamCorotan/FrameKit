@@ -97,6 +97,8 @@ export type MutationCommand = {
   expectedRevision?: number;
   idempotencyKey?: string;
   idempotencyFingerprint: string;
+  /** The UOW must lock the saga journal row and validate this fence until commit. */
+  sagaFence?: SagaFence;
   sideEffects: { audit: AuditEvent; outbox: OutboxEvent } | ((persisted: DocumentRecord) => { audit: AuditEvent; outbox: OutboxEvent });
   afterWrite(persisted?: DocumentRecord): Promise<void>;
 };
@@ -121,6 +123,49 @@ export type DocumentCommandResult = {
   mode: "atomic" | "saga";
   replayed: boolean;
   documents: Array<DocumentRecord | undefined>;
+};
+
+export type SagaFence = {
+  key: string;
+  owner: string;
+  phase: "running" | "compensating";
+  step: number;
+};
+
+export type SagaProgress = {
+  phase: "running" | "compensating" | "completed" | "compensated";
+  nextStep: number;
+  activeStep?: number;
+  compensationIndex?: number;
+  documents: Array<DocumentRecord | null>;
+  failure?: { code?: string; message: string };
+  compensationFailure?: { index: number; code?: string; message: string };
+};
+
+export type SagaRecord = SagaProgress & {
+  tenantId: string;
+  key: string;
+  command: string;
+  fingerprint: string;
+  operations: DocumentCommandOperation[];
+  owner?: string;
+  leaseUntil?: string;
+  revision: number;
+};
+
+/** Claims and saves must lock the same row as fenced mutation transactions. */
+export type SagaStore = LifecycleResource & {
+  claim(input: {
+    tenantId: string; key: string; command: string; fingerprint: string;
+    operations: DocumentCommandOperation[]; owner: string; leaseMs: number;
+  }): Promise<SagaRecord>;
+  get(tenantId: string, key: string): Promise<SagaRecord | undefined>;
+  /** Reject expired/lost ownership and stale revisions; terminal records are immutable. */
+  save(input: {
+    tenantId: string; key: string; owner: string; expectedRevision: number;
+    progress: SagaProgress; leaseMs: number; release?: boolean;
+  }): Promise<SagaRecord>;
+  describe(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
 };
 
 export type CommandRowPolicy = (input: {
@@ -345,6 +390,7 @@ export type RealtimePublisher = LifecycleResource & {
 };
 
 export type RuntimeOptions = {
+  deployment?: "development" | "production";
   repository?: DocumentRepository;
   audit?: AuditStore;
   outbox?: OutboxStore;
@@ -353,6 +399,8 @@ export type RuntimeOptions = {
   migrations?: MigrationStore;
   realtime?: RealtimePublisher;
   mutations?: MutationUnitOfWork;
+  sagas?: SagaStore;
+  sagaLeaseMs?: number;
   commandRowPolicy?: CommandRowPolicy;
   resources?: LifecycleResource[];
   attachmentStorage?: AttachmentStorage;
@@ -366,8 +414,10 @@ export type AttachmentStorage = {
   get(key: string): Promise<Uint8Array | undefined>;
   delete(key: string): Promise<void>;
   list(prefix: string): Promise<string[]>;
+  /** Capture before scanning document references. Every object/lease mutation changes revision. */
+  listCleanupCandidates?(prefix: string): Promise<Array<{ key: string; revision: string }>>;
   releaseLease?(key: string, owner: string): Promise<void>;
-  deleteIfUnleased?(key: string, options: { minimumAgeMs: number }): Promise<boolean>;
+  deleteIfUnleased?(key: string, options: { minimumAgeMs: number; expectedRevision: string }): Promise<boolean>;
   describe?(): RepositoryDiagnostics | Promise<RepositoryDiagnostics>;
   close?(): Promise<void>;
 };

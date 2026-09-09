@@ -1,13 +1,36 @@
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { defineApp, defineDocType, defineModule } from "@framekit/core";
 import { createExecutableMigrationArtifact, createRuntime, migrationChecksum } from "@framekit/runtime";
 import { isValidSemVer, runCli } from "./index.js";
 import { isValidSemVer as isValidReleaseSemVer } from "../../../scripts/semver.mjs";
 
+const deskFixture = vi.hoisted(() => ({ directory: "" }));
+vi.mock("@framekit/desk-assets", () => ({ deskAssetsDirectory: () => deskFixture.directory }));
+beforeAll(async () => {
+  deskFixture.directory = await mkdtemp(join(tmpdir(), "framekit-desk-fixture-"));
+  await writeFile(join(deskFixture.directory, "index.html"), '<script src="./framekit-config.js"></script>');
+  await writeFile(join(deskFixture.directory, "framekit-config.js"), 'window.__FRAMEKIT_CONFIG__ = { version: 1 };');
+});
+afterAll(async () => { await rm(deskFixture.directory, { recursive: true, force: true }); });
+
 describe("framekit CLI", () => {
+  it("installs Desk assets and preserves runtime configuration across upgrades", async () => {
+    await inTemporaryDirectory(async (directory) => {
+      await runCli(["install-desk", "public/desk", "--api-url", "https://api.example.test"], { log: () => undefined });
+      expect(await readFile(join(directory, "public/desk/index.html"), "utf8")).toContain("framekit-config.js");
+      const configPath = join(directory, "public/desk/framekit-config.js");
+      const config = await readFile(configPath, "utf8");
+      expect(config).toContain("https://api.example.test");
+      await expect(runCli(["install-desk", "public/desk"], { log: () => undefined })).rejects.toThrow("Refusing to overwrite");
+      await runCli(["install-desk", "public/desk", "--force"], { log: () => undefined });
+      expect(await readFile(configPath, "utf8")).toBe(config);
+      await expect(runCli(["install-desk", "../outside", "--dry-run"], { log: () => undefined })).rejects.toThrow("outside");
+      await expect(runCli(["install-desk", "elsewhere", "--api-url", "https://user:secret@example.test"], { log: () => undefined })).rejects.toThrow("without credentials");
+    });
+  });
   it.each([
     ["0.0.0", true], ["1.2.3", true], ["1.2.3-alpha.1", true], ["1.2.3+build.5", true],
     ["1.2.3-alpha.1+build.5", true], ["01.2.3", false], ["1.02.3", false], ["1.2.03", false],
