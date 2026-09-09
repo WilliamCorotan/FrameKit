@@ -1,6 +1,6 @@
 import type { MfaFactor, MfaStore } from "@framekit/auth";
 import type { Sql } from "postgres";
-import { closeAdapterSql, postgresForOptions } from "./connection.js";
+import { closeAdapterSql, postgresForOptions, runBootstrapMigrations } from "./connection.js";
 import type { PostgresRepositoryOptions } from "./types.js";
 const DEFAULT_ATTEMPT_LIMIT = 5;
 const DEFAULT_ATTEMPT_WINDOW_MS = 5 * 60_000;
@@ -21,8 +21,8 @@ export class PostgresMfaStore implements MfaStore {
   }
 
   async migrate(): Promise<void> {
-    await this.sql`create table if not exists framekit_mfa_factors (tenant_id text not null, user_id text not null, revision integer not null, factor jsonb not null, expires_at timestamptz, primary key (tenant_id, user_id))`;
-    await this.sql`create table if not exists framekit_mfa_attempts (tenant_id text not null, user_id text not null, count integer not null, expires_at timestamptz not null, primary key (tenant_id, user_id))`;
+    await runBootstrapMigrations(this.sql, `create table if not exists framekit_mfa_factors (tenant_id text not null, user_id text not null, revision integer not null, factor jsonb not null, expires_at timestamptz, primary key (tenant_id, user_id))`,
+      `create table if not exists framekit_mfa_attempts (tenant_id text not null, user_id text not null, count integer not null, expires_at timestamptz not null, primary key (tenant_id, user_id))`);
   }
 
   async start(): Promise<void> { await this.sql`select 1`; }

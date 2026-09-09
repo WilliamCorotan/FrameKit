@@ -3,6 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, FramekitError, type DocumentCommandRequest, type TenantContext } from "@framekit/core";
 import { createRuntime, type MutationCommand, type MutationUnitOfWork, type SagaStore } from "@framekit/runtime";
 import { PostgresDocumentRepository, PostgresMutationUnitOfWork, PostgresSagaStore, createAuditTableSql, createDocumentTableSql, createMutationTablesSql, createOutboxTableSql } from "./index.js";
+import { runBootstrapMigrations } from "./connection.js";
 import type { PostgresMutationStage } from "./types.js";
 
 const connectionString = process.env.DATABASE_URL;
@@ -37,7 +38,7 @@ describe.skipIf(!connectionString)("durable saga recovery and mutation fencing",
   const resources: Array<{ close(): Promise<void> }> = [];
 
   beforeAll(async () => {
-    for (const statement of [createDocumentTableSql(), createAuditTableSql(), createOutboxTableSql(), createMutationTablesSql()]) await sql.unsafe(statement);
+    await runBootstrapMigrations(sql, createDocumentTableSql(), createAuditTableSql(), createOutboxTableSql(), createMutationTablesSql());
     const store = new PostgresSagaStore({ connectionString: connectionString! });
     await store.migrate();
     await store.close();

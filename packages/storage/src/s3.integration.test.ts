@@ -19,7 +19,7 @@ describe.skipIf(!url || !endpoint)("durable S3 attachment storage", () => {
   const identity = JSON.stringify([namespace, bucket, "framekit"]);
   beforeAll(async () => {
     await client.send(new CreateBucketCommand({ Bucket: bucket }));
-    await storage.migrate();
+    await Promise.all(Array.from({ length: 8 }, () => new S3AttachmentStorage(options).migrate()));
     await storage.start();
   });
   afterAll(async () => {

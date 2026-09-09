@@ -112,3 +112,5 @@ After building packages, run `DATABASE_URL=<disposable-postgres> pnpm verify:cra
 ### Node server request and shutdown bounds
 
 The generated server and CRM bridge cap request bodies at 16 MiB by default (`FRAMEKIT_MAX_REQUEST_BYTES`, positive safe integer bytes) and return 413 before passing oversized content to Nitro. Responses stream with backpressure, including SSE; client disconnects abort the adapter request and response stream. Shutdown aborts active requests and closes adapter resources, with a five-second deadline (`FRAMEKIT_SHUTDOWN_TIMEOUT_MS`, 1–60,000 milliseconds); an exceeded deadline exits non-zero. Account for encoded attachment size when choosing a request limit. Configure matching limits and timeouts at the reverse proxy.
+
+Framework bootstrap `migrate()` calls coordinate with a database-scoped transaction advisory lock, including the S3 attachment registry. Each call uses one connection for the lock and its DDL, preventing concurrent replicas from racing PostgreSQL catalog creation. Keep the documented document-before-mutation initialization order. Application migration planning/apply retains its separate approval and locking contract.

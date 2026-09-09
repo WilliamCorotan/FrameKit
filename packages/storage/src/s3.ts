@@ -31,7 +31,10 @@ export class S3AttachmentStorage implements AttachmentStorage {
 
   async migrate(): Promise<void> {
     this.assertOpen();
-    await this.options.sql`
+    await this.options.sql.begin(async (tx) => {
+      // Coordinate bootstrap with the database adapters on this transaction connection.
+      await tx`select pg_advisory_xact_lock(1718774644, 1)`;
+      await tx`
       create table if not exists framekit_attachment_objects (
         namespace text not null, logical_key text not null, physical_key text not null,
         revision text not null, state text not null check (state in ('uploading', 'live', 'deleting', 'deleted')),
@@ -39,7 +42,8 @@ export class S3AttachmentStorage implements AttachmentStorage {
         created_at timestamptz not null default clock_timestamp(), checked_at timestamptz not null default clock_timestamp(),
         primary key (namespace, logical_key), unique (namespace, physical_key)
       )
-    `;
+      `;
+    });
   }
 
   async start(signal?: AbortSignal): Promise<void> {
