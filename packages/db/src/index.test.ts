@@ -1,3 +1,4 @@
+import { assertPostgresUrl } from "./connection.js";
 import { describe, expect, it, vi } from "vitest";
 import { getTableConfig } from "drizzle-orm/pg-core";
 import { migrationChecksum, type MigrationPlan } from "@framekit/runtime";
@@ -41,7 +42,7 @@ describe("db migration sql", () => {
     expect(() => createPostgresConnection({ connectionString: "postgres://example.test/framekit", max: 2, listenerConnections: 1, totalBudget: 2 })).toThrow("budget");
     expect(() => createPostgresConnection({ connectionString: "postgres://example.test/framekit", max: 2, listenerConnections: -1 })).toThrow("listener");
     expect(() => createPostgresConnection({ connectionString: "postgres://example.test/framekit", max: 2, listenerConnections: 1.5 })).toThrow("listener");
-    expect(() => createPostgresConnection({ connectionString: "not a postgres url", max: 2 })).toThrow("Invalid Postgres connection configuration");
+    expect(() => createPostgresConnection({ connectionString: "not a postgres url", max: 2 })).toThrow("explicit PostgreSQL connection URL");
   });
   it("normalizes adversarial migration identifiers in linear time", () => {
     expect(indexIdentifier({
@@ -224,3 +225,13 @@ async function migrationPlanFixture(): Promise<MigrationPlan> {
   };
   return { ...plan, checksum: await migrationChecksum(plan) };
 }
+
+describe("explicit PostgreSQL connection URLs", () => {
+  it("rejects missing URLs and implicit database targets", () => {
+    for (const value of [undefined, "", "  ", "postgres://localhost", "https://example.test/database"]) {
+      expect(() => assertPostgresUrl(value as string)).toThrow("explicit PostgreSQL connection URL");
+      expect(() => createPostgresConnection({ connectionString: value as string, max: 2 })).toThrow("explicit PostgreSQL connection URL");
+    }
+    expect(() => assertPostgresUrl("postgres://test:test@primary.example:5432,replica.example:5432/app?target_session_attrs=read-write")).not.toThrow();
+  });
+});

@@ -1,3 +1,4 @@
+import { loadLocalEnvironment, requireDatabaseUrl } from "./environment.mjs";
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { once } from "node:events";
@@ -5,6 +6,9 @@ import { fileURLToPath } from "node:url";
 import { defineApp, defineDocType, defineModule } from "../packages/core/dist/index.js";
 import { createRuntime } from "../packages/runtime/dist/index.js";
 import { createPostgresConnection, PostgresDocumentRepository, PostgresMutationUnitOfWork, PostgresAuditStore, PostgresOutboxStore } from "../packages/db/dist/index.js";
+
+loadLocalEnvironment();
+requireDatabaseUrl();
 
 if (!process.env.DATABASE_URL) throw new Error("Crash verification requires a disposable DATABASE_URL.");
 const doctype = defineDocType({ name: "crash_probe", label: "Crash probe", fields: [{ name: "title", label: "Title", type: "text" }] });

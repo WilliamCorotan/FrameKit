@@ -12,8 +12,10 @@ describe("production configuration", () => {
     expect(() => productionConfiguration({ NODE_ENV: "production" })).toThrow("DATABASE_URL");
     expect(() => productionConfiguration({ ...production, FRAMEKIT_SETTINGS_KEYS: undefined })).toThrow("FRAMEKIT_SETTINGS_KEYS");
     expect(() => productionConfiguration({ ...production, FRAMEKIT_S3_BUCKET: undefined })).toThrow("FRAMEKIT_S3_BUCKET");
+    expect(productionConfiguration({ ...production, DATABASE_URL: "postgres://test:test@primary.example:5432,replica.example:5432/app" }).databaseUrl).toContain("replica.example");
     expect(productionConfiguration(production)).toMatchObject({ production: true, poolMax: 10, connectionBudget: 11 });
-    expect(productionConfiguration({})).toMatchObject({ production: false, databaseUrl: undefined });
+    expect(() => productionConfiguration({})).toThrow("DATABASE_URL");
+    expect(productionConfiguration({ NODE_ENV: "test", FRAMEKIT_TEST_MEMORY_STORAGE: "true" })).toMatchObject({ production: false, databaseUrl: undefined });
   });
   it("rejects insecure endpoints and invalid budgets without exposing configuration values", () => {
     expect(() => productionConfiguration({ ...production, FRAMEKIT_S3_ENDPOINT: "http://localhost:9000" })).toThrow("HTTPS");

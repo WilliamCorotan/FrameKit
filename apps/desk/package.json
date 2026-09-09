@@ -9,7 +9,7 @@
     "dev": "vite --host 0.0.0.0 --port 5173",
     "preview": "vite preview",
     "test:browser": "playwright test --config playwright.config.ts",
-    "test:browser:fullstack": "pnpm build:fullstack && playwright test --config playwright.fullstack.config.ts",
+    "test:browser:fullstack": "node ../../scripts/with-env.mjs --database && pnpm build:fullstack && node ../../scripts/with-env.mjs --database pnpm exec playwright test --config playwright.fullstack.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

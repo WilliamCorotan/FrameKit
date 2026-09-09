@@ -8,18 +8,18 @@ Framekit apps use Nitro as the default host engine.
 docker compose up --build
 ```
 
-`docker-compose.yml` is a local/reference stack, not a production deployment template. It includes the Nitro API, Postgres, and Redis; Postgres and Redis publish only to `127.0.0.1`. The local password defaults to `framekit`.
+`docker-compose.yml` is a local/reference stack, not a production deployment template. It includes the Nitro API, Postgres, and Redis; Postgres and Redis publish only to `127.0.0.1`. Supply the database URL and PostgreSQL password in `.env` before starting it.
 
-To override the local password, set this pair together:
+Set this pair together, using the same password:
 
 ```bash
-FRAMEKIT_POSTGRES_PASSWORD='p@:/#ss'
-FRAMEKIT_POSTGRES_URL='postgresql://framekit:p%40%3A%2F%23ss@postgres:5432/framekit'
+FRAMEKIT_POSTGRES_PASSWORD='<your local PostgreSQL password>'
+DATABASE_URL='<your PostgreSQL URL with its password percent-encoded>'
 ```
 
-`FRAMEKIT_POSTGRES_PASSWORD` is passed to Postgres unchanged. `FRAMEKIT_POSTGRES_URL` is passed as the CRM's `DATABASE_URL`; its password component must be percent-encoded as a URI user-info value. Compose does not URL-encode interpolated values, so never interpolate the raw password into a connection URL. When `DATABASE_URL` is set, the CRM example uses durable Postgres stores for documents, users, audit events, outbox events, custom fields, views, and naming series.
+`FRAMEKIT_POSTGRES_PASSWORD` is passed to Postgres unchanged. `DATABASE_URL` is passed to CRM unchanged; its password component must be percent-encoded as a URI user-info value. Compose does not URL-encode interpolated values, so never interpolate the raw password into a connection URL. CRM requires `DATABASE_URL` and uses durable Postgres stores for documents, users, audit events, outbox events, custom fields, views, and naming series.
 
-Do not deploy the bundled Postgres or Redis services to production. Provision a private network or managed Postgres and Redis service, create distinct least-privilege runtime credentials, supply them through the deployment platform's secret manager, and set `DATABASE_URL` and `REDIS_URL` accordingly. Do not reuse the Compose password default or expose either data service on a public interface.
+Do not deploy the bundled Postgres or Redis services to production. Provision a private network or managed Postgres and Redis service, create distinct least-privilege runtime credentials, supply them through the deployment platform's secret manager, and set `DATABASE_URL` and `REDIS_URL` accordingly. Compose has no password or URL default. Do not expose either data service on a public interface.
 
 Required production storage configuration and recovery details are in [Production storage](storage.md). The CRM now rejects missing database, settings keyring, or S3 configuration when `NODE_ENV=production`; the reference Compose stack requires an externally provisioned private bucket.
 
@@ -114,3 +114,13 @@ After building packages, run `DATABASE_URL=<disposable-postgres> pnpm verify:cra
 The generated server and CRM bridge cap request bodies at 16 MiB by default (`FRAMEKIT_MAX_REQUEST_BYTES`, positive safe integer bytes) and return 413 before passing oversized content to Nitro. Responses stream with backpressure, including SSE; client disconnects abort the adapter request and response stream. Shutdown aborts active requests and closes adapter resources, with a five-second deadline (`FRAMEKIT_SHUTDOWN_TIMEOUT_MS`, 1–60,000 milliseconds); an exceeded deadline exits non-zero. Account for encoded attachment size when choosing a request limit. Configure matching limits and timeouts at the reverse proxy.
 
 Framework bootstrap `migrate()` calls coordinate with a database-scoped transaction advisory lock, including the S3 attachment registry. Each call uses one connection for the lock and its DDL, preventing concurrent replicas from racing PostgreSQL catalog creation. Keep the documented document-before-mutation initialization order. Application migration planning/apply retains its separate approval and locking contract.
+
+## Database configuration
+
+No database URL is inferred from source code, Compose defaults, PostgreSQL driver defaults, or a missing environment variable. CRM startup, explicit service/full-stack test commands, and recovery/load probes reject a missing or malformed `DATABASE_URL`.
+
+Locally, copy `.env.example` to the ignored root `.env` and supply an explicit URL with a host and database name. Database commands load this file without overriding existing process environment values. CLI migration commands load the invoking directory's `.env`; an explicit `--database-url` argument remains supported. Use the Compose host `postgres` only for commands inside its network; host-side tools must use the actual published host/port. Do not run destructive integration/recovery fixtures against a production database.
+
+GitHub database jobs use the **ci** environment: `DATABASE_URL` and `POSTGRES_PASSWORD` are secrets; `POSTGRES_USER` and `POSTGRES_DB` are variables. The URL must match the job's isolated PostgreSQL service, which publishes port 5432 to its runner. Both matrix entries and Desk have separate service containers, so they can use the same configured database name. CI does not load local `.env` files, and missing secrets fail configuration validation instead of selecting another database. Fork runs without secrets require a maintainer-controlled run with access to that environment.
+
+In-memory adapters remain available for explicit library tests. CRM's isolated built-server smoke explicitly selects `FRAMEKIT_TEST_MEMORY_STORAGE=true` with `NODE_ENV=test`; that switch is rejected outside tests and is never a fallback for a missing URL.

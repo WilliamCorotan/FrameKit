@@ -9,6 +9,8 @@ if (!existsSync(serverEntry)) {
   throw new Error("Built CRM server not found. Run `pnpm --filter @framekit/example-crm build` before `smoke:built`.");
 }
 
+process.env.NODE_ENV = "test";
+process.env.FRAMEKIT_TEST_MEMORY_STORAGE = "true";
 process.env.FRAMEKIT_AUTH_SECRET = "BuiltSmoke!9qL2vN7xK4mR8sW5cT1hP6z";
 process.env.FRAMEKIT_ADMIN_EMAIL = "smoke@framekit.test";
 process.env.FRAMEKIT_ADMIN_PASSWORD = "Built smoke bootstrap passphrase";

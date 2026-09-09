@@ -24,6 +24,9 @@ jobs:
       - run: pnpm test:coverage
 
   service-integration:
+    environment: ci
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
     strategy:
       matrix:
         include:
@@ -37,13 +40,13 @@ jobs:
       postgres:
         image: postgres:${{ matrix.postgres }}
         env:
-          POSTGRES_USER: framekit
-          POSTGRES_PASSWORD: framekit
-          POSTGRES_DB: framekit
+          POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ vars.POSTGRES_DB }}
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U framekit -d framekit"
+          --health-cmd "pg_isready -U ${{ vars.POSTGRES_USER }} -d ${{ vars.POSTGRES_DB }}"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -65,6 +68,8 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - name: Require configured database URL
+        run: node scripts/with-env.mjs --database
       - run: pnpm install --frozen-lockfile
       - name: Start S3 integration fixture
         run: |
@@ -77,20 +82,15 @@ jobs:
           exit 1
       - run: pnpm test:storage
         env:
-          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit
           FRAMEKIT_TEST_S3_ENDPOINT: http://localhost:9000
       - run: pnpm test:services
         env:
-          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit
           REDIS_URL: redis://localhost:6379
       - run: pnpm --filter @framekit/db... build
       - run: pnpm verify:crash
-        env:
-          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit
       - run: pnpm test:services:coverage
         if: matrix.postgres == 16 && matrix.redis == 7
         env:
-          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit
           REDIS_URL: redis://localhost:6379
 
   built-smoke:
@@ -130,19 +130,22 @@ jobs:
       - run: pnpm test:frontends:browser
 
   desk-fullstack:
+    environment: ci
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: framekit
-          POSTGRES_PASSWORD: framekit
-          POSTGRES_DB: framekit_desk
+          POSTGRES_USER: ${{ vars.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ vars.POSTGRES_DB }}
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U framekit -d framekit_desk"
+          --health-cmd "pg_isready -U ${{ vars.POSTGRES_USER }} -d ${{ vars.POSTGRES_DB }}"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -155,11 +158,11 @@ jobs:
         with:
           node-version: 24
           cache: pnpm
+      - name: Require configured database URL
+        run: node scripts/with-env.mjs --database
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @framekit/desk exec playwright install --with-deps chromium firefox
       - run: pnpm test:desk:fullstack
-        env:
-          DATABASE_URL: postgres://framekit:framekit@localhost:5432/framekit_desk
 
   package-exports:
     strategy:

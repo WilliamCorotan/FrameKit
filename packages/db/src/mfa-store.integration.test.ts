@@ -5,6 +5,7 @@ import { PostgresMfaStore } from "./index.js";
 const connectionString = process.env.DATABASE_URL;
 
 describe.skipIf(!connectionString)("PostgresMfaStore", () => {
+  if (!connectionString) return;
   const sql = postgres(connectionString!);
   const tenantId = `mfa-${crypto.randomUUID()}`;
   const first = new PostgresMfaStore({ connectionString: connectionString! });

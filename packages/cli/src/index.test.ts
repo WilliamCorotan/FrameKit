@@ -10,11 +10,12 @@ import { isValidSemVer as isValidReleaseSemVer } from "../../../scripts/semver.m
 const deskFixture = vi.hoisted(() => ({ directory: "" }));
 vi.mock("@framekit/desk-assets", () => ({ deskAssetsDirectory: () => deskFixture.directory }));
 beforeAll(async () => {
+  vi.stubEnv("FRAMEKIT_TEST_MEMORY_STORAGE", "true");
   deskFixture.directory = await mkdtemp(join(tmpdir(), "framekit-desk-fixture-"));
   await writeFile(join(deskFixture.directory, "index.html"), '<script src="./framekit-config.js"></script>');
   await writeFile(join(deskFixture.directory, "framekit-config.js"), 'window.__FRAMEKIT_CONFIG__ = { version: 1 };');
 });
-afterAll(async () => { await rm(deskFixture.directory, { recursive: true, force: true }); });
+afterAll(async () => { vi.unstubAllEnvs(); await rm(deskFixture.directory, { recursive: true, force: true }); });
 
 describe("framekit CLI", () => {
   it("installs Desk assets and preserves runtime configuration across upgrades", async () => {
