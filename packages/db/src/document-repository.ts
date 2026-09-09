@@ -51,7 +51,7 @@ import { framekitDocuments } from "./schema.js";
 import type { PostgresRepositoryOptions } from "./types.js";
 import { createDocumentTableSql } from "./ddl.js";
 import { postgresRevisionConflict, rowToRecord } from "./document-mapping.js";
-import { closeAdapterSql, postgresForOptions } from "./connection.js";
+import { closeAdapterSql, postgresForOptions, runBootstrapMigrations } from "./connection.js";
 
 export class PostgresDocumentRepository implements DocumentRepository {
   private readonly sql: Sql;
@@ -69,7 +69,7 @@ export class PostgresDocumentRepository implements DocumentRepository {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createDocumentTableSql()));
+    await runBootstrapMigrations(this.sql, createDocumentTableSql());
   }
 
   describe(): RepositoryDiagnostics {

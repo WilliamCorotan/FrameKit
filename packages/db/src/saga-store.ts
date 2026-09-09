@@ -2,7 +2,7 @@ import { FramekitError } from "@framekit/core";
 import type { SagaProgress, SagaRecord, SagaStore } from "@framekit/runtime";
 import type postgres from "postgres";
 import type { Sql } from "postgres";
-import { closeAdapterSql, postgresForOptions } from "./connection.js";
+import { closeAdapterSql, postgresForOptions, runBootstrapMigrations } from "./connection.js";
 import type { PostgresRepositoryOptions } from "./types.js";
 
 type SagaRow = {
@@ -19,14 +19,14 @@ export class PostgresSagaStore implements SagaStore {
   constructor(options: PostgresRepositoryOptions) { this.sql = postgresForOptions(options); }
 
   async migrate(): Promise<void> {
-    await this.sql`
+    await runBootstrapMigrations(this.sql, `
       create table if not exists framekit_sagas (
         tenant_id text not null, key text not null, command text not null,
         fingerprint text not null, operations jsonb not null, progress jsonb not null,
         owner text, lease_until timestamptz, revision integer not null,
         primary key (tenant_id, key)
       )
-    `;
+    `);
   }
 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1 from framekit_sagas limit 0`; }

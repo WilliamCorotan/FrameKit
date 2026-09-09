@@ -51,7 +51,7 @@ import { framekitDocuments } from "./schema.js";
 import type { PostgresMutationUnitOfWorkOptions } from "./types.js";
 import { createMutationTablesSql } from "./ddl.js";
 import { postgresRevisionConflict, rowToRecord } from "./document-mapping.js";
-import { closeAdapterSql, postgresForOptions } from "./connection.js";
+import { closeAdapterSql, postgresForOptions, runBootstrapMigrations } from "./connection.js";
 
 export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
   private readonly sql: Sql;
@@ -67,7 +67,7 @@ export class PostgresMutationUnitOfWork implements MutationUnitOfWork {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.sql.unsafe(createMutationTablesSql());
+    await runBootstrapMigrations(this.sql, createMutationTablesSql());
   }
 
   describe(): RepositoryDiagnostics {

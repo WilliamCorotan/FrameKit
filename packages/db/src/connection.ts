@@ -48,3 +48,12 @@ export function postgresForOptions(options: PostgresRepositoryOptions): Sql {
 export async function closeAdapterSql(sql: Sql, timeout = 5): Promise<void> {
   if (!sharedSql.has(sql)) await sql.end({ timeout });
 }
+
+/** Static framework bootstrap DDL only; application migrations retain their own locking. */
+export async function runBootstrapMigrations(sql: Sql, ...statements: string[]): Promise<void> {
+  await sql.begin(async (tx) => {
+    // Shared with other Framekit bootstrap adapters, including S3 lease storage.
+    await tx`select pg_advisory_xact_lock(1718774644, 1)`;
+    for (const statement of statements) await tx.unsafe(statement);
+  });
+}

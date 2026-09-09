@@ -51,7 +51,7 @@ import { framekitAuditEvents, framekitCustomFields, framekitMigrations, framekit
 import type { PostgresMigrationStoreOptions, PostgresRealtimePublisherOptions, PostgresRepositoryOptions } from "./types.js";
 import { createAuditTableSql, createCustomFieldTableSql, createMigrationTableSql, createMutationTablesSql, createNamingSeriesTableSql, createOutboxTableSql, createPostgresMigrationStatements, createRealtimeTableSql, createSettingValueTableSql, createViewTableSql, executableStatements, validateExecutableMigration } from "./ddl.js";
 import { indexIdentifier, sqlLiteral } from "./migration-sql-helpers.js";
-import { closeAdapterSql, postgresForOptions } from "./connection.js";
+import { closeAdapterSql, postgresForOptions, runBootstrapMigrations } from "./connection.js";
 
 export class PostgresAuditStore implements AuditStore {
   private readonly sql: Sql;
@@ -67,7 +67,7 @@ export class PostgresAuditStore implements AuditStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createAuditTableSql()));
+    await runBootstrapMigrations(this.sql, createAuditTableSql());
   }
 
   describe(): RepositoryDiagnostics {
@@ -113,7 +113,7 @@ export class PostgresOutboxStore implements OutboxStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createOutboxTableSql()));
+    await runBootstrapMigrations(this.sql, createOutboxTableSql());
   }
 
   describe(): RepositoryDiagnostics {
@@ -288,7 +288,7 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
   }
 
   async migrate(): Promise<void> {
-    await this.sql.unsafe(createRealtimeTableSql());
+    await runBootstrapMigrations(this.sql, createRealtimeTableSql());
   }
 
   describe(): RepositoryDiagnostics {
@@ -476,9 +476,9 @@ export class PostgresCustomizationStore implements CustomizationStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createCustomFieldTableSql()));
-    await this.db.execute(drizzleSql.raw(createViewTableSql()));
-    await this.db.execute(drizzleSql.raw(createSettingValueTableSql()));
+    await runBootstrapMigrations(this.sql, createCustomFieldTableSql(),
+      createViewTableSql(),
+      createSettingValueTableSql());
   }
 
   describe(): RepositoryDiagnostics {
@@ -567,7 +567,7 @@ export class PostgresNamingSeriesStore implements NamingSeriesStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.sql.unsafe(createNamingSeriesTableSql());
+    await runBootstrapMigrations(this.sql, createNamingSeriesTableSql());
   }
 
   describe(): RepositoryDiagnostics {
@@ -609,7 +609,7 @@ export class PostgresMigrationStore implements MigrationStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(`${createMigrationTableSql()}\n${createMutationTablesSql()}`));
+    await runBootstrapMigrations(this.sql, `${createMigrationTableSql()}\n${createMutationTablesSql()}`);
   }
 
   describe(): RepositoryDiagnostics {

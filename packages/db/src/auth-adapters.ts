@@ -50,7 +50,7 @@ import {
 import { framekitApiTokens, framekitAuthAuditEvents, framekitAuthIdentityLinks, framekitRoles, framekitSessionRevocations, framekitUsers } from "./schema.js";
 import type { PostgresRepositoryOptions } from "./types.js";
 import { createApiTokenTableSql, createAuthIdentityLifecycleTablesSql, createRoleTableSql, createSessionRevocationTableSql, createUserTableSql } from "./ddl.js";
-import { closeAdapterSql, postgresForOptions } from "./connection.js";
+import { closeAdapterSql, postgresForOptions, runBootstrapMigrations } from "./connection.js";
 
 export class PostgresUserStore implements UserStore {
   private readonly sql: Sql;
@@ -66,7 +66,7 @@ export class PostgresUserStore implements UserStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createUserTableSql()));
+    await runBootstrapMigrations(this.sql, createUserTableSql());
   }
 
   async list(tenantId: string): Promise<AuthUser[]> {
@@ -209,7 +209,7 @@ export class PostgresRoleStore implements RoleStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createRoleTableSql()));
+    await runBootstrapMigrations(this.sql, createRoleTableSql());
   }
 
   async list(tenantId: string): Promise<AuthRole[]> {
@@ -269,7 +269,7 @@ export class PostgresApiTokenStore implements ApiTokenStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createApiTokenTableSql()));
+    await runBootstrapMigrations(this.sql, createApiTokenTableSql());
   }
 
   async list(tenantId: string): Promise<ApiTokenRecord[]> {
@@ -325,7 +325,7 @@ export class PostgresSessionRevocationStore implements SessionRevocationStore {
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {
-    await this.db.execute(drizzleSql.raw(createSessionRevocationTableSql()));
+    await runBootstrapMigrations(this.sql, createSessionRevocationTableSql());
   }
 
   async revoke(sessionId: string, expiresAt: string): Promise<void> {
@@ -364,7 +364,9 @@ export class PostgresAuthIdentityLinkStore implements AuthIdentityLinkStore {
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
   async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
-  async migrate(): Promise<void> { await this.db.execute(drizzleSql.raw(createAuthIdentityLifecycleTablesSql())); }
+  async migrate(): Promise<void> {
+    await runBootstrapMigrations(this.sql, createAuthIdentityLifecycleTablesSql());
+  }
   async find(tenantId: string, providerId: string, subject: string): Promise<AuthIdentityLink | undefined> {
     const rows = await this.db.select().from(framekitAuthIdentityLinks).where(and(
       eq(framekitAuthIdentityLinks.tenantId, tenantId), eq(framekitAuthIdentityLinks.providerId, providerId), eq(framekitAuthIdentityLinks.subject, subject)
@@ -389,7 +391,9 @@ export class PostgresAuthLifecycleTokenStore implements AuthLifecycleTokenStore 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
   async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
-  async migrate(): Promise<void> { await this.sql.unsafe(createAuthIdentityLifecycleTablesSql()); }
+  async migrate(): Promise<void> {
+    await runBootstrapMigrations(this.sql, createAuthIdentityLifecycleTablesSql());
+  }
   async create(token: AuthLifecycleToken): Promise<AuthLifecycleToken> {
     await this.sql`insert into framekit_auth_lifecycle_tokens
       (id, tenant_id, kind, token_hash, email, user_id, name, roles, permissions, created_at, expires_at, used_at)
@@ -428,7 +432,9 @@ export class PostgresOidcAuthorizationStateStore implements OidcAuthorizationSta
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
   async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
-  async migrate(): Promise<void> { await this.sql.unsafe(createAuthIdentityLifecycleTablesSql()); }
+  async migrate(): Promise<void> {
+    await runBootstrapMigrations(this.sql, createAuthIdentityLifecycleTablesSql());
+  }
   async create(state: OidcAuthorizationState): Promise<OidcAuthorizationState> {
     await this.sql`insert into framekit_oidc_authorization_states
       (id, provider_id, tenant_id, state_hash, nonce_hash, encrypted_code_verifier, return_to, redirect_uri, created_at, expires_at, used_at)
@@ -474,7 +480,9 @@ export class PostgresAuthAuditStore implements AuthAuditSink {
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.sql`select 1`; }
   async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
-  async migrate(): Promise<void> { await this.db.execute(drizzleSql.raw(createAuthIdentityLifecycleTablesSql())); }
+  async migrate(): Promise<void> {
+    await runBootstrapMigrations(this.sql, createAuthIdentityLifecycleTablesSql());
+  }
   async record(event: AuthAuditEvent): Promise<void> {
     await this.db.insert(framekitAuthAuditEvents).values({ ...event, actorUserId: event.actorUserId ?? null, targetUserId: event.targetUserId ?? null,
       success: event.success ? 1 : 0, createdAt: new Date(event.createdAt), details: event.details ?? null });
