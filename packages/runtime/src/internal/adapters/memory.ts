@@ -189,7 +189,7 @@ export class InMemoryDocumentRepository implements DocumentRepository {
 }
 
 export class InMemoryAttachmentStorage implements AttachmentStorage {
-  private readonly objects = new Map<string, { bytes: Uint8Array; createdAt: number; leaseOwner?: string; leaseUntil?: number }>();
+  private readonly objects = new Map<string, { bytes: Uint8Array; createdAt: number; revision: string; leaseOwner?: string; leaseUntil?: number }>();
 
   constructor(private readonly currentTime: () => number = Date.now) {}
 
@@ -200,7 +200,7 @@ export class InMemoryAttachmentStorage implements AttachmentStorage {
   async put(key: string, bytes: Uint8Array, metadata: { contentType: string; lease?: { owner: string; durationMs: number } }): Promise<void> {
     const now = this.currentTime();
     this.objects.set(key, {
-      bytes: new Uint8Array(bytes), createdAt: now,
+      bytes: new Uint8Array(bytes), createdAt: now, revision: crypto.randomUUID(),
       ...(metadata.lease ? { leaseOwner: metadata.lease.owner, leaseUntil: now + metadata.lease.durationMs } : {})
     });
   }
@@ -223,14 +223,19 @@ export class InMemoryAttachmentStorage implements AttachmentStorage {
     if (object?.leaseOwner === owner) {
       delete object.leaseOwner;
       delete object.leaseUntil;
+      object.revision = crypto.randomUUID();
     }
   }
 
-  async deleteIfUnleased(key: string, options: { minimumAgeMs: number }): Promise<boolean> {
+  async listCleanupCandidates(prefix: string): Promise<Array<{ key: string; revision: string }>> {
+    return [...this.objects.entries()].filter(([key]) => key.startsWith(prefix)).map(([key, object]) => ({ key, revision: object.revision }));
+  }
+
+  async deleteIfUnleased(key: string, options: { minimumAgeMs: number; expectedRevision: string }): Promise<boolean> {
     const object = this.objects.get(key);
-    if (!object) return false;
+    if (!object || object.revision !== options.expectedRevision) return false;
     const now = this.currentTime();
-    if (now - object.createdAt < options.minimumAgeMs || (object.leaseUntil !== undefined && object.leaseUntil > now)) return false;
+    if (now - object.createdAt < options.minimumAgeMs || object.leaseOwner !== undefined) return false;
     this.objects.delete(key);
     return true;
   }
@@ -426,6 +431,7 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
   }
 
   async execute(command: MutationCommand): Promise<{ document?: DocumentRecord; replayed: boolean }> {
+    if (command.sagaFence) throw new FramekitError("COMMAND_SAGA_FENCING_UNAVAILABLE", "This memory unit of work does not provide saga fencing.", 501);
     const idempotencyKey = command.idempotencyKey ? `${command.tenant.tenantId}:${command.idempotencyKey}` : undefined;
     const previous = this.mutationTail;
     let release!: () => void;
@@ -439,6 +445,7 @@ export class InMemoryMutationUnitOfWork implements MutationUnitOfWork {
   }
 
   async executeBatch(commands: MutationCommand[], options: { tenant: TenantContext; idempotencyKey?: string; idempotencyFingerprint: string }): Promise<MutationBatchResult> {
+    if (commands.some((command) => command.sagaFence)) throw new FramekitError("COMMAND_SAGA_FENCING_UNAVAILABLE", "This memory unit of work does not provide saga fencing.", 501);
     const key = options.idempotencyKey ? `${options.tenant.tenantId}:${options.idempotencyKey}` : undefined;
     const previous = this.mutationTail;
     let release!: () => void;

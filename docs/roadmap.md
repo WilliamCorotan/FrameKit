@@ -1,6 +1,6 @@
 # Framekit Roadmap
 
-> This file records the completed MVP phases and their history. The current production-maturity assessment, component percentages, missing features, and open GitHub work are maintained in [maturity-roadmap.md](maturity-roadmap.md). As of 2026-07-28, Framekit is assessed at 88% implementation toward a production-ready 1.0 and is a beta; [#60](https://github.com/WilliamCorotan/FrameKit/issues/60) is the sole remaining P2 reconciliation issue.
+> This file records the completed MVP phases and their history. The active implementation milestones and production release gates are maintained in [maturity-roadmap.md](maturity-roadmap.md#current-implementation-plan). As of 2026-09-09 the security baseline is complete; production composition, operational evidence, durable automation/native MFA, evolution contracts, and Desk distribution remain active work. Historical percentages and issue closure are not release gates.
 
 ## Implemented
 
@@ -64,7 +64,7 @@ Status: implemented
 Status: implemented for the beta
 
 - Generate typed SDK models from app metadata; generated endpoint parity is implemented and covered by the explicit HTTP endpoint matrix. The remaining developer-experience limitation is the intentionally un-packaged Desk template, pending stable asset, configuration, and upgrade contracts.
-- Add a `create-app` server template for Nitro, Docker/env, and a starter DocType. The scaffold intentionally excludes Desk; a future packaged Desk template requires its own stable asset and upgrade contract.
+- Add a `create-app` server template for Nitro, Docker/env, and a starter DocType. The September extension adds optional packaged Desk installation with `--desk`; see the active distribution milestone.
 - Add independently copyable React, Vue, Svelte, Solid, and vanilla TypeScript SDK examples with one shared API/environment contract. Implemented under `examples/frontends`; packaging the full Desk remains separate future work.
 - Add CI workflow, deployment presets docs, and package publishing metadata.
 - Publish lifecycle, compatibility, observability, security, contribution, and support contracts; enforce coverage and supply-chain gates in CI.

@@ -1,6 +1,6 @@
 # Framekit Maturity Roadmap
 
-Last reconciled: 2026-07-29. The original verification record remains evidence for the `515ffdca734d61142539c903b0f35b284f67a18b` merged #42 baseline; the stabilization record separately identifies the checks rerun for the current changes.
+Last reconciled: 2026-09-09 against security baseline `252aa7e`. Historical verification below applies only to its named commits. This document tracks implementation and release evidence separately; closed historical issues do not establish production readiness.
 
 Framekit is a beta, metadata-driven TypeScript business application framework. The selected metadata, HTTP, persistence, migration, job/realtime, Desk, SDK, and release-gate slices are implemented. This is not a claim of an unqualified production 1.0: the explicitly delegated capabilities and operating evidence below remain necessary for that bar.
 
@@ -12,12 +12,53 @@ Scores are evidence-based engineering estimates, not issue-completion percentage
 - **Implemented** means the bounded repository contract is present and tested. **Partial** means a supported path exists but the stated production depth or evidence is missing. **Delegated** means Framekit intentionally exposes a port or operator responsibility rather than pretending to supply that facility.
 - A score may rise only with source behavior, focused tests, production-like verification, and user/operator documentation. Coverage is a guardrail, not a score.
 
-## Overall assessment
+## Current implementation plan
 
-- Component-average implementation: **88%**.
-- Stage: **beta**. The P0 and P1 milestones and all feature issues are closed. [#60](https://github.com/WilliamCorotan/FrameKit/issues/60) is the only open P2 issue and closes with this reconciliation after its reviewed PR is merged.
+Stage: **beta**. The historical 88% estimate is retained below as context, not used as a completion gate. A production-ready release requires every applicable acceptance gate below to pass on a named commit. Public deployment, package publication, and a 1.0 release require separate authorization.
 
-## Modern framework component matrix
+The initial supported production target is a Node server, PostgreSQL, Redis/BullMQ, and durable attachment storage. Deployment-specific secrets, domains, capacity targets, and external identity-provider credentials must be supplied by the operator. Edge/serverless support is not inferred from Nitro compatibility.
+
+| Milestone | Status | Implementation and acceptance gate |
+| --- | --- | --- |
+| S0 — Security baseline | Complete (`252aa7e`) | Patch dependency advisories; browser-bound OIDC, verified-email linking, credential-bound sessions, owner-bound API tokens, and atomic auth mutations. Unit, real PostgreSQL, browser, built-server, and dependency checks pass. |
+| P1 — Durable production composition | Implemented and locally verified | Bounded shared PostgreSQL connections with explicit ownership; production secret encryption and rotation; durable attachment adapter with leases and conditional cleanup; reject accidental ephemeral production stores. Restart, isolation, cleanup-race, and shutdown tests pass. |
+| P2 — Operating and recovery evidence | Local evidence complete; staging qualification pending | Reproducible load/soak and fault harness; backup/restore drill; retention and dead-letter recovery; readiness and shutdown behavior; operator runbooks with measured capacity and recovery results. No unmeasured performance claims. |
+| P3 — Durable automation and native MFA | Implemented and locally verified | Crash-resumable saga state, lease fencing, deterministic compensation and idempotency; durable scheduler ownership; native MFA enrollment/challenge/recovery/step-up with rate limits and replay protection. Integrate HTTP/SDK/Desk and test cross-instance recovery. |
+| P4 — Safe evolution and public contracts | Framework contracts implemented; deployment upgrade qualification pending | Physical schema drift inspection, supported online migration/rollback boundaries, explicit API compatibility and pagination contracts, generated API reference, and versioned upgrade examples. Upgrade a previous supported installation and verify rollback/recovery. |
+| P5 — Distributable Desk and consumer experience | Implemented and locally verified | Packaged Desk assets with runtime configuration and version/upgrade contract; scaffold integration; error summaries and keyboard/accessibility coverage. Install, authenticate, perform business workflows, and upgrade outside this monorepo. |
+| P6 — Release qualification | Local checks passed; hosted/staging gates pending | All supported Node/service/browser matrices, packed consumers, security/CodeQL/SBOM checks, restore/load/fault evidence, and a representative external application pass against one release candidate. Outstanding limitations are explicit and accepted; release artifacts remain unpublished until authorized. |
+
+The framework is not marked production-ready while any applicable gate is pending. Native MFA, durable saga recovery, and Desk distribution are part of the expanded capability work; third-party services and an unlimited set of domain modules are not implied by "fully capable".
+
+### Current implementation evidence (working tree, September 2026)
+
+- P1: `@framekit/storage` provides context-bound AES-GCM keyrings and PostgreSQL/S3 immutable attachment generations. Cleanup uses revision snapshots and atomic leases; failed deletions rotate through repair. CRM enforces durable production configuration, preserves existing bootstrap users/roles, and owns shutdown. Shared PostgreSQL connections use separate raw/ORM codec pools under one explicit aggregate budget.
+- P1 checks: full lint/typecheck/coverage/build passed (**203 passed / 26 skipped**) before subsequent scheduler/MFA additions; live S3 **4/4**, mixed-codec PostgreSQL regressions, packed standalone consumer with **11 packages**, package exports, and built smoke passed. The final combined candidate still needs qualification.
+- P2: `verify:operations` ran **8,281** create/replay/update/read cycles in **30 seconds**, eight workers and four aggregate query connections; local cycle p95 **38.8 ms**. A subsequent five-second run recreated clients/adapters and verified durable replay (**1,404 cycles**). This is local component evidence, not an HTTP SLO or process-crash/failover result. The isolated `pg_dump`/`pg_restore` drill passed for a new database, tenant isolation, historical settings keys, and restored attachment registry/bytes. A ten-minute rerun passed **135,721 cycles**, p95 **60.6 ms**, after fixing truncated-UUID collisions. An actual SIGKILL probe passed committed-receipt replay and uncommitted transaction rollback. Managed-service failover, deployment-specific soak and operator SLO qualification remain open.
+- P3: Redis-backed `BullMqScheduler` persists schedules, supports bounded job-history retention, and passed restart/upsert/execution/removal tests. Native TOTP/recovery MFA is integrated across password/provider sign-in, HTTP, SDK and Desk, with session invalidation, recent-auth checks and atomic rate/replay limits. Auth tests **142**, PostgreSQL MFA **5**, retention **3**, and mocked Desk journeys **15** passed. Browser OIDC challenge forms passed HTTP integration tests; durable saga recovery passed **8** live PostgreSQL fault/fencing cases. Runtime unit/configuration checks passed **57**. Final combined qualification remains active.
+- Combined checks so far: **332 passed / 46 skipped** without external services, **67.19%** statement coverage; PostgreSQL 17 coverage **39 tests**, **78.79%** statements; PostgreSQL 16 adapter suite **38 tests**, Redis 7/8 **3 tests each**, PostgreSQL/S3 **4 tests** on both database majors. Later saga assertions may increase service counts. Skipped unit-run cases are exercised by explicit service commands.
+- P4: Structural PostgreSQL catalog inspection passed isolated schema/index/default regressions; a generated reference indexes all **12** public packages. Existing online migration tests cover approved conversion checkpoints, interruptions, concurrent operators and guarded rollback.
+- P5: A packed **12-package** standalone consumer passed installation, typecheck, build, authentication and CRUD, including `create-app --desk` and configuration-preserving Desk upgrade. The packaged `/desk/` browser journey passed. PostgreSQL-backed Chromium/Firefox passed **10/10** journeys including native MFA. All **12** public package export surfaces passed on Node **22** and **24**.
+
+### Final local qualification (September working tree)
+
+- `pnpm audit:all`: lint, recursive typechecks, coverage and builds passed; **352 passed / 46 skipped**, **67.19%** statement coverage. The service-dependent cases are checked separately.
+- PostgreSQL **16/17** adapter suites: **38 tests** each; PostgreSQL 17 coverage including CRM bootstrap: **39 tests**, **78.79%** statements. Redis **7/8**: **3 tests** each. PostgreSQL/S3 storage: **4 tests** on each database major.
+- Desk mocked browser **15/15**; durable PostgreSQL Chromium/Firefox **10/10** including MFA. Packaged Desk **1/1**; actual OIDC MFA form **2/2** across Chromium/Firefox. The browser check caught and fixed null-Origin form submissions by applying a strict-origin policy specifically to the MFA page.
+- Server bridge request limits, streaming/SSE, disconnect cancellation and bounded shutdown: **20 tests**, also passed on Node **22**. CLI combined suite **48 tests**. Final Nitro suite **31 tests**, root TypeScript check, CRM build and built smoke **2/2** passed after the form fix.
+- All **12** public packages passed export checks on Node **22/24**. Packed consumer installation, typecheck, build, authentication, CRUD and Desk install/upgrade passed.
+- Ten-minute component soak: **135,721 cycles**, p95 **60.6 ms**, eight workers/four aggregate query connections. Real SIGKILL after commit and during an uncommitted transaction passed, including a fresh database and zero remaining probe rows. Isolated database/keyring/object restoration passed.
+- Dependency audit: **zero known vulnerabilities**. Hosted CI/CodeQL/SBOM, external-provider deployment tests, previous deployed application upgrade, and the operator's staging capacity/failover/backup chain remain unverified. These checks cover the implementation submitted for review, not a published or deployed release candidate.
+
+The next action requires the staging target/domain and a reference to its existing credential source. Production deployment and release publication remain outside this implementation PR.
+
+### Latest completed evidence
+
+Security baseline `252aa7e`: `pnpm audit:all` passed on Node 24 with **188 passed / 20 skipped**, including lint, typechecks, coverage and builds. PostgreSQL 17 service coverage passed **20/20**, mocked Desk browser journeys **12/12**, PostgreSQL-backed Chromium/Firefox journeys **8/8**, and built-server smoke **2/2**. Dependency audit reported zero known vulnerabilities. Hosted CodeQL and external-provider browser OIDC were not run in that local verification.
+
+## Historical component matrix (July baseline)
+
+These estimates predate the September implementation above. They are retained as historical context; current acceptance is tracked by the P1–P6 gates, not these percentages.
 
 | Component | Score | Status and evidence | Remaining boundary |
 | --- | ---: | --- | --- |
@@ -34,13 +75,13 @@ Scores are evidence-based engineering estimates, not issue-completion percentage
 | Testing and CI | 90% | **Implemented:** unit, service matrices, service-backed Postgres coverage thresholds, concurrency/fault, built smoke, default/development package-export parity, packed standalone, mocked and full-stack browsers, compatibility matrix, immutable action pins, and coverage gates. | **Partial:** long load/soak, broader failure injection, and visual regression. |
 | Documentation and adoption | 76% | **Implemented:** README plus architecture, deployment, security, identity, consistency, querying, migrations, observability, compatibility, contribution, disclosure, support, and release docs. | **Partial:** generated API reference, versioned upgrade guides, and external tutorial feedback. |
 
-## Milestone reconciliation
+## Historical milestone reconciliation (July 2026)
 
 - **P0:** closed, **4/4** issues: #16, #17, #18, and #28.
 - **P1:** closed, **8/8** issues: #19 through #25 and #41.
-- **P2 Production Maturity:** #26, #27, #39, #40, #42, #45, #46, and #47 are closed. #60 is its sole remaining open issue; no feature issue remains open.
+- **P2 Production Maturity:** #26, #27, #39, #40, #42, #45, #46, and #47 were recorded closed; #60 tracked the documentation reconciliation. These are historical records, not a current GitHub issue query.
 
-The remaining 1.0 work is deliberately outside that closed feature scope: durable saga coordination, native MFA, load/soak/fault evidence, deeper physical-schema drift detection, generated API/versioned upgrade documentation, packaged Desk, and production object-storage/secret adapters.
+The expanded P1–P6 implementation plan above now tracks work outside that historical feature scope.
 
 ## Verification record
 
@@ -76,12 +117,13 @@ The following evidence was collected for the exact merged baseline above on 2026
 
 Hosted CI, CodeQL, dependency-security, release, and SBOM runs remain required before release promotion; no hosted result is claimed for these stabilization changes.
 
-## Highest-risk findings
+## Remaining production qualification boundaries
 
-1. Sagas compensate local completed steps but cannot survive a crash as a durable coordinator across external systems.
-2. Compatibility tests prove selected functional combinations, not sustained production load, soak behavior, or infrastructure-fault tolerance.
-3. Nitro and H3 are pre-release dependencies and need explicit compatibility evidence for every upgrade.
-4. Secret and attachment ports fail closed but are not production secret-manager or object-storage implementations; operators must provide those adapters.
-5. Physical-schema drift outside managed indexes and automatic compatibility-window coordination are intentionally incomplete.
+1. Durable sagas fence local PostgreSQL mutations and receipts. External side effects need idempotent outbox consumers; arbitrary hooks are not an external distributed transaction.
+2. Local service matrices, a ten-minute component soak, process-kill recovery and an isolated restore drill do not establish a deployment's HTTP capacity, managed-service failover, RPO or RTO.
+3. Nitro and H3 remain pre-release dependencies. Keep the locked versions and run compatibility evidence for every upgrade.
+4. Operators must provision and rotate real encryption keys and service credentials, preserve historical keys for recovery, and test their actual database/object-store backup chain.
+5. Physical inspection covers explicit relational contracts. Application compatibility-window coordination and previous deployed binary upgrades remain application responsibilities.
+6. Hosted CI/CodeQL/SBOM and independent production-shaped application acceptance must pass on a named release candidate before promotion.
 
 The accepted metadata/lifecycle and version policy remain in [metadata-compatibility.md](metadata-compatibility.md); deployment responsibilities are in [deployment.md](deployment.md) and [children-and-attachments.md](children-and-attachments.md).

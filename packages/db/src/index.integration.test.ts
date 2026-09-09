@@ -21,7 +21,8 @@ import {
   PostgresOidcAuthorizationStateStore,
   PostgresRoleStore,
   PostgresSessionRevocationStore,
-  PostgresUserStore
+  PostgresUserStore,
+  createPostgresConnection
 } from "./index.js";
 
 declare const process: { env: Record<string, string | undefined> };
@@ -171,6 +172,44 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await cleanup(sql);
     await closeStores(stores);
     await sql.end({ timeout: 1 });
+  });
+
+  it("shares a bounded pool without allowing borrowers to close it", async () => {
+    const connection = createPostgresConnection({ connectionString: connectionString!, max: 2, listenerConnections: 1, totalBudget: 3 });
+    const repository = new PostgresDocumentRepository({ connectionString: connectionString!, connection });
+    const audit = new PostgresAuditStore({ connectionString: connectionString!, connection });
+    try {
+      await repository.start();
+      await repository.close();
+      await audit.start();
+      const firstClose = connection.close();
+      const secondClose = connection.close();
+      expect(secondClose).toBe(firstClose);
+      await Promise.all([firstClose, secondClose]);
+      await expect(connection.sql`select 1`).rejects.toThrow();
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("keeps raw JSON and timestamp codecs independent from shared ORM adapters", async () => {
+    const connection = createPostgresConnection({ connectionString: connectionString!, max: 2 });
+    const repository = new PostgresDocumentRepository({ connectionString: connectionString!, connection });
+    const audit = new PostgresAuditStore({ connectionString: connectionString!, connection });
+    try {
+      await repository.start();
+      await audit.start();
+      const [raw] = await connection.sql<{ value: unknown; at: Date }[]>`select ${connection.sql.json({ nested: true })} as value, clock_timestamp() as at`;
+      expect(raw!.value).toEqual({ nested: true });
+      expect(raw!.at).toBeInstanceOf(Date);
+      const [scalar] = await connection.sql<{ value: string }[]>`select ${"plain"} as value`;
+      expect(scalar!.value).toBe("plain");
+      await repository.close();
+      await audit.start();
+      await connection.close();
+      await expect(connection.sql`select 1`).rejects.toThrow();
+      await expect(connection.drizzleSql`select 1`).rejects.toThrow();
+    } finally { await connection.close(); }
   });
 
   it("atomically updates authentication state without restoring stale credentials or account privileges", async () => {
@@ -357,6 +396,20 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(true);
     await stores.sessionRevocations.revoke("pg-integration-session", new Date(Date.now() - 60_000).toISOString());
     await expect(stores.sessionRevocations.isRevoked("pg-integration-session")).resolves.toBe(false);
+  });
+
+  it("bootstraps users and roles only when absent", async () => {
+    const user = { tenantId: tenant.tenantId, id: "bootstrap", email: "bootstrap@example.com", name: "Bootstrap", passwordHash: "first", roles: ["admin"], permissions: ["*"], disabledAt: new Date().toISOString() };
+    expect(await stores.userStore.insertIfAbsent(user)).toBe(true);
+    expect(await stores.userStore.insertIfAbsent({ ...user, email: "renamed@example.com", passwordHash: "second", roles: [], permissions: [], disabledAt: undefined })).toBe(false);
+    await expect(stores.userStore.findById(tenant.tenantId, user.id)).resolves.toMatchObject({ email: user.email, passwordHash: "first", disabledAt: expect.any(String), roles: ["admin"] });
+    expect(await stores.userStore.insertIfAbsent({ ...user, id: "other", email: user.email })).toBe(false);
+    const role = { tenantId: tenant.tenantId, id: "bootstrap-role", name: "Bootstrap", permissions: ["limited"] };
+    expect(await stores.roleStore.insertIfAbsent(role)).toBe(true);
+    expect(await stores.roleStore.insertIfAbsent({ ...role, permissions: ["*"] })).toBe(false);
+    await expect(stores.roleStore.list(tenant.tenantId)).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ id: role.id, permissions: ["limited"] })]));
+    const concurrent = await Promise.all(Array.from({ length: 5 }, () => stores.userStore.insertIfAbsent({ ...user, id: "concurrent", email: "concurrent@example.com" })));
+    expect(concurrent.filter(Boolean)).toHaveLength(1);
   });
 
   it("persists ordered child ownership and attachment metadata through PostgreSQL", async () => {

@@ -1,3 +1,4 @@
+import { SecurityPanel } from "../sections/SecurityPanel";
 import React from "react";
 import { Activity, Boxes, Check, ChevronLeft, ChevronRight, Database, FileClock, FilePlus, KeyRound, LogOut, Radio, RefreshCw, Save, Search, Settings, Shield, Trash2, Users } from "lucide-react";
 import type { DeskSection } from "../domain/types";
@@ -7,7 +8,7 @@ import { AdminPanel, OperationsPanel } from "../sections/Panels";
 
 export function DeskApp() {
   const controller = useDeskController();
-  const { authenticated, sessionChecked, loggingOut, email, setEmail, password, setPassword, metadata, doctypes, active, section, setSection, setActiveDocType, records, hasNextPage, selected, draft, setDraft, ownerDraft, setOwnerDraft, query, setQuery, page, setPage, status, setStatus, listFields, formFields, availableTransitions, login, logout, refresh, selectRecord, save, uploadAttachment, deleteAttachment, transition, changeDocumentStatus, transferOwner, removeDocument, startNew } = controller;
+  const { authenticated, sessionChecked, loggingOut, email, setEmail, password, setPassword, signingIn, mfaChallenge, mfaCode, setMfaCode, recoveryCode, setRecoveryCode, cancelMfa, metadata, doctypes, active, section, setSection, setActiveDocType, records, hasNextPage, selected, draft, setDraft, ownerDraft, setOwnerDraft, query, setQuery, page, setPage, status, setStatus, listFields, formFields, availableTransitions, login, logout, refresh, selectRecord, save, uploadAttachment, deleteAttachment, transition, changeDocumentStatus, transferOwner, removeDocument, startNew } = controller;
   const message = (key: string, fallback: string) => metadata?.messages?.[key] ?? fallback;
 
   if (!sessionChecked) {
@@ -43,6 +44,12 @@ export function DeskApp() {
           <div className="mark"><Boxes size={24} /> Framekit</div>
           <p className="eyebrow">Desk sign in</p>
           <h1 id="login-title">Metadata operations console</h1>
+          {mfaChallenge ? <>
+            <label className="field"><span>{recoveryCode ? "Recovery code" : "Authenticator code"}</span><input autoFocus name="mfa-code" autoComplete="one-time-code" inputMode={recoveryCode ? "text" : "numeric"} value={mfaCode} onChange={(event) => setMfaCode(event.target.value)} /></label>
+            <label className="field"><span>Use a recovery code</span><input type="checkbox" checked={recoveryCode} onChange={(event) => { setRecoveryCode(event.target.checked); setMfaCode(""); }} /></label>
+            <button type="submit" className="primary wide" disabled={signingIn}>Verify and sign in</button>
+            <button type="button" onClick={cancelMfa}>Back to sign in</button>
+          </> : <>
           <label className="field">
             <span>Email</span>
             <input name="email" type="email" autoComplete="username" spellCheck={false} value={email} onChange={(event) => setEmail(event.target.value)} />
@@ -51,7 +58,8 @@ export function DeskApp() {
             <span>Password</span>
             <input name="password" type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} />
           </label>
-          <button type="submit" className="primary wide"><KeyRound size={16} /> Sign in</button>
+          <button type="submit" className="primary wide" disabled={signingIn}><KeyRound size={16} /> Sign in</button>
+          </>}
           <p className="status" role="status" aria-live="polite">{status}</p>
         </form>
       </main>
@@ -80,11 +88,13 @@ export function DeskApp() {
           <button className={section === "audit" ? "active" : ""} onClick={() => setSection("audit")}><FileClock size={17} /><span>Audit</span></button>
           <button className={section === "outbox" ? "active" : ""} onClick={() => setSection("outbox")}><Radio size={17} /><span>Outbox</span></button>
           <button className={section === "diagnostics" ? "active" : ""} onClick={() => setSection("diagnostics")}><Activity size={17} /><span>Diagnostics</span></button>
+          <button className={section === "security" ? "active" : ""} onClick={() => setSection("security")}><Shield size={17} /><span>Account security</span></button>
           <button onClick={() => void logout()}><LogOut size={17} /><span>Sign out</span></button>
         </nav>
       </aside>
 
       <section className="workbench" aria-label="Desk workbench" id="desk-main" tabIndex={-1}>
+        {section === "security" ? <SecurityPanel signOut={logout} /> : null}
         {section === "users" || section === "roles" || section === "tokens" ? <AdminPanel section={section} status={status} setStatus={setStatus} /> : null}
         {section === "audit" || section === "outbox" || section === "diagnostics" || section === "customization" || section === "settings" ? <OperationsPanel section={section} doctypes={doctypes} status={status} setStatus={setStatus} locale={metadata?.locale} /> : null}
         {section === "documents" ? (

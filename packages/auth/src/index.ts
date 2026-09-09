@@ -13,3 +13,4 @@ export {
 export * from "./oidc-providers.js";
 export * from "./password-policy.js";
 export { PasswordAuthService } from "./password-auth-service.js";
+export * from "./mfa.js";

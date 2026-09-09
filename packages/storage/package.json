@@ -1,0 +1,52 @@
+{
+  "name": "@framekit/storage",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Production secret and attachment storage adapters for Framekit.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "development": {
+        "types": "./src/index.ts",
+        "default": "./src/index.ts"
+      },
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run --root ../.. packages/storage/src/index.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "pnpm build",
+    "test:integration": "node ../../scripts/verify-storage-services.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1124.0",
+    "@framekit/core": "workspace:*",
+    "@framekit/runtime": "workspace:*",
+    "postgres": "^3.4.9"
+  },
+  "files": [
+    "dist",
+    "src/index.ts",
+    "src/secrets.ts",
+    "src/s3.ts"
+  ],
+  "engines": {
+    "node": ">=22 <26"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "sideEffects": false,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/null-jj/FrameKit.git",
+    "directory": "packages/storage"
+  }
+}

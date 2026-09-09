@@ -1,3 +1,4 @@
+import { DeskRequestError } from "../transport/client";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   DeskSection,
@@ -29,6 +30,10 @@ export function useDeskController() {
   const invalidateSessionRef = useRef<() => void>(() => undefined);
   const [email, setEmail] = useState("admin@example.com");
   const [password, setPassword] = useState("admin12345");
+  const [signingIn, setSigningIn] = useState(false);
+  const [mfaChallenge, setMfaChallenge] = useState<string>();
+  const [mfaCode, setMfaCode] = useState("");
+  const [recoveryCode, setRecoveryCode] = useState(false);
   const [metadata, setMetadata] = useState<Metadata>();
   const [activeDocType, setActiveDocType] = useState("customer");
   const [section, setSection] = useState<DeskSection>("documents");
@@ -91,20 +96,33 @@ export function useDeskController() {
   }, [active?.name, query, page, section]);
 
   async function login() {
-    if (loggingOut) return;
+    if (loggingOut || signingIn) return;
+    setSigningIn(true);
     try {
       setStatus("Signing in…");
       beginAuthGeneration();
-      await fetchJson("/api/auth/login", {
+      await fetchJson(mfaChallenge ? "/api/auth/mfa/complete" : "/api/auth/login", {
         method: "POST",
-        body: { email, password }
+        body: mfaChallenge ? { challengeToken: mfaChallenge, code: mfaCode, recoveryCode } : { email, password }
       });
+      setMfaChallenge(undefined);
+      setMfaCode("");
+      setPassword("");
       setAuthenticated(true);
       setStatus("Ready");
     } catch (error) {
-      setStatus(errorMessage(error));
+      if (error instanceof DeskRequestError && error.code === "MFA_REQUIRED" && typeof error.details?.challengeToken === "string") {
+        setMfaChallenge(error.details.challengeToken);
+        setMfaCode("");
+        setPassword("");
+        setStatus("Enter your authenticator code or a recovery code.");
+      } else {
+        if (mfaChallenge) { setMfaChallenge(undefined); setMfaCode(""); }
+        setStatus(errorMessage(error));
+      }
     } finally {
       setSessionChecked(true);
+      setSigningIn(false);
     }
   }
 
@@ -334,6 +352,8 @@ export function useDeskController() {
     setEmail,
     password,
     setPassword,
+    signingIn, mfaChallenge, mfaCode, setMfaCode, recoveryCode, setRecoveryCode,
+    cancelMfa: () => { setMfaChallenge(undefined); setMfaCode(""); setStatus("Sign in to continue."); },
     metadata,
     doctypes,
     active,

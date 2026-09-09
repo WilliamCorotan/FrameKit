@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defineApp, defineDocType, defineModule, type DocumentHook, type TenantContext } from "@framekit/core";
-import { applyFilters, assertDestructiveMigration, assertSupportedMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryAttachmentStorage, InMemoryCustomizationStore, InMemoryDocumentRepository, migrationChecksum, validateMigrationPlan, type AttachmentStorage } from "./index.js";
+import { applyFilters, assertDestructiveMigration, assertSupportedMigration, createExecutableMigrationArtifact, createRollbackMigrationPlan, createRuntime, InMemoryAttachmentStorage, InMemoryAuditStore, InMemoryCustomizationStore, InMemoryDocumentRepository, InMemoryMutationUnitOfWork, InMemoryOutboxStore, migrationChecksum, validateMigrationPlan, type AttachmentStorage } from "./index.js";
 
 const tenant: TenantContext = {
   tenantId: "tenant_1",
@@ -245,7 +245,7 @@ describe("runtime document service", () => {
     const created = await runtime.create(tenant, "customer", { name: "Northwind" });
     const list = await runtime.list(tenant, "customer");
 
-    expect(created.id).toBe("customer-abc12345");
+    expect(created.id).toBe("customer-abc123456789");
     expect(list).toHaveLength(1);
   });
 
@@ -390,7 +390,7 @@ describe("runtime document service", () => {
 
     expect(page).toHaveLength(1);
     expect(page[0]?.data).toEqual({ name: "Gamma" });
-    expect(page[0]?.id).toBe("customer-id7abcde");
+    expect(page[0]?.id).toBe("customer-id7abcdef");
     await expect(runtime.list(tenant, "customer", { sort: { field: "name", direction: "desc" }, cursor: firstPage.nextCursor })).rejects.toMatchObject({ code: "INVALID_CURSOR" });
     await expect(runtime.list(tenant, "customer", { fields: ["unknown"] })).rejects.toMatchObject({ code: "UNKNOWN_PROJECTION_FIELD" });
   });
@@ -879,6 +879,7 @@ describe("runtime document service", () => {
       put: async (...args) => { putCount += 1; await storage.put(...args); }, get: (...args) => storage.get(...args),
       delete: (...args) => storage.delete(...args), list: (...args) => storage.list(...args),
       releaseLease: async (...args) => { if (failLeaseRelease) { failLeaseRelease = false; throw new Error("lease release unavailable"); } await storage.releaseLease(...args); },
+      listCleanupCandidates: (...args) => storage.listCleanupCandidates(...args),
       deleteIfUnleased: (...args) => storage.deleteIfUnleased(...args)
     };
     const runtime = createRuntime(defineApp({ name: "Secure files", modules: [defineModule({ id: "records", name: "Records", doctypes: [record] })] }), { attachmentStorage: counted });
@@ -923,7 +924,7 @@ describe("runtime document service", () => {
     const storage: AttachmentStorage = {
       put: async (...args) => { await backing.put(...args); arrivals += 1; if (arrivals === 2) release(); await barrier; },
       get: (...args) => backing.get(...args), delete: (...args) => backing.delete(...args), list: (...args) => backing.list(...args),
-      releaseLease: (...args) => backing.releaseLease(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args)
+      releaseLease: (...args) => backing.releaseLease(...args), listCleanupCandidates: (...args) => backing.listCleanupCandidates(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args)
     };
     let id = 0;
     const repository = new InMemoryDocumentRepository();
@@ -956,7 +957,7 @@ describe("runtime document service", () => {
     let failDelete = true;
     const failingStorage: AttachmentStorage = {
       put: (...args) => backing.put(...args), get: (...args) => backing.get(...args), list: (...args) => backing.list(...args),
-      releaseLease: (...args) => backing.releaseLease(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args),
+      releaseLease: (...args) => backing.releaseLease(...args), listCleanupCandidates: (...args) => backing.listCleanupCandidates(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args),
       delete: async (key) => { if (failDelete) { failDelete = false; throw new Error("storage unavailable"); } await backing.delete(key); }
     };
     const restarted = createRuntime(runtime.app, { repository, attachmentStorage: failingStorage });
@@ -993,7 +994,7 @@ describe("runtime document service", () => {
     const leaseStorage: AttachmentStorage = {
       put: async (...args) => { await storage.put(...args); staged(); await promotePromise; }, get: (...args) => storage.get(...args),
       delete: (...args) => storage.delete(...args), list: (...args) => storage.list(...args),
-      releaseLease: (...args) => storage.releaseLease(...args), deleteIfUnleased: (...args) => storage.deleteIfUnleased(...args)
+      releaseLease: (...args) => storage.releaseLease(...args), listCleanupCandidates: (...args) => storage.listCleanupCandidates(...args), deleteIfUnleased: (...args) => storage.deleteIfUnleased(...args)
     };
     const inFlightRuntime = createRuntime(definitionA, { attachmentStorage: leaseStorage });
     await inFlightRuntime.addCustomField(context, { doctype: base.name, field: { name: "files", label: "Files", type: "attachments" } });
@@ -1018,7 +1019,7 @@ describe("runtime document service", () => {
     const storage: AttachmentStorage = {
       put: async (...args) => { await backing.put(...args); if (holdUpload) { uploaded(); await releasePromise; } },
       get: (...args) => backing.get(...args), delete: (...args) => backing.delete(...args), list: (...args) => backing.list(...args),
-      releaseLease: (...args) => backing.releaseLease(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args)
+      releaseLease: (...args) => backing.releaseLease(...args), listCleanupCandidates: (...args) => backing.listCleanupCandidates(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args)
     };
     const runtime = createRuntime(defineApp({ name: "Upload delete", modules: [defineModule({ id: "files", name: "Files", doctypes: [record] })] }), { attachmentStorage: storage });
     const actor = { tenantId: "tenant", userId: "writer", roles: [], permissions: [] };
@@ -1032,6 +1033,118 @@ describe("runtime document service", () => {
     await expect(losingUpload).rejects.toMatchObject({ code: "REVISION_CONFLICT" });
     await expect(runtime.get(actor, record.name, created.id)).resolves.toMatchObject({ revision: 4, data: { files: [] } });
     await expect(backing.list("tenant/Upload%20delete/")).resolves.toEqual([]);
+  });
+
+  it("uses revision snapshots to make attachment cleanup conservative", async () => {
+    let now = 0;
+    const storage = new InMemoryAttachmentStorage(() => now);
+    await storage.put("orphan", new Uint8Array([1]), { contentType: "text/plain", lease: { owner: "upload", durationMs: 1 } });
+    const revision = (await storage.listCleanupCandidates(""))[0]!.revision;
+    now = 60_001;
+    await storage.put("orphan", new Uint8Array([1]), { contentType: "text/plain" });
+    expect(await storage.deleteIfUnleased("orphan", { minimumAgeMs: 60_000, expectedRevision: revision! })).toBe(false);
+    const current = (await storage.listCleanupCandidates(""))[0]!.revision;
+    await storage.releaseLease("orphan", "wrong-owner");
+    expect(await storage.deleteIfUnleased("orphan", { minimumAgeMs: 60_000, expectedRevision: current! })).toBe(false);
+    const first = storage.deleteIfUnleased("orphan", { minimumAgeMs: 0, expectedRevision: current! });
+    const second = storage.deleteIfUnleased("orphan", { minimumAgeMs: 0, expectedRevision: current! });
+    expect((await Promise.all([first, second])).filter(Boolean)).toHaveLength(1);
+  });
+
+  it("does not delete a key replaced by an upload after cleanup has scanned references", async () => {
+    let now = 0;
+    const backing = new InMemoryAttachmentStorage(() => now);
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredCleanup = new Promise<void>((resolve) => { entered = resolve; });
+    const releaseCleanup = new Promise<void>((resolve) => { release = resolve; });
+    const storage: AttachmentStorage = {
+      put: (...args) => backing.put(...args), get: (...args) => backing.get(...args), delete: (...args) => backing.delete(...args), list: (...args) => backing.list(...args),
+      releaseLease: (...args) => backing.releaseLease(...args), listCleanupCandidates: (...args) => backing.listCleanupCandidates(...args),
+      deleteIfUnleased: async (...args) => { entered(); await releaseCleanup; return backing.deleteIfUnleased(...args); }
+    };
+    const type = defineDocType({ name: "files", label: "Files", fields: [{ name: "attachments", label: "Attachments", type: "attachments" }] });
+    let id = 0;
+    const app = defineApp({ name: "Race", modules: [defineModule({ id: "race", name: "Race", doctypes: [type] })] });
+    const actor = { tenantId: "tenant", userId: "u", roles: [], permissions: ["*", "framekit.attachments.cleanup"] };
+    const writer = createRuntime(app, { attachmentStorage: storage, idGenerator: () => "id" });
+    const cleaner = createRuntime(app, { attachmentStorage: storage });
+    const document = await writer.create(actor, type.name, {});
+    const key = "tenant/Race/orphan";
+    await backing.put(key, new Uint8Array([0]), { contentType: "text/plain" });
+    now = 60_001;
+    const cleanup = cleaner.cleanupOrphanAttachments(actor);
+    await enteredCleanup;
+    const upload = writer.uploadAttachment(actor, type.name, document.id, "attachments", { name: "x", contentType: "text/plain", bytes: new Uint8Array([1]) });
+    const receipt = await upload;
+    release();
+    await expect(cleanup).resolves.toEqual([key]);
+    expect(await backing.get(receipt.storageKey)).toEqual(new Uint8Array([1]));
+  });
+
+  it("retains leased objects and fails closed when attachment reference scanning fails", async () => {
+    let now = 0;
+    const storage = new InMemoryAttachmentStorage(() => now);
+    await storage.put("tenant/Fail/orphan", new Uint8Array([1]), { contentType: "text/plain", lease: { owner: "upload", durationMs: 1 } });
+    now = 10 * 60_000;
+    const type = defineDocType({ name: "files", label: "Files", fields: [{ name: "attachments", label: "Attachments", type: "attachments" }] });
+    const app = defineApp({ name: "Fail", modules: [defineModule({ id: "fail", name: "Fail", doctypes: [type] })] });
+    const repository = new InMemoryDocumentRepository();
+    const original = repository.listForMaintenance.bind(repository);
+    repository.listForMaintenance = async (...args) => { throw new Error("scan failed"); };
+    const runtime = createRuntime(app, { attachmentStorage: storage, repository });
+    const actor = { tenantId: "tenant", userId: "u", roles: [], permissions: ["*"] };
+    await expect(runtime.cleanupOrphanAttachments(actor)).rejects.toThrow("scan failed");
+    expect(await storage.get("tenant/Fail/orphan")).toBeDefined();
+    repository.listForMaintenance = original;
+    const snapshot = (await storage.listCleanupCandidates("tenant/Fail/"))[0]!;
+    expect(await storage.deleteIfUnleased(snapshot.key, { minimumAgeMs: 60_000, expectedRevision: snapshot.revision })).toBe(false);
+  });
+
+  it("preserves committed attachment bytes when realtime publication fails after commit", async () => {
+    const type = defineDocType({ name: "files", label: "Files", fields: [{ name: "attachments", label: "Attachments", type: "attachments" }] });
+    const storage = new InMemoryAttachmentStorage();
+    let failPublish = false;
+    const runtime = createRuntime(defineApp({ name: "Publish", modules: [defineModule({ id: "publish", name: "Publish", doctypes: [type] })] }), {
+      attachmentStorage: storage, realtime: { publish: async () => { if (failPublish) throw new Error("publish failed"); } }
+    });
+    const actor = { tenantId: "tenant", userId: "u", roles: [], permissions: ["*"] };
+    const document = await runtime.create(actor, type.name, {});
+    failPublish = true;
+    await expect(runtime.uploadAttachment(actor, type.name, document.id, "attachments", { name: "x", contentType: "text/plain", bytes: new Uint8Array([1]) })).rejects.toThrow("publish failed");
+    const committed = await runtime.get(actor, type.name, document.id);
+    const attachment = (committed.data.attachments as Array<{ id: string; storageKey: string }>)[0]!;
+    expect(await storage.get(attachment.storageKey)).toEqual(new Uint8Array([1]));
+    await expect(runtime.downloadAttachment(actor, type.name, document.id, "attachments", attachment.id)).resolves.toMatchObject({ bytes: new Uint8Array([1]) });
+  });
+
+  it("replays concurrent idempotent uploads without deleting the committed attempt", async () => {
+    const type = defineDocType({ name: "files", label: "Files", fields: [{ name: "attachments", label: "Attachments", type: "attachments" }] });
+    const backing = new InMemoryAttachmentStorage();
+    const keys: string[] = [];
+    const storage: AttachmentStorage = { put: async (key, ...args) => { keys.push(key); await backing.put(key, ...args); }, get: (...args) => backing.get(...args), delete: (...args) => backing.delete(...args), list: (...args) => backing.list(...args), releaseLease: (...args) => backing.releaseLease(...args), listCleanupCandidates: (...args) => backing.listCleanupCandidates(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args) };
+    const repository = new InMemoryDocumentRepository(); const audit = new InMemoryAuditStore(); const outbox = new InMemoryOutboxStore(); const mutations = new InMemoryMutationUnitOfWork(repository, audit, outbox);
+    const app = defineApp({ name: "Attempts", modules: [defineModule({ id: "a", name: "A", doctypes: [type] })] });
+    const options = { attachmentStorage: storage, repository, audit, outbox, mutations };
+    const first = createRuntime(app, options); const second = createRuntime(app, options);
+    const actor = { tenantId: "tenant", userId: "u", roles: [], permissions: ["*"] };
+    const document = await first.create(actor, type.name, {});
+    const request = () => second.uploadAttachment(actor, type.name, document.id, "attachments", { name: "x", contentType: "text/plain", bytes: new Uint8Array([1]) }, { expectedRevision: 1, idempotencyKey: "same" });
+    const [left, right] = await Promise.all([request(), request()]);
+    expect(left).toEqual(right);
+    expect(await backing.get(left.storageKey)).toEqual(new Uint8Array([1]));
+    expect((await backing.list("tenant/Attempts/")).filter((key) => key !== left.storageKey)).toEqual([]);
+  });
+
+  it("retries a failed storage attempt with a new key for the same idempotency key", async () => {
+    const type = defineDocType({ name: "files", label: "Files", fields: [{ name: "attachments", label: "Attachments", type: "attachments" }] });
+    const backing = new InMemoryAttachmentStorage(); let failures = 1; const keys: string[] = [];
+    const storage: AttachmentStorage = { put: async (key, ...args) => { keys.push(key); if (failures--) throw new Error("put failed"); await backing.put(key, ...args); }, get: (...args) => backing.get(...args), delete: (...args) => backing.delete(...args), list: (...args) => backing.list(...args), releaseLease: (...args) => backing.releaseLease(...args), listCleanupCandidates: (...args) => backing.listCleanupCandidates(...args), deleteIfUnleased: (...args) => backing.deleteIfUnleased(...args) };
+    const app = defineApp({ name: "Retry", modules: [defineModule({ id: "r", name: "R", doctypes: [type] })] }); const runtime = createRuntime(app, { attachmentStorage: storage }); const actor = { tenantId: "tenant", userId: "u", roles: [], permissions: ["*"] };
+    const document = await runtime.create(actor, type.name, {}); const input = { name: "x", contentType: "text/plain", bytes: new Uint8Array([1]) }; const options = { expectedRevision: 1, idempotencyKey: "retry" };
+    await expect(runtime.uploadAttachment(actor, type.name, document.id, "attachments", input, options)).rejects.toThrow("put failed");
+    const receipt = await runtime.uploadAttachment(actor, type.name, document.id, "attachments", input, options);
+    expect(keys).toHaveLength(2); expect(keys[0]).not.toBe(receipt.storageKey); expect(await backing.get(receipt.storageKey)).toEqual(new Uint8Array([1]));
   });
 
   it("rejects child envelope typos and unsupported collection-schema apply and rollback", async () => {
@@ -1575,4 +1688,17 @@ describe("runtime document service", () => {
 
     expect(received).toMatchObject([{ type: "customer.created" }]);
   });
+});
+
+it("preserves generator entropy when assigning fallback document names", async () => {
+  const ids = ["12345678-0000-4000-8000-000000000001", "12345678-0000-4000-8000-000000000002"];
+  let sequence = 0;
+  const runtime = createRuntime(defineApp({ name: "Identifier entropy", modules: [defineModule({ id: "probe", name: "Probe", doctypes: [defineDocType({ name: "record", label: "Record", fields: [] })] })] }), { idGenerator: () => ids[sequence++] ?? crypto.randomUUID() });
+  const tenant = { tenantId: "entropy", userId: "test", roles: [], permissions: ["*"] };
+  const first = await runtime.create(tenant, "record", {});
+  // Each create also allocates side-effect IDs; reset so the next document uses the colliding prefix.
+  sequence = 1;
+  const second = await runtime.create(tenant, "record", {});
+  expect(first.id).toBe(`record-${ids[0]}`);
+  expect(second.id).toBe(`record-${ids[1]}`);
 });

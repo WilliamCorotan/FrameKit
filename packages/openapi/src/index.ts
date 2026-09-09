@@ -498,6 +498,21 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
         responses: okResponse({ type: "object", properties: { deleted: { type: "array", items: { type: "string" } } } })
       }
     },
+    [`${basePath}/auth/mfa/status`]: {
+      get: { operationId: "mfaStatus", summary: "Read the current user's MFA status", tags: ["Auth"], responses: okResponse({ type: "object", properties: { enabled: { type: "boolean" }, pending: { type: "boolean" }, recoveryCodes: { type: "integer" } } }) }
+    },
+    [`${basePath}/auth/mfa/enroll`]: {
+      post: { operationId: "beginMfaEnrollment", summary: "Begin MFA enrollment after recent primary authentication", tags: ["Auth"], responses: okResponse({ type: "object", properties: { secret: { type: "string" }, expiresAt: { type: "string" } } }) }
+    },
+    [`${basePath}/auth/mfa/confirm`]: {
+      post: { operationId: "confirmMfaEnrollment", summary: "Confirm enrollment and return recovery codes once", tags: ["Auth"], requestBody: jsonBody({ type: "object", required: ["code"], properties: { code: { type: "string" } } }, true), responses: okResponse({ type: "object", properties: { recoveryCodes: { type: "array", items: { type: "string" } } } }) }
+    },
+    [`${basePath}/auth/mfa/disable`]: {
+      post: { operationId: "disableMfa", summary: "Disable MFA using a fresh authenticator or unused recovery code", tags: ["Auth"], requestBody: jsonBody({ type: "object", required: ["code"], properties: { code: { type: "string" }, recoveryCode: { type: "boolean" } } }, true), responses: okResponse({ type: "object", properties: { ok: { type: "boolean" } } }) }
+    },
+    [`${basePath}/auth/mfa/complete`]: {
+      post: { operationId: "completeMfaChallenge", summary: "Complete a one-use primary-authentication challenge", tags: ["Auth"], security: [], requestBody: jsonBody({ type: "object", required: ["challengeToken", "code"], properties: { challengeToken: { type: "string" }, code: { type: "string" }, recoveryCode: { type: "boolean" } } }, true), responses: okResponse(ref("AuthSession")) }
+    },
     [`${basePath}/auth/login`]: {
       post: {
         operationId: "login",
@@ -538,7 +553,7 @@ export function createOpenApiDocument(app: AppDefinition, options: OpenApiOption
     },
     [`${basePath}/auth/providers/{id}/callback`]: {
       get: { operationId: "completeOidcAuthorization", summary: "Validate the OIDC callback and establish a session", tags: ["Auth"],
-        parameters: [pathParam("id"), queryParam("code", "string"), queryParam("state", "string")], responses: { "303": { description: "Same-origin post-login redirect" }, ...errorResponses() }, security: [] }
+        parameters: [pathParam("id"), queryParam("code", "string"), queryParam("state", "string")], responses: { "200": { description: "Browser MFA challenge form", content: { "text/html": { schema: { type: "string" } } } }, "303": { description: "Same-origin post-login redirect" }, ...errorResponses() }, security: [] }
     },
     [`${basePath}/auth/invitations`]: {
       post: { operationId: "createInvitation", summary: "Create an expiring single-use tenant invitation", tags: ["Auth"],

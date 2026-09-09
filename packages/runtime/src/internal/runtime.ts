@@ -32,7 +32,7 @@ import {
   type ViewDefinition
 } from "@framekit/core";
 
-import type { AttachmentStorage, AttachmentUpload, AuditEvent, AuditStore, CommandRowPolicy, CustomizationStore, DocumentCommandResult, DocumentPage, DocumentRepository, LifecycleResource, ListOptions, MigrationChange, MigrationPlan, MigrationRecord, MigrationStore, MutationCommand, MutationOptions, MutationUnitOfWork, NamingSeriesStore, OutboxClaimOptions, OutboxEvent, OutboxStore, PublicSetting, RealtimePublisher, RepositoryDiagnostics, RuntimeOptions, RuntimeRealtimeEvent, SettingsSecretPort, StoredSettingValue } from "./types.js";
+import type { SagaRecord, SagaProgress, SagaStore, AttachmentStorage, AttachmentUpload, AuditEvent, AuditStore, CommandRowPolicy, CustomizationStore, DocumentCommandResult, DocumentPage, DocumentRepository, LifecycleResource, ListOptions, MigrationChange, MigrationPlan, MigrationRecord, MigrationStore, MutationCommand, MutationOptions, MutationUnitOfWork, NamingSeriesStore, OutboxClaimOptions, OutboxEvent, OutboxStore, PublicSetting, RealtimePublisher, RepositoryDiagnostics, RuntimeOptions, RuntimeRealtimeEvent, SettingsSecretPort, StoredSettingValue } from "./types.js";
 import { InMemoryAttachmentStorage, InMemoryAuditStore, InMemoryCustomizationStore, InMemoryDocumentRepository, InMemoryMigrationStore, InMemoryMutationUnitOfWork, InMemoryNamingSeriesStore, InMemoryOutboxStore, NoopRealtimePublisher } from "./adapters/memory.js";
 import { appSchemaChecksum, appUniqueConstraints, assertMigrationIdentity, assertMigrationMetadata, createRollbackMigrationPlan, indexKey, migrationChange, migrationChecksum, secretStorageFailure, stableJson, validateMigrationPlan } from "./migrations.js";
 import { encodeDocumentCursor, filterPrimitive, validateListOptions } from "./query.js";
@@ -48,17 +48,21 @@ export class FramekitRuntime {
   private readonly realtime: RealtimePublisher;
   private readonly mutations?: MutationUnitOfWork;
   private readonly commandRowPolicy?: CommandRowPolicy;
+  private readonly sagas?: SagaStore;
+  private readonly sagaLeaseMs: number;
   private readonly attachmentStorage: AttachmentStorage;
   private readonly idGenerator: () => string;
   private readonly now: () => Date;
   private readonly activeAttachmentKeys = new Set<string>();
   private readonly settingsSecrets?: SettingsSecretPort;
   private readonly resources: LifecycleResource[];
+  private readonly deployment: "development" | "production";
   private lifecycleState: "created" | "started" | "closing" | "closed" = "created";
   private startPromise?: Promise<void>;
   private closePromise?: Promise<void>;
 
   constructor(app: AppDefinition, options: RuntimeOptions = {}) {
+    this.deployment = options.deployment ?? "development";
     this.app = defineApp(app);
     const repository = options.repository ?? new InMemoryDocumentRepository();
     const audit = options.audit ?? new InMemoryAuditStore();
@@ -77,12 +81,15 @@ export class FramekitRuntime {
         : undefined
     );
     this.commandRowPolicy = options.commandRowPolicy;
+    this.sagas = options.sagas;
+    this.sagaLeaseMs = options.sagaLeaseMs ?? 30_000;
+    if (!Number.isSafeInteger(this.sagaLeaseMs) || this.sagaLeaseMs < 1 || this.sagaLeaseMs > 900_000) throw new TypeError("Saga lease must be 1 to 900000 milliseconds.");
     this.idGenerator = options.idGenerator ?? (() => crypto.randomUUID());
     this.now = options.now ?? (() => new Date());
     this.settingsSecrets = options.settingsSecrets;
     this.resources = uniqueLifecycleResources([
       repository, audit, outbox, this.customization, this.namingSeries, this.migrations, this.realtime, this.attachmentStorage,
-      ...(this.mutations ? [this.mutations] : []), ...(options.resources ?? [])
+      ...(this.mutations ? [this.mutations] : []), ...(this.sagas ? [this.sagas] : []), ...(options.resources ?? [])
     ]);
   }
 
@@ -120,7 +127,10 @@ export class FramekitRuntime {
   private async startResources(signal?: AbortSignal): Promise<void> {
     const started: LifecycleResource[] = [];
     let starting: LifecycleResource | undefined;
+    let validated = this.deployment !== "production";
     try {
+      if (this.deployment === "production") await this.assertProductionReady();
+      validated = true;
       for (const resource of this.resources) {
         signal?.throwIfAborted();
         starting = resource;
@@ -131,7 +141,7 @@ export class FramekitRuntime {
       this.lifecycleState = "started";
     } catch (error) {
       try {
-        await closeLifecycleResources([...(starting ? [starting] : []), ...started.reverse()]);
+        await closeLifecycleResources(validated ? [...(starting ? [starting] : []), ...started.reverse()] : [...this.resources].reverse());
       } catch (closeError) {
         throw new AggregateError([error, ...aggregateErrorCauses(closeError)], "Runtime startup and rollback both failed.");
       } finally {
@@ -271,6 +281,8 @@ export class FramekitRuntime {
     const migrations = this.migrations.describe ? await this.migrations.describe() : { kind: "unknown", durable: false, features: [] };
     const realtime = this.realtime.describe ? await this.realtime.describe() : { kind: "unknown", durable: false, features: [] };
     const mutations = this.mutations?.describe ? await this.mutations.describe() : { kind: "none", durable: false, features: [] };
+    const attachmentStorage = this.attachmentStorage.describe ? await this.attachmentStorage.describe() : { kind: "unknown", durable: false, features: [] };
+    const sagas = this.sagas ? await this.sagas.describe() : { kind: "none", durable: false, features: [] };
     const doctypes = this.app.modules.flatMap((module) => module.doctypes);
     return {
       app: {
@@ -285,6 +297,8 @@ export class FramekitRuntime {
       migrations,
       realtime,
       mutations,
+      attachmentStorage,
+      sagas,
       modules: this.app.modules.map((module) => ({
         id: module.id,
         name: module.name,
@@ -301,6 +315,18 @@ export class FramekitRuntime {
       })),
       warnings: createRuntimeWarnings(repository, audit, outbox, customization, namingSeries, mutations, doctypes)
     };
+  }
+
+  private async assertProductionReady(): Promise<void> {
+    if (!this.settingsSecrets) throw new FramekitError("RUNTIME_PRODUCTION_UNSAFE", "Production runtime requires a secret settings port.", 503);
+    const diagnostics = await this.diagnostics();
+    const resources = ["repository", "audit", "outbox", "customization", "namingSeries", "migrations", "realtime", "mutations", "attachmentStorage"] as const;
+    if (this.app.modules.some((module) => module.commands.some((command) => command.mode === "saga"))
+      && (!diagnostics.sagas.durable || !diagnostics.mutations.features.includes("saga-fencing"))) {
+      throw new FramekitError("RUNTIME_PRODUCTION_UNSAFE", "Production saga commands require a durable journal and fenced mutation unit of work.", 503);
+    }
+    const unsafe = resources.filter((name) => diagnostics[name].durable !== true);
+    if (unsafe.length) throw new FramekitError("RUNTIME_PRODUCTION_UNSAFE", `Production runtime requires durable resources: ${unsafe.join(", ")}.`, 503);
   }
 
   async migrationHistory(tenant: TenantContext): Promise<MigrationRecord[]> {
@@ -862,6 +888,9 @@ export class FramekitRuntime {
       throw new FramekitError("COMMAND_EXECUTION_UNAVAILABLE", `Saga command "${commandId}" requires a mutation unit of work for each local step.`, 501);
     }
 
+    if (this.sagas) return this.executeJournaledSaga(tenant, commandId, request);
+    if (this.deployment === "production") throw new FramekitError("COMMAND_SAGA_JOURNAL_REQUIRED", "Production sagas require a durable journal.", 503);
+
     const completed: Array<{ operation: DocumentCommandOperation; document?: DocumentRecord }> = [];
     let allReplayed = Boolean(request.idempotencyKey);
     try {
@@ -914,6 +943,142 @@ export class FramekitRuntime {
         compensationFailures
       });
     }
+  }
+
+  private async executeJournaledSaga(tenant: TenantContext, commandId: string, request: DocumentCommandRequest): Promise<DocumentCommandResult> {
+    tenant = structuredClone(tenant);
+    request = structuredClone(request);
+    if (!request.idempotencyKey) throw new FramekitError("COMMAND_SAGA_KEY_REQUIRED", "A journaled saga requires an idempotency key.", 422);
+    const diagnostics = await this.mutations!.describe?.();
+    if (!this.mutations?.replay || !diagnostics?.features.includes("saga-fencing")) {
+      throw new FramekitError("COMMAND_SAGA_FENCING_UNAVAILABLE", "Journaled sagas require receipt replay and transactional mutation fencing.", 501);
+    }
+    if (this.deployment === "production" && !(await this.sagas!.describe()).durable) {
+      throw new FramekitError("COMMAND_SAGA_JOURNAL_REQUIRED", "Production sagas require a durable journal.", 503);
+    }
+    // Authority may change between attempts; it is checked afresh, not frozen in the fingerprint.
+    for (const operation of request.operations) {
+      assertPermission(tenant, await this.getEffectiveDocType(tenant, operation.doctype), operation.operation);
+      const compensation = operation.compensation!;
+      assertPermission(tenant, await this.getEffectiveDocType(tenant, compensation.doctype), compensation.operation);
+    }
+    const owner = crypto.randomUUID();
+    const key = request.idempotencyKey;
+    let journal = await this.sagas!.claim({
+      tenantId: tenant.tenantId, key, command: commandId,
+      fingerprint: sagaFingerprint(tenant, commandId, request.operations), operations: request.operations,
+      owner, leaseMs: this.sagaLeaseMs
+    });
+    if (journal.phase === "completed") return {
+      command: commandId, mode: "saga", replayed: true,
+      documents: await this.authorizeSagaReceipt(tenant, commandId, request.operations, journal.documents.map((document) => document ?? undefined))
+    };
+    if (journal.phase === "compensated") throw new FramekitError("COMMAND_SAGA_TERMINAL", "This saga was compensated. Use a new key for a new command.", 409);
+
+    const save = async (changes: Partial<SagaProgress>, release = false) => {
+      journal = await this.sagas!.save({
+        tenantId: tenant.tenantId, key, owner, expectedRevision: journal.revision,
+        progress: { ...sagaProgress(journal), ...changes }, leaseMs: this.sagaLeaseMs, release
+      });
+    };
+    const publications: Array<{ type: string; document: DocumentRecord }> = [];
+    let allReplayed = true;
+    let completed = false;
+    if (journal.phase === "running") {
+      try {
+        for (let index = journal.nextStep; index < request.operations.length; index++) {
+          const operation = request.operations[index]!;
+          // This checkpoint precedes preparation and mutation, including user hooks.
+          await save({ activeStep: index });
+          const stepKey = sagaStepKey(key, "running", index);
+          const fingerprint = sagaStepFingerprint(tenant, commandId, "running", operation);
+          const prior = await this.mutations.replay(tenant, stepKey, fingerprint);
+          let document: DocumentRecord | undefined;
+          if (prior.found) {
+            [document] = await this.authorizeSagaReceipt(tenant, commandId, [operation], [prior.result]);
+          } else {
+            const command = await this.prepareDocumentCommandMutation(tenant, commandId, operation, stepKey);
+            command.idempotencyFingerprint = fingerprint;
+            command.sagaFence = { key, owner, phase: "running", step: index };
+            const execution = await this.mutations.execute(command);
+            document = execution.document;
+            if (!execution.replayed) {
+              allReplayed = false;
+              publications.push({ type: command.operation === "create" ? "created" : command.operation === "update" ? "updated" : "deleted", document: document ?? command.document });
+            }
+          }
+          const documents = [...journal.documents];
+          documents[index] = document ?? null;
+          await save({ documents, nextStep: index + 1, activeStep: undefined });
+        }
+        await save({ phase: "completed" });
+        completed = true;
+      } catch (cause) {
+        if (isSagaLeaseLost(cause)) throw cause;
+        // save locks the journal row, draining any uncertain mutation commit before
+        // compensation can inspect receipts or make an absence decision.
+        await save({
+          phase: "compensating", compensationIndex: journal.activeStep ?? journal.nextStep - 1,
+          activeStep: undefined, failure: sagaFailure(cause)
+        });
+      }
+      if (completed) {
+        // Publishing cannot change a committed terminal saga into compensation.
+        for (const publication of publications) await this.publishDocumentEvent(tenant, publication.type, publication.document);
+        return {
+          command: commandId, mode: "saga", replayed: allReplayed,
+          documents: await this.authorizeSagaReceipt(tenant, commandId, request.operations, journal.documents.map((document) => document ?? undefined))
+        };
+      }
+    }
+
+    const compensationPublications: Array<{ type: string; document: DocumentRecord }> = [];
+    for (let index = journal.compensationIndex!; index >= 0; index--) {
+      try {
+        await save({ compensationIndex: index });
+        const operation = request.operations[index]!;
+        const forward = await this.mutations.replay(tenant, sagaStepKey(key, "running", index), sagaStepFingerprint(tenant, commandId, "running", operation));
+        if (forward.found) {
+          const compensation = operation.compensation!;
+          const compensationKey = sagaStepKey(key, "compensating", index);
+          const fingerprint = sagaStepFingerprint(tenant, commandId, "compensating", compensation);
+          const prior = await this.mutations.replay(tenant, compensationKey, fingerprint);
+          if (prior.found) {
+            await this.authorizeCommandReplay(tenant, commandId, [compensation], [prior.result]);
+          } else {
+            const command = await this.prepareDocumentCommandMutation(tenant, commandId, compensation, compensationKey);
+            command.idempotencyFingerprint = fingerprint;
+            command.sagaFence = { key, owner, phase: "compensating", step: index };
+            const execution = await this.mutations.execute(command);
+            if (!execution.replayed) compensationPublications.push({ type: `compensated.${command.operation}`, document: execution.document ?? command.document });
+          }
+        }
+        await save({ compensationIndex: index - 1, compensationFailure: undefined });
+      } catch (error) {
+        if (isSagaLeaseLost(error)) throw error;
+        await save({ compensationFailure: { index, ...sagaFailure(error) } }, true);
+        throw sagaFailed(commandId, journal);
+      }
+    }
+    await save({ phase: "compensated", compensationFailure: undefined });
+    for (const publication of compensationPublications) await this.publishDocumentEvent(tenant, publication.type, publication.document);
+    throw sagaFailed(commandId, journal);
+  }
+
+  private async authorizeSagaReceipt(
+    tenant: TenantContext, commandId: string, operations: DocumentCommandOperation[], stored: Array<DocumentRecord | undefined>
+  ): Promise<Array<DocumentRecord | undefined>> {
+    const documents = await this.authorizeCommandReplay(tenant, commandId, operations, stored);
+    for (const [index, operation] of operations.entries()) {
+      if (operation.operation === "delete") continue;
+      const doctype = await this.getEffectiveDocType(tenant, operation.doctype);
+      const prior = documents[index]!;
+      const current = await this.repository.get(tenant, doctype, prior.id, { access: operation.operation === "create" ? "read" : "write" });
+      if (!current || !(await this.commandRowPolicy?.({ tenant, command: commandId, operation, document: current }) ?? true)) {
+        throw new FramekitError("DOCUMENT_NOT_FOUND", `${doctype.name} "${prior.id}" does not exist`, 404);
+      }
+    }
+    return documents;
   }
 
   private async prepareDocumentCommandMutation(
@@ -1040,16 +1205,18 @@ export class FramekitRuntime {
       return receipt;
     }
     assertDraftDocument(existing, "upload attachments to");
-    const storageKey = [tenant.tenantId, this.app.name, doctype.name, id, field.name, attachmentId].map(encodeURIComponent).join("/");
+    const storageKey = [tenant.tenantId, this.app.name, doctype.name, id, field.name, attachmentId, crypto.randomUUID()].map(encodeURIComponent).join("/");
     const metadata: AttachmentMetadata = {
       id: attachmentId, name: upload.name, contentType: upload.contentType, size: upload.bytes.length,
       sha256, storageKey, createdAt: this.now().toISOString(), createdBy: tenant.userId
     };
-    const leaseOwner = `upload:${attachmentId}`;
+    const leaseOwner = `upload:${crypto.randomUUID()}`;
     this.activeAttachmentKeys.add(storageKey);
     let committed = false;
+    let putSucceeded = false;
     try {
       await this.attachmentStorage.put(storageKey, upload.bytes, { contentType: upload.contentType, lease: { owner: leaseOwner, durationMs: 5 * 60_000 } });
+      putSucceeded = true;
       const attachments = attachmentList(existing.data[field.name]);
       const saved = await this.updateDocument(
         tenant, doctypeName, id, { [field.name]: [...attachments, metadata] },
@@ -1057,10 +1224,21 @@ export class FramekitRuntime {
       );
       const receipt = attachmentList(saved.data[field.name]).find((attachment) => attachment.id === attachmentId);
       if (!receipt) throw new FramekitError("IDEMPOTENCY_RESULT_INVALID", "Stored attachment upload receipt is invalid.", 409);
-      committed = true;
+      committed = receipt.storageKey === storageKey;
+      if (!committed) await this.attachmentStorage.delete(storageKey);
       return receipt;
     } catch (error) {
-      await this.attachmentStorage.delete(storageKey).catch(() => undefined);
+      if (putSucceeded) {
+        try {
+          const current = await this.repository.get(tenant, doctype, id, { access: "write" });
+          committed = attachmentList(current?.data[field.name]).some((attachment) => attachment.storageKey === storageKey);
+          if (!committed && error instanceof FramekitError && ["REVISION_CONFLICT", "VALIDATION_FAILED", "FORBIDDEN", "IDEMPOTENCY_KEY_REUSED"].includes(error.code)) {
+            await this.attachmentStorage.delete(storageKey);
+          }
+        } catch {
+          // Preserve the lease when the durable commit outcome cannot be established.
+        }
+      }
       throw error;
     } finally {
       if (committed) await this.attachmentStorage.releaseLease?.(storageKey, leaseOwner).catch(() => undefined);
@@ -1135,6 +1313,11 @@ export class FramekitRuntime {
     if (!tenant.permissions.includes("*") && !tenant.permissions.includes("framekit.attachments.cleanup")) {
       throw new FramekitError("FORBIDDEN", "Missing framekit.attachments.cleanup permission", 403);
     }
+    if (!this.attachmentStorage.listCleanupCandidates || !this.attachmentStorage.deleteIfUnleased) {
+      throw new FramekitError("ATTACHMENT_CLEANUP_UNSUPPORTED", "Attachment storage must support revision snapshots and atomic conditional deletion for safe cleanup.", 501);
+    }
+    const prefix = `${encodeURIComponent(tenant.tenantId)}/${encodeURIComponent(this.app.name)}/`;
+    const snapshot = await this.attachmentStorage.listCleanupCandidates(prefix);
     const referenced = new Set<string>();
     for (const baseDoctype of this.app.modules.flatMap((module) => module.doctypes)) {
       const doctype = await this.getEffectiveDocType(tenant, baseDoctype.name);
@@ -1156,14 +1339,10 @@ export class FramekitRuntime {
         cursor = page.nextCursor;
       } while (cursor);
     }
-    const prefix = `${encodeURIComponent(tenant.tenantId)}/${encodeURIComponent(this.app.name)}/`;
-    const candidates = (await this.attachmentStorage.list(prefix)).filter((key) => !referenced.has(key) && !this.activeAttachmentKeys.has(key));
-    if (candidates.length > 0 && !this.attachmentStorage.deleteIfUnleased) {
-      throw new FramekitError("ATTACHMENT_CLEANUP_UNSUPPORTED", "Attachment storage must support atomic age-and-lease-guarded deletion for safe cleanup.", 501);
-    }
+    const candidates = snapshot.filter(({ key }) => key.startsWith(prefix) && !referenced.has(key) && !this.activeAttachmentKeys.has(key));
     const orphaned: string[] = [];
-    for (const key of candidates) {
-      if (await this.attachmentStorage.deleteIfUnleased?.(key, { minimumAgeMs: 60_000 })) orphaned.push(key);
+    for (const { key, revision } of candidates) {
+      if (await this.attachmentStorage.deleteIfUnleased(key, { minimumAgeMs: 60_000, expectedRevision: revision })) orphaned.push(key);
     }
     return orphaned;
   }
@@ -1447,7 +1626,7 @@ export class FramekitRuntime {
     if (doctype.naming.series) {
       return this.namingSeries.next(tenant, doctype, prefix, doctype.naming.digits);
     }
-    return `${prefix}-${this.idGenerator().slice(0, 8)}`;
+    return `${prefix}-${this.idGenerator()}`;
   }
 
   private async runHooks(name: HookName, tenant: TenantContext, doctype: DocTypeDefinition, document: DocumentRecord | undefined, input: DocumentData): Promise<void> {
@@ -1775,3 +1954,38 @@ function settingScopeId(definition: SettingDefinition, tenant: TenantContext, ap
 }
 
 function base64Url(bytes: Uint8Array): string { let binary = ""; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", ""); }
+
+function sagaProgress(record: SagaRecord): SagaProgress {
+  return {
+    phase: record.phase, nextStep: record.nextStep, activeStep: record.activeStep,
+    compensationIndex: record.compensationIndex, documents: record.documents,
+    failure: record.failure, compensationFailure: record.compensationFailure
+  };
+}
+
+function sagaStepKey(key: string, phase: "running" | "compensating", index: number): string {
+  return `framekit:saga:${JSON.stringify([key, phase, index])}`;
+}
+
+function sagaFingerprint(tenant: TenantContext, command: string, operations: DocumentCommandOperation[]): string {
+  return mutationFingerprint(`saga:${command}`, command, { principal: { tenantId: tenant.tenantId, userId: tenant.userId }, operations });
+}
+
+function sagaStepFingerprint(tenant: TenantContext, command: string, phase: string, operation: DocumentCommandOperation): string {
+  return mutationFingerprint(`saga:${command}:${phase}`, operation.doctype, { principal: { tenantId: tenant.tenantId, userId: tenant.userId }, operation });
+}
+
+function sagaFailure(error: unknown): { code?: string; message: string } {
+  return { code: error instanceof FramekitError ? error.code : undefined, message: error instanceof Error ? error.message : String(error) };
+}
+
+function isSagaLeaseLost(error: unknown): boolean {
+  return error instanceof FramekitError && error.code === "COMMAND_SAGA_LEASE_LOST";
+}
+
+function sagaFailed(command: string, journal: SagaRecord): FramekitError {
+  return new FramekitError("COMMAND_SAGA_FAILED", `Command "${command}" failed and compensation ${journal.phase === "compensated" ? "completed" : "must be resumed"}.`, 409, {
+    cause: journal.failure?.message, causeCode: journal.failure?.code,
+    compensationFailures: journal.compensationFailure ? [journal.compensationFailure] : []
+  });
+}

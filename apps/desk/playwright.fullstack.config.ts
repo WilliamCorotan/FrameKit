@@ -22,8 +22,11 @@ export default defineConfig({
     {
       command: "pnpm --filter @framekit/example-crm serve:built",
       env: {
+        DATABASE_URL: process.env.DATABASE_URL ?? "",
         FRAMEKIT_ALLOWED_ORIGINS: deskOrigin,
         FRAMEKIT_API_PORT: String(apiPort),
+        FRAMEKIT_SETTINGS_ACTIVE_KEY: "playwright",
+        FRAMEKIT_SETTINGS_KEYS: '{"playwright":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}',
         HOST: "127.0.0.1",
         NODE_ENV: "test",
         PORT: String(apiPort)

@@ -76,6 +76,64 @@ test("signs in, restores a session, and signs out", async ({ page }) => {
   await expect(page.evaluate(() => ({ local: window.localStorage.length, session: window.sessionStorage.length }))).resolves.toEqual({ local: 0, session: 0 });
 });
 
+test("completes an MFA login challenge and sends recovery-code intent", async ({ page }) => {
+  await page.goto("/");
+  await page.getByLabel("Email").fill("mfa@example.com");
+  await page.getByLabel("Password").fill("mfa-password");
+  await page.getByRole("button", { name: "Sign in" }).click();
+
+  await expect(page.getByLabel("Authenticator code")).toBeVisible();
+  await expect(page.getByLabel("Password")).toHaveCount(0);
+  await page.getByRole("button", { name: "Back to sign in" }).click();
+  await expect(page.getByLabel("Password")).toHaveValue("");
+
+  await page.getByLabel("Password").fill("mfa-password");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByLabel("Use a recovery code").check();
+  await page.getByRole("textbox", { name: "Recovery code" }).fill("RECOVERY-CODE");
+  const completion = page.waitForRequest(`${apiOrigin}/api/auth/mfa/complete`);
+  await page.getByRole("button", { name: "Verify and sign in" }).click();
+  expect((await completion).postDataJSON()).toEqual({
+    challengeToken: "mock-mfa-challenge",
+    code: "RECOVERY-CODE",
+    recoveryCode: true
+  });
+  await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
+});
+
+test("returns to primary sign in after an incorrect MFA code", async ({ page }) => {
+  await page.goto("/");
+  await page.getByLabel("Email").fill("mfa@example.com");
+  await page.getByLabel("Password").fill("mfa-password");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByLabel("Authenticator code").fill("000000");
+  await page.getByRole("button", { name: "Verify and sign in" }).click();
+
+  await expect(page.getByLabel("Email")).toBeVisible();
+  await expect(page.getByLabel("Password")).toHaveValue("");
+  await expect(page.getByRole("status")).toContainText("Authenticator code is invalid");
+});
+
+test("enrolls MFA from account security, displays recovery codes once, then signs out", async ({ page }) => {
+  await signIn(page);
+  await page.getByRole("button", { name: "Account security" }).click();
+  await expect(page.getByRole("heading", { name: "Account security" })).toBeVisible();
+  await page.getByRole("button", { name: "Set up authenticator" }).click();
+  await expect(page.getByText("Setup key: MOCK-SETUP-KEY")).toBeVisible();
+  await page.getByLabel("Authenticator code").fill("123456");
+  await page.getByRole("button", { name: "Confirm authenticator" }).click();
+  await expect(page.getByRole("heading", { name: "Save your recovery codes" })).toBeVisible();
+  await expect(page.getByText("RECOVERY-ONE")).toBeVisible();
+
+  await page.getByRole("button", { name: "I saved my codes — sign in again" }).click();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await page.getByLabel("Password").fill("admin12345");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.getByRole("heading", { name: "Account security" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Save your recovery codes" })).toHaveCount(0);
+  await expect(page.getByText("Multi-factor authentication is enabled. 8 recovery codes remain.")).toBeVisible();
+});
+
 test("waits for the session probe before allowing sign in", async ({ page }) => {
   let releaseProbe!: () => void;
   await page.route(`${apiOrigin}/api/auth/me`, async (route) => {
@@ -109,6 +167,7 @@ test("waits for server logout before allowing sign in again", async ({ page }) =
   releaseLogout();
 
   await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await page.getByLabel("Password").fill("admin12345");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
 });
@@ -135,6 +194,7 @@ test("ignores a delayed old-session success after logout and re-login", async ({
   await page.getByRole("button", { name: "Refresh records" }).click();
   await oldRequest;
   await page.getByRole("button", { name: "Sign out" }).click();
+  await page.getByLabel("Password").fill("admin12345");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
   releaseOldRequest();
@@ -157,6 +217,7 @@ test("ignores a delayed old-session 401 after logout and re-login", async ({ pag
   await page.getByRole("button", { name: "Refresh records" }).click();
   await oldRequest;
   await page.getByRole("button", { name: "Sign out" }).click();
+  await page.getByLabel("Password").fill("admin12345");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.getByRole("heading", { name: "Customer", exact: true })).toBeVisible();
   releaseOldRequest();
@@ -392,6 +453,8 @@ async function signIn(page: Page) {
 
 async function mockDeskApi(page: Page) {
   let sessionActive = false;
+  let mfaPending = false;
+  let mfaEnabled = false;
   const now = "2026-07-06T00:00:00.000Z";
   const customers: RecordItem[] = [
     {
@@ -444,8 +507,18 @@ async function mockDeskApi(page: Page) {
     const body = request.postDataJSON?.() as Record<string, unknown> | undefined;
 
     if (path === "/api/auth/login" && method === "POST") {
+      if (body?.email === "mfa@example.com" && body.password === "mfa-password") {
+        return jsonError(route, 401, "MFA_REQUIRED", "Complete MFA to sign in.", { challengeToken: "mock-mfa-challenge" });
+      }
       if (body?.password !== "admin12345") {
         return jsonError(route, 401, "INVALID_LOGIN", "Invalid email or password");
+      }
+      sessionActive = true;
+      return json(route, {});
+    }
+    if (path === "/api/auth/mfa/complete" && method === "POST") {
+      if (body?.challengeToken !== "mock-mfa-challenge" || body.code === "000000") {
+        return jsonError(route, 401, "MFA_CODE_INVALID", "Authenticator code is invalid.");
       }
       sessionActive = true;
       return json(route, {});
@@ -458,6 +531,19 @@ async function mockDeskApi(page: Page) {
       return sessionActive
         ? json(route, { user: users[0], context: { tenantId: "default", userId: "admin" } })
         : jsonError(route, 401, "UNAUTHENTICATED", "Missing session token.");
+    }
+    if (path === "/api/auth/mfa/status" && method === "GET") {
+      return json(route, { enabled: mfaEnabled, pending: mfaPending, recoveryCodes: mfaEnabled ? 8 : 0 });
+    }
+    if (path === "/api/auth/mfa/enroll" && method === "POST") {
+      mfaPending = true;
+      return json(route, { secret: "MOCK-SETUP-KEY", expiresAt: "2026-07-06T00:10:00.000Z" });
+    }
+    if (path === "/api/auth/mfa/confirm" && method === "POST") {
+      if (body?.code !== "123456") return jsonError(route, 401, "MFA_CODE_INVALID", "Authenticator code is invalid.");
+      mfaPending = false;
+      mfaEnabled = true;
+      return json(route, { recoveryCodes: ["RECOVERY-ONE", "RECOVERY-TWO"] });
     }
     if (path === "/api/meta" && method === "GET") {
       return json(route, metadata);
@@ -635,8 +721,8 @@ function empty(route: Route) {
   return route.fulfill({ status: 204 });
 }
 
-function jsonError(route: Route, status: number, code: string, message: string) {
-  return route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: true, code, message }) });
+function jsonError(route: Route, status: number, code: string, message: string, details?: Record<string, unknown>) {
+  return route.fulfill({ status, contentType: "application/json", body: JSON.stringify({ error: true, code, message, ...(details ? { details } : {}) }) });
 }
 
 const metadata = {

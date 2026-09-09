@@ -1,4 +1,5 @@
 import type { TenantContext } from "@framekit/core";
+import type { MfaService } from "./mfa.js";
 
 export type AuthUser = {
   id: string;
@@ -49,6 +50,15 @@ export type AuthSession = {
   user: PublicAuthUser;
   context: TenantContext;
   expiresAt: string;
+  mfa?: MfaSessionProof;
+  /** Original primary authentication time in Unix milliseconds; refresh preserves it. */
+  authenticatedAt?: number;
+};
+
+export type MfaSessionProof = {
+  enrollmentId: string;
+  /** Unix milliseconds of the original second-factor verification; refresh preserves it. */
+  verifiedAt: number;
 };
 
 export type AuthAuditEvent = {
@@ -99,7 +109,7 @@ export type AuthIdentityLinkStore = {
   upsert(link: AuthIdentityLink): Promise<AuthIdentityLink>;
 };
 
-export type AuthLifecycleTokenKind = "invitation" | "password_reset" | "recovery";
+export type AuthLifecycleTokenKind = "invitation" | "password_reset" | "recovery" | "mfa_challenge";
 
 export type AuthLifecycleToken = {
   id: string;
@@ -219,6 +229,7 @@ export type PasswordAuthOptions = {
   lockoutSeconds?: number;
   invitationTtlSeconds?: number;
   recoveryTtlSeconds?: number;
+  mfa?: MfaService;
 };
 export type ApiTokenSession = {
   token: string;

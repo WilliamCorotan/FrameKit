@@ -1,5 +1,5 @@
 import { OutboxDispatcher } from "@framekit/jobs";
-import { runtime, seedDemo } from "./app.js";
+import { runtime, seedDemo, closeApplication } from "./app.js";
 
 const tenant = {
   tenantId: "default",
@@ -17,5 +17,5 @@ const dispatcher = new OutboxDispatcher(runtime, tenant, async (event, context) 
 try {
   console.log(JSON.stringify(await dispatcher.runOnce()));
 } finally {
-  await dispatcher.close();
+  try { await dispatcher.close(); } finally { await closeApplication(); }
 }

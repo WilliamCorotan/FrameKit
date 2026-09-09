@@ -79,11 +79,83 @@ export function normalizeNitroBasePath(basePath: string): string {
   return prefixed.slice(0, end);
 }
 
+function safeBrowserReturnTo(value: unknown): string {
+  if (value === undefined) return "/";
+  if (typeof value !== "string" || !value.startsWith("/") || value.startsWith("//") || value.includes("\\") || /[\u0000-\u0020\u007f]/.test(value)) {
+    throw new FramekitError("INVALID_RETURN_TO", "returnTo must be a same-origin absolute path.", 422);
+  }
+  return value;
+}
+
+function renderMfaChallengePage(basePath: string, challengeToken: string, returnTo: string): Response {
+  const action = escapeHtml(`${basePath}/auth/mfa/complete`);
+  const token = escapeHtml(challengeToken);
+  const target = escapeHtml(returnTo);
+  const document = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Complete sign in</title></head><body><main><h1>Complete sign in</h1><p>Enter an authenticator or recovery code to continue.</p><form method="post" action="${action}"><input type="hidden" name="challengeToken" value="${token}"><input type="hidden" name="returnTo" value="${target}"><label>Authenticator code <input name="code" inputmode="numeric" autocomplete="one-time-code" required></label><label><input type="checkbox" name="recoveryCode" value="on"> Use a recovery code</label><button type="submit">Continue</button></form></main></body></html>`;
+  return new Response(document, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+      "referrer-policy": "strict-origin",
+      "content-security-policy": "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    }
+  });
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]!);
+}
+
 async function dispatchAuthRoute(event: H3Event, context: RouteContext): Promise<Result> {
   const { assertAuthManager, assertOperationPermission, authenticatedTenantFromRequest, canonicalLocale, clearSessionCookie, createRealtimeStream, decodeBase64, encodeBase64, isOutboxStatus, isPlainObject, mutationOptions, parseFields, parseFilters, parseSort, preferredLocale, requireAuth, runHealthChecks, sessionTokenFromEvent, setSessionCookie, tenantFromRequest } = context.helpers;
   const { runtime, options, basePath, authCookie, allowHeaderIdentity } = context;
   const method = event.req.method ?? "GET";
   const path = event.url.pathname;
+const authManagementMutation = method !== "GET" && (
+  path.startsWith(basePath + "/auth/users") || path.startsWith(basePath + "/auth/roles") || path.startsWith(basePath + "/auth/tokens") ||
+  path === basePath + "/auth/invitations" || path === basePath + "/auth/identity-links"
+);
+if (authManagementMutation && options.auth) {
+  const token = sessionTokenFromEvent(event, authCookie);
+  if (token) {
+    const identity = await options.auth.verifyBearerToken(token);
+    if ("sessionId" in identity) await options.auth.enforceRecentMfa(token);
+  }
+}
+if (method === "POST" && path === basePath + "/auth/mfa/complete") {
+  const auth = requireAuth(options.auth);
+  const formSubmission = event.req.headers.get("content-type")?.toLowerCase().startsWith("application/x-www-form-urlencoded") === true;
+  const body = await readBody(event) as { challengeToken?: unknown; code?: unknown; recoveryCode?: unknown; returnTo?: unknown };
+  const returnTo = formSubmission ? safeBrowserReturnTo(body?.returnTo) : undefined;
+  const recoveryCode = formSubmission ? body?.recoveryCode === "on" : body?.recoveryCode;
+  if (!body || typeof body.challengeToken !== "string" || typeof body.code !== "string" || (recoveryCode !== undefined && typeof recoveryCode !== "boolean")) throw new FramekitError("VALIDATION_FAILED", "A challenge token and MFA code are required.", 422);
+  const session = await auth.completeMfaChallenge(body.challengeToken, body.code, { recoveryCode });
+  setSessionCookie(event, session.token, session.expiresAt, authCookie);
+  if (formSubmission) return handled(sendRedirect(event, returnTo!, 303));
+  return handled(session);
+}
+if (path.startsWith(basePath + "/auth/mfa/")) {
+  const auth = requireAuth(options.auth);
+  const tenant = await authenticatedTenantFromRequest(event.req, auth, authCookie);
+  if (method === "GET" && path === basePath + "/auth/mfa/status") return handled(await auth.getMfaStatus(tenant));
+  if (method === "POST" && path === basePath + "/auth/mfa/enroll") {
+    const token = sessionTokenFromEvent(event, authCookie);
+    if (!token) throw new FramekitError("INVALID_SESSION", "A recent session is required to enroll MFA.", 401);
+    await auth.assertRecentPrimaryAuth(token);
+    return handled(await auth.beginMfaEnrollment(tenant));
+  }
+  if (method === "POST" && (path === basePath + "/auth/mfa/confirm" || path === basePath + "/auth/mfa/disable")) {
+    const body = await readBody(event) as { code?: unknown; recoveryCode?: unknown };
+    if (!body || typeof body.code !== "string" || (body.recoveryCode !== undefined && typeof body.recoveryCode !== "boolean")) throw new FramekitError("VALIDATION_FAILED", "An MFA code is required.", 422);
+    if (path.endsWith("/confirm")) return handled(await auth.confirmMfaEnrollment(tenant, body.code));
+    const token = sessionTokenFromEvent(event, authCookie);
+    if (!token) throw new FramekitError("INVALID_SESSION", "A recent session is required to change MFA.", 401);
+    await auth.assertRecentPrimaryAuth(token);
+    await auth.disableMfa(tenant, body.code, { recoveryCode: body.recoveryCode });
+    clearSessionCookie(event, authCookie);
+    return handled({ ok: true });
+  }
+}
 if (method === "POST" && path === basePath + "/auth/login") {
   if (!options.auth) {
     throw new FramekitError("AUTH_NOT_CONFIGURED", "Auth is not configured for this app.", 501);
@@ -127,7 +199,19 @@ if (method === "GET" && providerAuthorization?.action === "callback") {
     throw new FramekitError("VALIDATION_FAILED", "code and state are required.", 422);
   }
   await consumeOidcBrowserState(event, basePath, providerAuthorization.providerId, query.state, authCookie?.secure ?? nodeEnvironment() === "production");
-  const completed = await auth.completeProviderAuthorization(providerAuthorization.providerId, { code: query.code, state: query.state });
+  let completed: Awaited<ReturnType<typeof auth.completeProviderAuthorization>>;
+  try {
+    completed = await auth.completeProviderAuthorization(providerAuthorization.providerId, { code: query.code, state: query.state });
+  } catch (error) {
+    if (error instanceof FramekitError && error.code === "MFA_REQUIRED" && error.details && typeof error.details === "object") {
+      const details = error.details as { challengeToken?: unknown; returnTo?: unknown };
+      if (typeof details.challengeToken === "string") {
+        event.res.headers.set("referrer-policy", "strict-origin");
+        return handled(renderMfaChallengePage(basePath, details.challengeToken, safeBrowserReturnTo(details.returnTo)));
+      }
+    }
+    throw error;
+  }
   setSessionCookie(event, completed.session.token, completed.session.expiresAt, authCookie);
   return handled(sendRedirect(event, completed.returnTo, 303));
 }

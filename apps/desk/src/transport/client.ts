@@ -1,4 +1,20 @@
-const apiUrl = import.meta.env.VITE_FRAMEKIT_API_URL ?? "http://localhost:3000";
+type RuntimeConfig = { version: 1; apiUrl?: string };
+
+function runtimeApiUrl(): string {
+  const config = (window as Window & { __FRAMEKIT_CONFIG__?: unknown }).__FRAMEKIT_CONFIG__;
+  if (config !== undefined) {
+    if (!config || typeof config !== "object" || (config as RuntimeConfig).version !== 1) throw new Error("Invalid Framekit Desk runtime configuration.");
+    const value = (config as RuntimeConfig).apiUrl;
+    if (value !== undefined) {
+      const url = new URL(value);
+      if (!/^https?:$/.test(url.protocol) || url.username || url.password) throw new Error("Invalid Framekit Desk API URL.");
+      return url.toString().replace(/\/$/, "");
+    }
+    return import.meta.env.VITE_FRAMEKIT_API_URL ?? (import.meta.env.DEV ? "http://localhost:3000" : "");
+  }
+  return import.meta.env.VITE_FRAMEKIT_API_URL ?? (import.meta.env.DEV ? "http://localhost:3000" : "");
+}
+const apiUrl = runtimeApiUrl();
 
 export type RequestOptions = { method?: string; body?: unknown; expectedRevision?: number };
 
@@ -47,14 +63,14 @@ export async function fetchJson<T>(path: string, options: RequestOptions = {}): 
 
   if (requestGeneration !== authRequestState.generation) return staleRequest<T>();
   if (!response.ok) {
-    if (response.status === 401 && path !== "/api/auth/me" && path !== "/api/auth/login") {
+    if (response.status === 401 && path !== "/api/auth/me" && path !== "/api/auth/login" && path !== "/api/auth/mfa/complete") {
       window.dispatchEvent(new Event("framekit:unauthenticated"));
     }
     const text = await response.text();
     if (requestGeneration !== authRequestState.generation) return staleRequest<T>();
     try {
-      const payload = JSON.parse(text) as { message?: unknown };
-      throw new Error(typeof payload.message === "string" ? payload.message : `Request failed (${response.status}).`);
+      const payload = JSON.parse(text) as { message?: unknown; code?: string; details?: Record<string, unknown> };
+      throw new DeskRequestError(typeof payload.message === "string" ? payload.message : `Request failed (${response.status}).`, payload.code, payload.details);
     } catch (error) {
       if (error instanceof SyntaxError) throw new Error(text || `Request failed (${response.status}).`);
       throw error;
@@ -69,3 +85,7 @@ export async function fetchJson<T>(path: string, options: RequestOptions = {}): 
 export function errorMessage(error: unknown): string { return error instanceof Error ? error.message : "Request failed. Try again."; }
 export function encodeBase64(bytes: Uint8Array): string { let binary = ""; for (let offset = 0; offset < bytes.length; offset += 0x8000) binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000)); return btoa(binary); }
 export function csv(value: string | undefined): string[] { return value ? value.split(",").map((part) => part.trim()).filter(Boolean) : []; }
+
+export class DeskRequestError extends Error {
+  constructor(message: string, readonly code?: string, readonly details?: Record<string, unknown>) { super(message); }
+}

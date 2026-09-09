@@ -47,3 +47,11 @@ Before the first hardened apply, back up the database and keep the application o
 Do not edit migration IDs, checksums, fingerprints, or history rows. The first migration in a database with no prior history cannot prove an arbitrary physical baseline; use a no-change baseline migration after backup and schema review. Continue to require `--allow-destructive` (or `allowDestructive: true`) only during an approved maintenance window.
 
 Generated document indexes are shared physical indexes even though document rows and migration history are tenant-scoped. Deployments that share one document table across tenants must keep DocType schemas aligned and coordinate destructive index changes across every tenant. JSON fields cannot be normalized unique keys; model a scalar canonical key instead.
+
+## Physical relational inspection
+
+`inspectPostgresSchema(sql, { schema, tables })` from `@framekit/db` is read-only. It checks supplied relational contracts against catalog columns, defaults, and valid/ready plain B-tree indexes, including uniqueness and ordered columns. Expression, partial, descending, included-column, and non-default operator/collation indexes do not satisfy a plain index contract. Defaults use PostgreSQL's canonical expression text.
+
+The default contracts intentionally cover the four tables in `fixedSchema` (audit, outbox, custom fields and views). Supply additional `FixedSchemaTable` contracts for application-owned relational tables. The result identifies its `checkedTables`; it is not a complete database drift certificate. Domain JSON metadata, migration fingerprints, and supported online conversion plans continue to use the runtime migration APIs.
+
+For a staged v1 → v2 additive rollout and v2 → v3 conversion, see the [versioned upgrade example](upgrade-example.md).

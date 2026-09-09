@@ -1,0 +1,46 @@
+{
+  "name": "@framekit/desk-assets",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "development": {
+        "types": "./index.d.ts",
+        "default": "./index.js"
+      },
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "scripts": {
+    "build": "pnpm --filter @framekit/desk build && node build.mjs",
+    "test:browser": "pnpm build && playwright test --config test/playwright.config.ts",
+    "prepack": "pnpm build"
+  },
+  "files": [
+    "assets",
+    "index.js",
+    "index.d.ts"
+  ],
+  "license": "Apache-2.0",
+  "description": "Packaged Framekit Desk assets and runtime configuration contract.",
+  "engines": {
+    "node": ">=22 <26"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/null-jj/FrameKit.git",
+    "directory": "packages/desk-assets"
+  },
+  "devDependencies": {
+    "@framekit/desk": "workspace:*"
+  }
+}

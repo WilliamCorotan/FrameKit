@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gt, gte, lt, lte, ne, or, sql as drizzleSql, type SQL } from "drizzle-orm";
 import { boolean, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import postgres, { type Sql } from "postgres";
+import { type Sql } from "postgres";
 import type {
   ApiTokenRecord, ApiTokenStore, AuthAuditEvent, AuthAuditSink, AuthIdentityLink, AuthIdentityLinkStore,
   AuthLifecycleToken, AuthLifecycleTokenKind, AuthLifecycleTokenStore, AuthRole, AuthUser,
@@ -51,6 +51,7 @@ import { framekitDocuments } from "./schema.js";
 import type { PostgresRepositoryOptions } from "./types.js";
 import { createDocumentTableSql } from "./ddl.js";
 import { postgresRevisionConflict, rowToRecord } from "./document-mapping.js";
+import { closeAdapterSql, postgresForOptions } from "./connection.js";
 
 export class PostgresDocumentRepository implements DocumentRepository {
   private readonly sql: Sql;
@@ -58,13 +59,13 @@ export class PostgresDocumentRepository implements DocumentRepository {
   private readonly onQuery?: PostgresRepositoryOptions["onQuery"];
 
   constructor(options: PostgresRepositoryOptions) {
-    this.sql = postgres(options.connectionString, { max: options.max ?? 5 });
-    this.db = drizzle(this.sql);
+    this.sql = postgresForOptions(options);
+    this.db = drizzle(options.connection?.drizzleSql ?? this.sql);
     this.onQuery = options.onQuery;
   }
 
   async start(signal?: AbortSignal): Promise<void> { signal?.throwIfAborted(); await this.db.execute(drizzleSql`select 1`); }
-  async close(): Promise<void> { await this.sql.end({ timeout: 5 }); }
+  async close(): Promise<void> { await closeAdapterSql(this.sql); }
   async dispose(): Promise<void> { await this.close(); }
 
   async migrate(): Promise<void> {

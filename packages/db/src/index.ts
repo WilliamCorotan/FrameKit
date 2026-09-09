@@ -1,6 +1,10 @@
 // Public package boundary. Implementation is grouped by persistence concern.
 export * from "./schema.js";
+export * from "./schema-contract.js";
+export * from "./schema-inspection.js";
+export { PostgresMfaStore } from "./mfa-store.js";
 export * from "./types.js";
+export { createPostgresConnection, type PostgresConnection } from "./connection.js";
 export { PostgresDocumentRepository } from "./document-repository.js";
 export { PostgresMutationUnitOfWork } from "./mutation-repository.js";
 export {
@@ -42,3 +46,5 @@ export {
   createUserTableSql,
   createViewTableSql
 } from "./ddl.js";
+
+export { PostgresSagaStore } from "./saga-store.js";
