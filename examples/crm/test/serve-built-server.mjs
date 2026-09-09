@@ -99,9 +99,9 @@ try {
   await close();
   throw error;
 }
-console.log("Framekit listening on http://" + host + ":" + server.address().port);
 process.once("SIGINT", () => void close().then(() => process.exit(0), () => process.exit(1)));
 process.once("SIGTERM", () => void close().then(() => process.exit(0), () => process.exit(1)));
+console.log("Framekit listening on http://" + host + ":" + server.address().port);
 
 function rejectLargeRequest(incoming, outgoing) {
   outgoing.writeHead(413, { "connection": "close", "content-type": "text/plain; charset=utf-8" });
