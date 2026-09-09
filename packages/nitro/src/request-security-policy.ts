@@ -1,4 +1,31 @@
-import type { H3Event } from "h3";
+import { deleteCookie, getCookie, setCookie, type H3Event } from "h3";
+import { FramekitError } from "@framekit/core";
+
+async function oidcStateDigest(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function oidcBrowserCookie(basePath: string, providerId: string, secure: boolean) {
+  const scope = await oidcStateDigest(JSON.stringify([basePath, providerId]));
+  return {
+    name: `${secure ? "__Host-" : ""}framekit_oidc_${scope.slice(0, 24)}`,
+    options: { path: "/", httpOnly: true, secure, sameSite: "lax" as const }
+  };
+}
+
+export async function setOidcBrowserState(event: H3Event, basePath: string, providerId: string, state: string, secure: boolean): Promise<void> {
+  const cookie = await oidcBrowserCookie(basePath, providerId, secure);
+  setCookie(event, cookie.name, await oidcStateDigest(state), { ...cookie.options, maxAge: 600 });
+}
+
+export async function consumeOidcBrowserState(event: H3Event, basePath: string, providerId: string, state: string, secure: boolean): Promise<void> {
+  const cookie = await oidcBrowserCookie(basePath, providerId, secure);
+  if (getCookie(event, cookie.name) !== await oidcStateDigest(state)) {
+    throw new FramekitError("OIDC_BROWSER_STATE_INVALID", "OIDC callback does not match this browser's authorization request.", 401);
+  }
+  deleteCookie(event, cookie.name, cookie.options);
+}
 
 /** Applies the invariant response headers before route dispatch. */
 export function applyResponseSecurityHeaders(event: H3Event, environment: string | undefined): void {

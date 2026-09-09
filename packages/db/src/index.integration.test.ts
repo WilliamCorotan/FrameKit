@@ -1,5 +1,6 @@
 import postgres from "postgres";
 import { describe, expect, it, afterAll, beforeAll } from "vitest";
+import { hashPassword, PasswordAuthService } from "@framekit/auth";
 import { defineApp, defineDocType, defineModule, type TenantContext } from "@framekit/core";
 import { createRuntime, InMemoryAttachmentStorage, InMemoryDocumentRepository, migrationChecksum, type ListOptions } from "@framekit/runtime";
 import {
@@ -170,6 +171,63 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
     await cleanup(sql);
     await closeStores(stores);
     await sql.end({ timeout: 1 });
+  });
+
+  it("atomically updates authentication state without restoring stale credentials or account privileges", async () => {
+    const peer = new PostgresUserStore({ connectionString: connectionString! });
+    const user = {
+      tenantId: tenant.tenantId, id: "auth-race", email: "auth-race@example.test", name: "Auth race",
+      passwordHash: await hashPassword("old password"), roles: ["administrator"], permissions: ["*"]
+    };
+    const auth = new PasswordAuthService({ secret: "integration-secret-with-enough-length", userStore: stores.userStore });
+    try {
+      await stores.userStore.upsert(user);
+      const session = await auth.login(user.email, "old password", user.tenantId);
+      const loginState = {
+        tenantId: user.tenantId, userId: user.id, expectedPasswordHash: user.passwordHash,
+        maxFailedLoginAttempts: 5, lockoutSeconds: 60, now: new Date().toISOString()
+      };
+      await Promise.all(Array.from({ length: 10 }, (_, index) => (index % 2 ? peer : stores.userStore)
+        .updateLoginState({ ...loginState, operation: "failed" })));
+      await expect(peer.findById(user.tenantId, user.id)).resolves.toMatchObject({ failedLoginAttempts: 10, lockedUntil: expect.any(String) });
+      await expect(peer.updateLoginState({ ...loginState, operation: "succeeded" })).resolves.toBeUndefined();
+
+      const administratorLock = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      await stores.userStore.upsert({ ...user, failedLoginAttempts: 10, lockedUntil: administratorLock });
+      await expect(peer.updateLoginState({ ...loginState, operation: "failed" })).resolves.toMatchObject({ failedLoginAttempts: 11, lockedUntil: administratorLock });
+
+      await stores.userStore.upsert({ ...user, failedLoginAttempts: 10, lockedUntil: "2020-01-01T00:00:00.000Z" });
+      await expect(peer.updateLoginState({ ...loginState, operation: "clear_expired" })).resolves.toMatchObject({ failedLoginAttempts: 0, lockedUntil: undefined });
+      await auth.resetPassword(user.tenantId, user.id, "new password");
+      for (const operation of ["failed", "succeeded", "clear_expired"] as const) {
+        await expect(peer.updateLoginState({ ...loginState, operation })).resolves.toBeUndefined();
+      }
+      await expect(auth.verifyToken(session.token)).rejects.toMatchObject({ code: "INVALID_SESSION" });
+      await expect(auth.login(user.email, "old password", user.tenantId)).rejects.toMatchObject({ code: "INVALID_LOGIN" });
+      await expect(auth.login(user.email, "new password", user.tenantId)).resolves.toMatchObject({ context: { userId: user.id } });
+
+      const current = (await stores.userStore.findById(user.tenantId, user.id))!;
+      await stores.userStore.upsert({ ...current, roles: ["reader"], permissions: ["read"] });
+      const passwordUpdate = { tenantId: user.tenantId, userId: user.id, expectedPasswordHash: current.passwordHash, passwordHash: await hashPassword("third password") };
+      await expect(peer.updatePassword({ ...passwordUpdate, tenantId: "another-tenant" })).resolves.toBeUndefined();
+      await expect(peer.updatePassword(passwordUpdate)).resolves.toMatchObject({ roles: ["reader"], permissions: ["read"] });
+      await expect(peer.updatePassword(passwordUpdate)).resolves.toBeUndefined();
+
+      const disabled = { ...(await stores.userStore.findById(user.tenantId, user.id))!, disabledAt: new Date().toISOString() };
+      await stores.userStore.upsert(disabled);
+      const disabledUpdate = { ...passwordUpdate, expectedPasswordHash: disabled.passwordHash, passwordHash: await hashPassword("fourth password") };
+      await expect(peer.updatePassword(disabledUpdate)).resolves.toBeUndefined();
+      await expect(peer.updateLoginState({ ...loginState, expectedPasswordHash: disabled.passwordHash, operation: "failed" })).resolves.toBeUndefined();
+      await expect(peer.updatePassword({ ...disabledUpdate, allowDisabled: true })).resolves.toMatchObject({ disabledAt: disabled.disabledAt, roles: ["reader"], permissions: ["read"] });
+      await expect(auth.login(user.email, "fourth password", user.tenantId)).rejects.toMatchObject({ code: "USER_DISABLED" });
+
+      await stores.userStore.delete(user.tenantId, user.id);
+      await expect(peer.updatePassword({ ...disabledUpdate, expectedPasswordHash: disabledUpdate.passwordHash, allowDisabled: true })).resolves.toBeUndefined();
+      await expect(peer.updateLoginState({ ...loginState, expectedPasswordHash: disabledUpdate.passwordHash, operation: "failed" })).resolves.toBeUndefined();
+      await expect(peer.findById(user.tenantId, user.id)).resolves.toBeUndefined();
+    } finally {
+      await peer.close();
+    }
   });
 
   it("persists documents, audit, outbox, customization, naming, migrations, users, and session revocations", async () => {

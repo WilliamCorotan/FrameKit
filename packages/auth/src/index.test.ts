@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import * as authExports from "./index.js";
+import { sign } from "./crypto.js";
+import type { UserStore } from "./contracts.js";
 import {
   createOidcAuthorizationCodeProvider,
   createOidcProvider,
@@ -172,6 +174,177 @@ describe("PasswordAuthService", () => {
     await expect(auth.verifyToken(refreshed.token)).rejects.toMatchObject({ code: "SESSION_REVOKED" });
   });
 
+  it("does not restore stale user data while recording a failed login", async () => {
+    const scenarios: Array<{ name: string; mutate: (auth: PasswordAuthService, store: InMemoryUserStore) => Promise<void>; verify: (store: InMemoryUserStore) => Promise<void> }> = [
+      {
+        name: "password reset",
+        mutate: async (auth) => { await auth.resetPassword("t1", "u1", "reset password"); },
+        verify: async (store) => expect(await store.findById("t1", "u1")).toMatchObject({ passwordHash: expect.any(String) })
+      },
+      {
+        name: "account disable",
+        mutate: async (_auth, store) => { await store.upsert({ ...(await store.findById("t1", "u1"))!, disabledAt: new Date().toISOString() }); },
+        verify: async (store) => expect(await store.findById("t1", "u1")).toMatchObject({ disabledAt: expect.any(String) })
+      },
+      {
+        name: "account delete",
+        mutate: async (_auth, store) => { await store.delete("t1", "u1"); },
+        verify: async (store) => expect(await store.findById("t1", "u1")).toBeUndefined()
+      },
+      {
+        name: "role update",
+        mutate: async (_auth, store) => { await store.upsert({ ...(await store.findById("t1", "u1"))!, roles: ["administrator"], permissions: ["*"] }); },
+        verify: async (store) => expect(await store.findById("t1", "u1")).toMatchObject({ roles: ["administrator"], permissions: ["*"] })
+      }
+    ];
+    for (const scenario of scenarios) {
+      const base = new InMemoryUserStore([{
+        id: "u1", tenantId: "t1", email: "admin@example.com", name: "Admin", passwordHash: await hashPassword("old password"), roles: [], permissions: []
+      }]);
+      const oldHash = (await base.findById("t1", "u1"))!.passwordHash;
+      const barrier = deferred<void>();
+      const release = deferred<void>();
+      const store: UserStore = {
+        list: (tenantId) => base.list(tenantId), findByEmail: (email, tenantId) => base.findByEmail(email, tenantId),
+        findById: (tenantId, userId) => base.findById(tenantId, userId), upsert: (user) => base.upsert(user), delete: (tenantId, userId) => base.delete(tenantId, userId),
+        updateLoginState: async (input) => { barrier.resolve(); await release.promise; return base.updateLoginState(input); },
+        updatePassword: (input) => base.updatePassword(input)
+      };
+      const auth = new PasswordAuthService({ secret: "test-secret-with-enough-length", userStore: store });
+      const login = auth.login("admin@example.com", "wrong password", "t1");
+      await barrier.promise;
+      await scenario.mutate(auth, base);
+      release.resolve();
+      await expect(login, scenario.name).rejects.toMatchObject({ code: "INVALID_LOGIN" });
+      await scenario.verify(base);
+      if (scenario.name === "password reset") {
+        const user = (await base.findById("t1", "u1"))!;
+        expect(user.passwordHash).not.toBe(oldHash);
+        await expect(auth.login("admin@example.com", "old password", "t1")).rejects.toMatchObject({ code: "INVALID_LOGIN" });
+        await expect(auth.login("admin@example.com", "reset password", "t1")).resolves.toMatchObject({ context: { userId: "u1" } });
+      }
+    }
+  });
+
+  it("counts concurrent failed logins atomically", async () => {
+    const store = new InMemoryUserStore([{
+      id: "u1", tenantId: "t1", email: "admin@example.com", name: "Admin", passwordHash: await hashPassword("password"), roles: [], permissions: []
+    }]);
+    const reached = deferred<void>();
+    const release = deferred<void>();
+    let updates = 0;
+    const blockingStore: UserStore = {
+      list: (tenantId) => store.list(tenantId), findByEmail: (email, tenantId) => store.findByEmail(email, tenantId),
+      findById: (tenantId, userId) => store.findById(tenantId, userId), upsert: (user) => store.upsert(user), delete: (tenantId, userId) => store.delete(tenantId, userId),
+      updateLoginState: async (input) => { if (++updates === 5) reached.resolve(); await release.promise; return store.updateLoginState(input); },
+      updatePassword: (input) => store.updatePassword(input)
+    };
+    const auth = new PasswordAuthService({ secret: "test-secret-with-enough-length", userStore: blockingStore, maxFailedLoginAttempts: 5 });
+    const attempts = Array.from({ length: 5 }, () => auth.login("admin@example.com", "wrong", "t1"));
+    await reached.promise;
+    release.resolve();
+    await Promise.all(attempts.map((attempt) => expect(attempt).rejects.toMatchObject({ code: "INVALID_LOGIN" })));
+    await expect(store.findById("t1", "u1")).resolves.toMatchObject({ failedLoginAttempts: 5, lockedUntil: expect.any(String) });
+  });
+
+  it("does not shorten an existing longer lock while recording a failed login", async () => {
+    const lockedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+    const store = new InMemoryUserStore([{
+      id: "u1", tenantId: "t1", email: "admin@example.com", name: "Admin", passwordHash: await hashPassword("password"), roles: [], permissions: [], lockedUntil
+    }]);
+    const user = (await store.findById("t1", "u1"))!;
+    await store.updateLoginState({
+      tenantId: "t1", userId: "u1", expectedPasswordHash: user.passwordHash, operation: "failed",
+      maxFailedLoginAttempts: 1, lockoutSeconds: 15 * 60, now: new Date().toISOString()
+    });
+    await expect(store.findById("t1", "u1")).resolves.toMatchObject({ lockedUntil });
+  });
+
+  it("does not let credential writes restore concurrent account changes", async () => {
+    const cases: Array<{
+      action: (auth: PasswordAuthService) => Promise<void>;
+      mutate: (store: InMemoryUserStore) => Promise<void>;
+      verify: (store: InMemoryUserStore) => Promise<void>;
+      rejects: boolean;
+    }> = [
+      {
+        action: (auth) => auth.changePassword("t1", "u1", "old password", "changed password"),
+        mutate: async (store) => { await store.upsert({ ...(await store.findById("t1", "u1"))!, disabledAt: new Date().toISOString() }); },
+        verify: async (store) => expect(await store.findById("t1", "u1")).toMatchObject({ disabledAt: expect.any(String) }), rejects: true
+      },
+      {
+        action: (auth) => auth.resetPassword("t1", "u1", "reset password"),
+        mutate: (store) => store.delete("t1", "u1"),
+        verify: async (store) => expect(await store.findById("t1", "u1")).toBeUndefined(), rejects: true
+      },
+      {
+        action: async (auth) => {
+          const recovery = await auth.createRecoveryToken("t1", "u1");
+          await auth.completePasswordRecovery({ tenantId: "t1", token: recovery.token, newPassword: "recovered password", kind: "recovery" });
+        },
+        mutate: async (store) => { await store.upsert({ ...(await store.findById("t1", "u1"))!, roles: ["downgraded"], permissions: ["limited"] }); },
+        verify: async (store) => expect(await store.findById("t1", "u1")).toMatchObject({ roles: ["downgraded"], permissions: ["limited"] }), rejects: false
+      }
+    ];
+    for (const testCase of cases) {
+      const base = new InMemoryUserStore([{ id: "u1", tenantId: "t1", email: "admin@example.com", name: "Admin", passwordHash: await hashPassword("old password"), roles: ["admin"], permissions: ["*"] }]);
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      const store: UserStore = {
+        list: (tenantId) => base.list(tenantId), findByEmail: (email, tenantId) => base.findByEmail(email, tenantId), findById: (tenantId, userId) => base.findById(tenantId, userId),
+        upsert: (user) => base.upsert(user), delete: (tenantId, userId) => base.delete(tenantId, userId), updateLoginState: (input) => base.updateLoginState(input),
+        updatePassword: async (input) => { entered.resolve(); await release.promise; return base.updatePassword(input); }
+      };
+      const auth = new PasswordAuthService({ secret: "test-secret-with-enough-length", userStore: store, lifecycleTokens: new InMemoryAuthLifecycleTokenStore([]) });
+      const session = await auth.login("admin@example.com", "old password", "t1");
+      const action = testCase.action(auth);
+      await entered.promise;
+      await testCase.mutate(base);
+      release.resolve();
+      if (testCase.rejects) await expect(action).rejects.toMatchObject({ code: "INVALID_LOGIN" });
+      else await expect(action).resolves.toBeUndefined();
+      await testCase.verify(base);
+      await expect(auth.verifyToken(session.token)).rejects.toMatchObject({ code: expect.any(String) });
+    }
+  });
+
+  it("binds sessions to the current password credential across auth services", async () => {
+    const store = new InMemoryUserStore([{
+      id: "u1", tenantId: "t1", email: "admin@example.com", name: "Admin",
+      passwordHash: await hashPassword("old password"), roles: [], permissions: []
+    }]);
+    const options = { secret: "test-secret-with-enough-length", userStore: store, lifecycleTokens: new InMemoryAuthLifecycleTokenStore([]) };
+    const auth = new PasswordAuthService(options);
+    const otherAuth = new PasswordAuthService(options);
+    const legacy = await auth.login("admin@example.com", "old password", "t1");
+    const encodedPayload = legacy.token.split(".")[0]!;
+    const legacyPayload = JSON.parse(Buffer.from(encodedPayload, "base64url").toString()) as Record<string, unknown>;
+    delete legacyPayload.cb;
+    const unsignedLegacy = Buffer.from(JSON.stringify(legacyPayload)).toString("base64url");
+    const legacyToken = `${unsignedLegacy}.${await sign(unsignedLegacy, options.secret)}`;
+    await expect(otherAuth.verifyToken(legacy.token)).resolves.toMatchObject({ context: { userId: "u1" } });
+    await expect(auth.verifyToken(legacyToken)).rejects.toMatchObject({ code: "INVALID_SESSION" });
+
+    await auth.changePassword("t1", "u1", "old password", "changed password");
+    await expect(otherAuth.verifyToken(legacy.token)).rejects.toMatchObject({ code: "INVALID_SESSION" });
+    await expect(otherAuth.refreshSession(legacy.token)).rejects.toMatchObject({ code: "INVALID_SESSION" });
+    const changed = await auth.login("admin@example.com", "changed password", "t1");
+    await expect(otherAuth.refreshSession(changed.token)).resolves.toMatchObject({ context: { userId: "u1" } });
+
+    await auth.resetPassword("t1", "u1", "reset password");
+    await expect(auth.verifyToken(changed.token)).rejects.toMatchObject({ code: "INVALID_SESSION" });
+    const reset = await auth.login("admin@example.com", "reset password", "t1");
+
+    const recovery = await auth.createRecoveryToken("t1", "u1");
+    await auth.completePasswordRecovery({ tenantId: "t1", token: recovery.token, newPassword: "recovered password", kind: "recovery" });
+    await expect(auth.verifyToken(reset.token)).rejects.toMatchObject({ code: "INVALID_SESSION" });
+    const recovered = await auth.login("admin@example.com", "recovered password", "t1");
+
+    await auth.upsertUser({ tenantId: "t1", id: "u1", email: "admin@example.com", name: "Admin", password: "upserted password", roles: [], permissions: [] });
+    await expect(auth.verifyToken(recovered.token)).rejects.toMatchObject({ code: "INVALID_SESSION" });
+    await expect(auth.login("admin@example.com", "upserted password", "t1")).resolves.toMatchObject({ context: { userId: "u1" } });
+  });
+
   it("changes and resets user passwords", async () => {
     const store = new InMemoryUserStore([
       {
@@ -220,7 +393,7 @@ describe("PasswordAuthService", () => {
             if (token !== "provider-token") {
               throw new Error("bad token");
             }
-            return { providerId: "test", subject: "external-admin", tenantId, email: "admin@example.com" };
+            return { providerId: "test", subject: "external-admin", tenantId, email: "admin@example.com", emailVerified: true };
           }
         }
       ]
@@ -287,7 +460,7 @@ describe("PasswordAuthService", () => {
       providers: [
         {
           id: "test",
-          authenticate: async ({ tenantId }) => ({ providerId: "test", subject: "external-admin", tenantId, email: "ADMIN@example.com" })
+          authenticate: async ({ tenantId }) => ({ providerId: "test", subject: "external-admin", tenantId, email: "ADMIN@example.com", emailVerified: true })
         }
       ]
     });
@@ -297,6 +470,36 @@ describe("PasswordAuthService", () => {
 
     expect(session.context.userId).toBe("u1");
     expect(link).toMatchObject({ userId: "u1", email: "admin@example.com" });
+  });
+
+  it("does not auto-link an unverified provider email", async () => {
+    const users = new InMemoryUserStore([{
+      id: "u1", tenantId: "t1", email: "admin@example.com", name: "Admin", passwordHash: await hashPassword("password"), roles: [], permissions: []
+    }]);
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length", userStore: users, identityLinkingPolicy: { mode: "email", autoLink: true },
+      providers: [{ id: "test", authenticate: async ({ tenantId }) => ({ providerId: "test", subject: "external-admin", tenantId, email: "admin@example.com", emailVerified: false }) }]
+    });
+    await expect(auth.loginWithProvider("test", "provider-token", "t1")).rejects.toMatchObject({ code: "PROVIDER_USER_NOT_FOUND" });
+  });
+
+  it("only auto-links default OIDC identities with a strict verified email claim", async () => {
+    const users = new InMemoryUserStore([{
+      id: "u1", tenantId: "t1", email: "admin@example.com", name: "Admin", passwordHash: await hashPassword("password"), roles: [], permissions: []
+    }]);
+    const provider = createOidcProvider({
+      id: "oidc",
+      verifyJwt: async (token) => token === "strict" ? {
+        sub: "subject-1", email: "admin@example.com", email_verified: "true"
+      } : {
+        sub: "subject-2", preferred_username: "admin@example.com", email_verified: true
+      }
+    });
+    const auth = new PasswordAuthService({
+      secret: "test-secret-with-enough-length", userStore: users, identityLinkingPolicy: { mode: "email", autoLink: true }, providers: [provider]
+    });
+    await expect(auth.loginWithProvider("oidc", "strict", "t1")).rejects.toMatchObject({ code: "PROVIDER_USER_NOT_FOUND" });
+    await expect(auth.loginWithProvider("oidc", "preferred-username", "t1")).rejects.toMatchObject({ code: "PROVIDER_USER_NOT_FOUND" });
   });
 
   it("enforces tenant-safe identity collisions and audits the failed link", async () => {
@@ -471,6 +674,7 @@ describe("PasswordAuthService", () => {
           aud: "framekit",
           sub: "subject-1",
           email: "admin@example.com",
+          email_verified: true,
           name: "Admin"
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
@@ -562,6 +766,18 @@ describe("PasswordAuthService", () => {
     await expect(auth.verifyBearerToken(created.token)).rejects.toMatchObject({ code: "INVALID_API_TOKEN" });
   });
 
+  it("rejects API tokens bound to deleted users while allowing service tokens", async () => {
+    const users = new InMemoryUserStore([{
+      id: "u1", tenantId: "t1", email: "owner@example.com", name: "Owner", passwordHash: await hashPassword("password"), roles: [], permissions: []
+    }]);
+    const auth = new PasswordAuthService({ secret: "test-secret-with-enough-length", userStore: users, apiTokenStore: new InMemoryApiTokenStore([]) });
+    const owned = await auth.createApiToken({ tenantId: "t1", name: "Owned", userId: "u1", roles: [], permissions: [] });
+    const service = await auth.createApiToken({ tenantId: "t1", name: "Service", roles: [], permissions: [] });
+    await users.delete("t1", "u1");
+    await expect(auth.verifyApiToken(owned.token)).rejects.toMatchObject({ code: "INVALID_API_TOKEN" });
+    await expect(auth.verifyApiToken(service.token)).resolves.toMatchObject({ context: { userId: expect.stringMatching(/^api-token:/) } });
+  });
+
   it("rejects invalid and expired API token expirations", async () => {
     const auth = new PasswordAuthService({
       secret: "test-secret-with-enough-length",
@@ -592,4 +808,10 @@ describe("PasswordAuthService", () => {
 
 function base64Url(buffer: ArrayBuffer): string {
   return Buffer.from(buffer).toString("base64url");
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((next) => { resolve = next; });
+  return { promise, resolve };
 }

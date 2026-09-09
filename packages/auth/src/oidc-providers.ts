@@ -32,6 +32,7 @@ export function createOidcProvider(options: OidcProviderOptions): AuthIdentityPr
         subject,
         tenantId: providerTenantId,
         email,
+        emailVerified: typeof claims.email === "string" && claims.email_verified === true,
         name: typeof claims.name === "string" ? claims.name : email
       };
     }
@@ -162,7 +163,14 @@ async function validateOidcIdToken(payload: JWTPayload, nonceHash: string, clien
 function defaultOidcIdentity(providerId: string, claims: OidcClaims, tenantId: string): AuthProviderIdentity {
   const email = typeof claims.email === "string" ? claims.email : undefined;
   if (!email) throw new FramekitError("OIDC_EMAIL_MISSING", "OIDC identity did not include an email claim.", 401);
-  return { providerId, subject: stringClaim(claims.sub, "sub"), tenantId, email, name: typeof claims.name === "string" ? claims.name : email };
+  return {
+    providerId,
+    subject: stringClaim(claims.sub, "sub"),
+    tenantId,
+    email,
+    emailVerified: claims.email_verified === true,
+    name: typeof claims.name === "string" ? claims.name : email
+  };
 }
 async function oidcClaimsFromToken(token: string, options: OidcProviderOptions, fetcher: typeof fetch): Promise<OidcClaims> {
   if (options.verifyJwt) {

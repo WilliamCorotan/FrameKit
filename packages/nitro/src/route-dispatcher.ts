@@ -4,6 +4,8 @@ import { FramekitError, type TenantContext } from "@framekit/core";
 import { createOpenApiDocument, FRAMEKIT_ROUTE_CATALOG, type FramekitRouteDefinition } from "@framekit/openapi";
 import type { DocumentCommandRequest, FilterValue, FramekitRuntime } from "@framekit/runtime";
 import { matchAttachmentPath, matchAuthManagementPath, matchCommandPath, matchDocumentPath, matchOutboxPath, matchProviderAuthorizationPath, matchProviderLoginPath, matchUserPasswordPath, matchUserRecoveryPath } from "./route-matchers.js";
+import { consumeOidcBrowserState, setOidcBrowserState } from "./request-security-policy.js";
+import { nodeEnvironment } from "./production-policy.js";
 
 const UNHANDLED = Symbol("unhandled");
 type Result = { handled: true; value: unknown } | typeof UNHANDLED;
@@ -113,6 +115,9 @@ if (method === "GET" && providerAuthorization?.action === "authorize") {
     tenantId: event.req.headers.get("x-tenant-id") ?? "default",
     returnTo: typeof query.returnTo === "string" ? query.returnTo : "/"
   });
+  const state = new URL(started.authorizationUrl).searchParams.get("state");
+  if (!state) throw new FramekitError("OIDC_STATE_MISSING", "OIDC authorization requires a state parameter.", 500);
+  await setOidcBrowserState(event, basePath, providerAuthorization.providerId, state, authCookie?.secure ?? nodeEnvironment() === "production");
   return handled(sendRedirect(event, started.authorizationUrl, 302));
 }
 if (method === "GET" && providerAuthorization?.action === "callback") {
@@ -121,6 +126,7 @@ if (method === "GET" && providerAuthorization?.action === "callback") {
   if (typeof query.code !== "string" || typeof query.state !== "string") {
     throw new FramekitError("VALIDATION_FAILED", "code and state are required.", 422);
   }
+  await consumeOidcBrowserState(event, basePath, providerAuthorization.providerId, query.state, authCookie?.secure ?? nodeEnvironment() === "production");
   const completed = await auth.completeProviderAuthorization(providerAuthorization.providerId, { code: query.code, state: query.state });
   setSessionCookie(event, completed.session.token, completed.session.expiresAt, authCookie);
   return handled(sendRedirect(event, completed.returnTo, 303));

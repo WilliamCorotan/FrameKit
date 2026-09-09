@@ -14,6 +14,7 @@ type SessionPayload = {
   permissions: string[];
   exp: number;
   jti?: string;
+  cb?: string;
 };
 
 export class PasswordAuthService {
@@ -61,9 +62,7 @@ export class PasswordAuthService {
       await this.recordAuthAudit({ tenantId, targetUserId: user.id, action: "login.failed", success: false, details: { email: user.email, reason: "invalid_password" } });
       throw new FramekitError("INVALID_LOGIN", "Invalid email or password.", 401);
     }
-    if ((user.failedLoginAttempts ?? 0) > 0 || user.lockedUntil) {
-      user = await this.persistUserAuthState(user, { failedLoginAttempts: 0, lockedUntil: undefined });
-    }
+    user = await this.updateLoginState(user, "succeeded");
     const session = await this.createSession(user);
     await this.recordAuthAudit({ tenantId, actorUserId: user.id, targetUserId: user.id, action: "login.succeeded", success: true, details: { sessionId: session.sessionId } });
     return session;
@@ -253,7 +252,7 @@ export class PasswordAuthService {
       await this.recordAuthAudit({ tenantId: input.tenantId, targetUserId: record.userId, action: `${kind}.failed`, success: false, details: { tokenId: record.id, reason: authErrorCode(error) } });
       throw error;
     }
-    await this.options.userStore.upsert({ ...user, passwordHash: await hashPassword(input.newPassword), failedLoginAttempts: 0, lockedUntil: undefined });
+    await this.replacePassword(user, input.newPassword);
     await this.recordAuthAudit({ tenantId: input.tenantId, targetUserId: user.id, action: `${kind}.completed`, success: true, details: { tokenId: record.id } });
   }
 
@@ -284,6 +283,9 @@ export class PasswordAuthService {
     if (!user) {
       throw new FramekitError("INVALID_SESSION", "Session user no longer exists.", 401);
     }
+    if (!payload.cb || !constantEqual(payload.cb, await this.sessionCredentialBinding(user))) {
+      throw new FramekitError("INVALID_SESSION", "Session credentials are no longer valid.", 401);
+    }
     this.assertUserCanLogin(user);
     return this.sessionFromUser(user, token, new Date(payload.exp * 1000).toISOString(), payload.jti);
   }
@@ -298,6 +300,9 @@ export class PasswordAuthService {
       throw new FramekitError("API_TOKEN_EXPIRED", "API token has expired.", 401);
     }
     const user = record.userId ? await this.options.userStore.findById(record.tenantId, record.userId) : undefined;
+    if (record.userId && !user) {
+      throw new FramekitError("INVALID_API_TOKEN", "API token owner no longer exists.", 401);
+    }
     if (user) {
       this.assertUserCanLogin(user);
     }
@@ -326,7 +331,8 @@ export class PasswordAuthService {
       roles: user.roles,
       permissions: user.permissions,
       exp: expiresAt,
-      jti: sessionId
+      jti: sessionId,
+      cb: await this.sessionCredentialBinding(user)
     };
     const encodedPayload = base64UrlEncode(JSON.stringify(payload));
     const token = `${encodedPayload}.${await sign(encodedPayload, this.options.secret)}`;
@@ -422,12 +428,7 @@ export class PasswordAuthService {
       await this.recordFailedLogin(user);
       throw new FramekitError("INVALID_LOGIN", "Invalid email or password.", 401);
     }
-    await this.options.userStore.upsert({
-      ...user,
-      passwordHash: await hashPassword(newPassword),
-      failedLoginAttempts: 0,
-      lockedUntil: undefined
-    });
+    await this.replacePassword(user, newPassword);
     await this.recordAuthAudit({ tenantId, actorUserId: userId, targetUserId: userId, action: "password.changed", success: true });
   }
 
@@ -436,12 +437,7 @@ export class PasswordAuthService {
     if (!user) {
       throw new FramekitError("USER_NOT_FOUND", `No user with id "${userId}"`, 404);
     }
-    await this.options.userStore.upsert({
-      ...user,
-      passwordHash: await hashPassword(newPassword),
-      failedLoginAttempts: 0,
-      lockedUntil: undefined
-    });
+    await this.replacePassword(user, newPassword, true);
     await this.recordAuthAudit({ tenantId, targetUserId: userId, action: "password.reset", success: true });
   }
 
@@ -529,7 +525,7 @@ export class PasswordAuthService {
     if (this.identityLinkingPolicy.mode === "linked") {
       return undefined;
     }
-    if (!this.identityLinkingPolicy.autoLink) return undefined;
+    if (!this.identityLinkingPolicy.autoLink || identity.emailVerified !== true) return undefined;
     const user = await this.options.userStore.findByEmail(normalizeEmail(identity.email), tenantId);
     if (user) {
       await this.linkProviderIdentity({
@@ -543,6 +539,10 @@ export class PasswordAuthService {
     return user;
   }
 
+  private async sessionCredentialBinding(user: AuthUser): Promise<string> {
+    return sign(JSON.stringify(["framekit:session:credential-binding:v1", user.tenantId, user.id, user.passwordHash]), this.options.secret);
+  }
+
   private assertUserCanLogin(user: AuthUser): void {
     if (user.disabledAt) {
       throw new FramekitError("USER_DISABLED", "User account is disabled.", 403);
@@ -554,23 +554,38 @@ export class PasswordAuthService {
 
   private async normalizeExpiredLockout(user: AuthUser): Promise<AuthUser> {
     if (user.lockedUntil && new Date(user.lockedUntil).getTime() <= Date.now()) {
-      return this.persistUserAuthState(user, { failedLoginAttempts: 0, lockedUntil: undefined });
+      return this.updateLoginState(user, "clear_expired");
     }
     return user;
   }
 
   private async recordFailedLogin(user: AuthUser): Promise<void> {
-    const failedLoginAttempts = (user.failedLoginAttempts ?? 0) + 1;
-    const lockedUntil = failedLoginAttempts >= this.maxFailedLoginAttempts
-      ? new Date(Date.now() + this.lockoutSeconds * 1000).toISOString()
-      : user.lockedUntil;
-    await this.persistUserAuthState(user, { failedLoginAttempts, lockedUntil });
+    await this.updateLoginState(user, "failed");
   }
 
-  private async persistUserAuthState(user: AuthUser, patch: Partial<Pick<AuthUser, "failedLoginAttempts" | "lockedUntil">>): Promise<AuthUser> {
-    const next = { ...user, ...patch };
-    await this.options.userStore.upsert(next);
-    return next;
+  private async updateLoginState(user: AuthUser, operation: "failed" | "succeeded" | "clear_expired"): Promise<AuthUser> {
+    const updated = await this.options.userStore.updateLoginState({
+      tenantId: user.tenantId,
+      userId: user.id,
+      expectedPasswordHash: user.passwordHash,
+      operation,
+      maxFailedLoginAttempts: this.maxFailedLoginAttempts,
+      lockoutSeconds: this.lockoutSeconds,
+      now: new Date().toISOString()
+    });
+    if (!updated) {
+      throw new FramekitError("INVALID_LOGIN", "Invalid email or password.", 401);
+    }
+    return updated;
+  }
+
+  private async replacePassword(user: AuthUser, password: string, allowDisabled = false): Promise<AuthUser> {
+    const updated = await this.options.userStore.updatePassword({
+      tenantId: user.tenantId, userId: user.id, expectedPasswordHash: user.passwordHash,
+      passwordHash: await hashPassword(password), allowDisabled
+    });
+    if (!updated) throw new FramekitError("INVALID_LOGIN", "Invalid email or password.", 401);
+    return updated;
   }
 
   private async issueLifecycleToken(input: {

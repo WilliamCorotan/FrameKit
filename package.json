@@ -22,7 +22,7 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:services:coverage": "vitest run --config vitest.services.config.ts --coverage",
-    "audit:dependencies": "pnpm audit --audit-level high",
+    "audit:dependencies": "pnpm audit --audit-level low",
     "test:desk:browser": "pnpm --filter @framekit/desk test:browser",
     "test:desk:fullstack": "pnpm --filter @framekit/desk test:browser:fullstack",
     "test:frontends:browser": "playwright test --config examples/frontends/playwright.config.ts",
@@ -41,10 +41,10 @@
     "@playwright/test": "^1.62.0",
     "@types/node": "^24.13.2",
     "@vitejs/plugin-react": "^6.0.4",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^4.1.11",
     "tsx": "^4.23.1",
     "typescript": "^6.0.3",
     "vite": "^8.1.5",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   }
 }

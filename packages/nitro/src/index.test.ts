@@ -453,8 +453,13 @@ describe("createNitroHandler", () => {
     expect(counts).toEqual([1]);
   });
 
-  it("executes browser-facing provider redirects and establishes the callback session cookie", async () => {
+  it.each([
+    { secure: false, sessionCookies: true },
+    { secure: true, sessionCookies: true },
+    { secure: false, sessionCookies: false }
+  ])("binds OIDC callbacks to their initiating browser (%j)", async ({ secure, sessionCookies }) => {
     const runtime = createRuntime(defineApp({ name: "OIDC browser", modules: [] }));
+    let completions = 0;
     const auth = new PasswordAuthService({
       secret: "test-secret-with-enough-length",
       identityLinkingPolicy: { mode: "email", autoLink: true },
@@ -465,22 +470,47 @@ describe("createNitroHandler", () => {
         authenticate: async () => { throw new Error("code flow only"); },
         beginAuthorization: async () => ({ authorizationUrl: "https://issuer.example/authorize?state=browser-state" }),
         completeAuthorization: async ({ code, state }) => {
+          completions += 1;
           expect({ code, state }).toEqual({ code: "browser-code", state: "browser-state" });
-          return { identity: { providerId: "oidc", subject: "admin", tenantId: "default", email: "admin@example.com" }, returnTo: "/desk" };
+          return { identity: { providerId: "oidc", subject: "admin", tenantId: "default", email: "admin@example.com", emailVerified: true }, returnTo: "/desk" };
         }
       }]
     });
     const h3 = new H3();
-    h3.all("/**", createNitroHandler(runtime, { auth, authCookie: { name: "fk_session", secure: false } }));
+    h3.all("/**", createNitroHandler(runtime, { auth, authCookie: sessionCookies ? { name: "fk_session", secure } : false }));
     const fetch = toWebHandler(h3);
 
     const authorize = await fetch(new Request("http://localhost/api/auth/providers/oidc/authorize?returnTo=%2Fdesk", { headers: { "x-tenant-id": "default" } }));
     expect(authorize.status).toBe(302);
     expect(authorize.headers.get("location")).toBe("https://issuer.example/authorize?state=browser-state");
-    const callback = await fetch(new Request("http://localhost/api/auth/providers/oidc/callback?code=browser-code&state=browser-state"));
+    const flowCookie = authorize.headers.get("set-cookie")!;
+    expect(flowCookie).toContain("HttpOnly");
+    expect(flowCookie).toContain("SameSite=Lax");
+    expect(flowCookie).toContain("Max-Age=600");
+    expect(flowCookie).toContain("Path=/");
+    expect(flowCookie).not.toContain("browser-state");
+    if (secure) {
+      expect(flowCookie).toMatch(/^__Host-/);
+      expect(flowCookie).toContain("Secure");
+    }
+    const browserCookie = flowCookie.split(";")[0]!;
+    const callbackUrl = "http://localhost/api/auth/providers/oidc/callback?code=browser-code&state=browser-state";
+    for (const cookie of [undefined, browserCookie.replace(/=.*/, "=another-browser")]) {
+      const rejected = await fetch(new Request(callbackUrl, { headers: cookie ? { cookie } : {} }));
+      expect(rejected.status).toBe(401);
+      expect(await rejected.json()).toMatchObject({ code: "OIDC_BROWSER_STATE_INVALID" });
+      expect(rejected.headers.get("set-cookie")).toBeNull();
+    }
+    const wrongState = await fetch(new Request(callbackUrl.replace("state=browser-state", "state=other-state"), { headers: { cookie: browserCookie } }));
+    expect(wrongState.status).toBe(401);
+    expect(wrongState.headers.get("set-cookie")).toBeNull();
+    expect(completions).toBe(0);
+    const callback = await fetch(new Request(callbackUrl, { headers: { cookie: browserCookie } }));
     expect(callback.status).toBe(303);
     expect(callback.headers.get("location")).toBe("/desk");
-    expect(callback.headers.get("set-cookie")).toContain("fk_session=");
+    expect(completions).toBe(1);
+    expect(callback.headers.get("set-cookie")).toContain("Max-Age=0");
+    if (sessionCookies) expect(callback.headers.get("set-cookie")).toContain("fk_session=");
   });
 
   it("supports cookie-backed signed sessions while preserving bearer auth", async () => {
@@ -604,7 +634,8 @@ describe("createNitroHandler", () => {
           providerId: "test",
           subject: "admin-provider",
           tenantId,
-          email: "admin@example.com"
+          email: "admin@example.com",
+          emailVerified: true
         })
       }]
     });
@@ -1039,7 +1070,7 @@ describe("createNitroHandler", () => {
             if (token !== "provider-token") {
               throw new Error("bad token");
             }
-            return { providerId: "test", subject: "external-admin", tenantId, email: "admin@example.com" };
+            return { providerId: "test", subject: "external-admin", tenantId, email: "admin@example.com", emailVerified: true };
           }
         }
       ]
@@ -1158,6 +1189,8 @@ describe("createNitroHandler", () => {
       headers: workerHeaders,
       body: { currentPassword: "new password", newPassword: "newer password" }
     });
+    await expect(json(fetch, "/api/auth/me", { headers: workerHeaders })).rejects.toMatchObject({ code: "INVALID_SESSION" });
+    await expect(json(fetch, "/api/auth/refresh", { method: "POST", headers: workerHeaders })).rejects.toMatchObject({ code: "INVALID_SESSION" });
     await expect(json(fetch, "/api/auth/login", { method: "POST", body: { email: "worker@example.com", password: "new password" } })).rejects.toMatchObject({ code: "INVALID_LOGIN" });
     await expect(json(fetch, "/api/auth/login", { method: "POST", body: { email: "worker@example.com", password: "newer password" } })).resolves.toMatchObject({ context: { userId: "worker" } });
 
@@ -1167,6 +1200,16 @@ describe("createNitroHandler", () => {
       body: { id: "integration", name: "Integration", roles: ["reader"], permissions: [] }
     });
     expect(apiToken.token).toMatch(/^fkat_/);
+
+    const ownedToken = await json<{ token: string }>(fetch, "/api/auth/tokens", {
+      method: "POST", headers,
+      body: { name: "Worker integration", userId: "worker", roles: ["reader"], permissions: [] }
+    });
+    const ownedTokenHeaders = { authorization: `Bearer ${ownedToken.token}` };
+    await expect(json(fetch, "/api/auth/me", { headers: ownedTokenHeaders })).resolves.toMatchObject({ context: { userId: "worker" } });
+    await json(fetch, "/api/auth/users/worker", { method: "DELETE", headers });
+    await expect(json(fetch, "/api/auth/me", { headers: ownedTokenHeaders })).rejects.toMatchObject({ code: "INVALID_API_TOKEN" });
+    await expect(json(fetch, "/api/auth/me", { headers: { authorization: `Bearer ${apiToken.token}` } })).resolves.toMatchObject({ context: { userId: "api-token:integration" } });
 
     const customField = await json(fetch, "/api/custom-fields", {
       method: "POST",

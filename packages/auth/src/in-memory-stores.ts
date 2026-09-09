@@ -32,6 +32,44 @@ export class InMemoryUserStore implements UserStore {
     return cloneUser(normalized)!;
   }
 
+  async updateLoginState(input: {
+    tenantId: string;
+    userId: string;
+    expectedPasswordHash: string;
+    operation: "failed" | "succeeded" | "clear_expired";
+    maxFailedLoginAttempts: number;
+    lockoutSeconds: number;
+    now: string;
+  }): Promise<AuthUser | undefined> {
+    const user = this.users.find((candidate) => candidate.tenantId === input.tenantId && candidate.id === input.userId);
+    if (!user || user.disabledAt || user.passwordHash !== input.expectedPasswordHash) return undefined;
+    const now = new Date(input.now).getTime();
+    const lockIsActive = user.lockedUntil && new Date(user.lockedUntil).getTime() > now;
+    if (input.operation === "succeeded" && lockIsActive) return undefined;
+    if (input.operation === "failed") {
+      user.failedLoginAttempts = (user.failedLoginAttempts ?? 0) + 1;
+      if (user.failedLoginAttempts >= input.maxFailedLoginAttempts) {
+        const computedLock = new Date(now + input.lockoutSeconds * 1000).toISOString();
+        if (!user.lockedUntil || new Date(user.lockedUntil).getTime() < new Date(computedLock).getTime()) {
+          user.lockedUntil = computedLock;
+        }
+      }
+    } else if (input.operation === "succeeded" || (user.lockedUntil && new Date(user.lockedUntil).getTime() <= now)) {
+      user.failedLoginAttempts = 0;
+      user.lockedUntil = undefined;
+    }
+    return cloneUser(user);
+  }
+
+  async updatePassword(input: { tenantId: string; userId: string; expectedPasswordHash: string; passwordHash: string; allowDisabled?: boolean }): Promise<AuthUser | undefined> {
+    const user = this.users.find((candidate) => candidate.tenantId === input.tenantId && candidate.id === input.userId);
+    if (!user || user.passwordHash !== input.expectedPasswordHash || (!input.allowDisabled && (user.disabledAt || (user.lockedUntil && new Date(user.lockedUntil).getTime() > Date.now())))) return undefined;
+    user.passwordHash = input.passwordHash;
+    user.failedLoginAttempts = 0;
+    user.lockedUntil = undefined;
+    return cloneUser(user);
+  }
+
   async delete(tenantId: string, userId: string): Promise<void> {
     const index = this.users.findIndex((user) => user.tenantId === tenantId && user.id === userId);
     if (index >= 0) {
@@ -214,4 +252,3 @@ export class NoopAuthAuditSink implements AuthAuditSink {
     return undefined;
   }
 }
-

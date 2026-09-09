@@ -72,6 +72,8 @@ export type AuthProviderIdentity = {
   subject: string;
   tenantId?: string;
   email: string;
+  /** Explicit attestation that this identity provider verified the email claim. */
+  emailVerified?: boolean;
   name?: string;
 };
 
@@ -161,6 +163,24 @@ export type UserStore = {
   findByEmail(email: string, tenantId?: string): Promise<AuthUser | undefined>;
   findById(tenantId: string, userId: string): Promise<AuthUser | undefined>;
   upsert(user: AuthUser): Promise<AuthUser>;
+  /** Atomically updates login-only state when the credential still matches. */
+  updateLoginState(input: {
+    tenantId: string;
+    userId: string;
+    expectedPasswordHash: string;
+    operation: "failed" | "succeeded" | "clear_expired";
+    maxFailedLoginAttempts: number;
+    lockoutSeconds: number;
+    now: string;
+  }): Promise<AuthUser | undefined>;
+  /** Atomically replaces a credential without overwriting concurrent account changes. */
+  updatePassword(input: {
+    tenantId: string;
+    userId: string;
+    expectedPasswordHash: string;
+    passwordHash: string;
+    allowDisabled?: boolean;
+  }): Promise<AuthUser | undefined>;
   delete(tenantId: string, userId: string): Promise<void>;
 };
 
@@ -232,6 +252,7 @@ export type CreateApiTokenInput = {
 export type OidcClaims = {
   sub?: unknown;
   email?: unknown;
+  email_verified?: unknown;
   name?: unknown;
   preferred_username?: unknown;
   tenantId?: unknown;

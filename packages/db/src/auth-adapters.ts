@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, lt, lte, ne, or, sql as drizzleSql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, isNull, lt, lte, ne, or, sql as drizzleSql, type SQL } from "drizzle-orm";
 import { boolean, integer, jsonb, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
 import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres, { type Sql } from "postgres";
@@ -123,6 +123,59 @@ export class PostgresUserStore implements UserStore {
       .from(framekitUsers)
       .where(and(eq(framekitUsers.tenantId, tenantId), eq(framekitUsers.id, userId)))
       .limit(1);
+    return rows[0] ? rowToUser(rows[0]) : undefined;
+  }
+
+  async updateLoginState(input: {
+    tenantId: string;
+    userId: string;
+    expectedPasswordHash: string;
+    operation: "failed" | "succeeded" | "clear_expired";
+    maxFailedLoginAttempts: number;
+    lockoutSeconds: number;
+    now: string;
+  }): Promise<AuthUser | undefined> {
+    const now = new Date(input.now);
+    const identity = and(
+      eq(framekitUsers.tenantId, input.tenantId),
+      eq(framekitUsers.id, input.userId),
+      eq(framekitUsers.passwordHash, input.expectedPasswordHash),
+      isNull(framekitUsers.disabledAt)
+    );
+    const activeOrExpiredLock = or(isNull(framekitUsers.lockedUntil), lte(framekitUsers.lockedUntil, now));
+    const set = input.operation === "failed"
+      ? {
+          failedLoginAttempts: drizzleSql`${framekitUsers.failedLoginAttempts} + 1`,
+          lockedUntil: drizzleSql`case when ${framekitUsers.failedLoginAttempts} + 1 >= ${input.maxFailedLoginAttempts} then greatest(coalesce(${framekitUsers.lockedUntil}, '-infinity'::timestamptz), ${now.toISOString()}::timestamptz + (${input.lockoutSeconds} * interval '1 second')) else ${framekitUsers.lockedUntil} end`,
+          updatedAt: now
+        }
+      : input.operation === "succeeded"
+        ? { failedLoginAttempts: 0, lockedUntil: null, updatedAt: now }
+        : {
+            failedLoginAttempts: drizzleSql`case when ${framekitUsers.lockedUntil} <= ${now.toISOString()}::timestamptz then 0 else ${framekitUsers.failedLoginAttempts} end`,
+            lockedUntil: drizzleSql`case when ${framekitUsers.lockedUntil} <= ${now.toISOString()}::timestamptz then null else ${framekitUsers.lockedUntil} end`,
+            updatedAt: now
+          };
+    const rows = await this.db.update(framekitUsers)
+      .set(set)
+      .where(input.operation === "succeeded" ? and(identity, activeOrExpiredLock) : identity)
+      .returning();
+    return rows[0] ? rowToUser(rows[0]) : undefined;
+  }
+
+  async updatePassword(input: { tenantId: string; userId: string; expectedPasswordHash: string; passwordHash: string; allowDisabled?: boolean }): Promise<AuthUser | undefined> {
+    const where = [
+      eq(framekitUsers.tenantId, input.tenantId),
+      eq(framekitUsers.id, input.userId),
+      eq(framekitUsers.passwordHash, input.expectedPasswordHash)
+    ];
+    if (!input.allowDisabled) {
+      where.push(isNull(framekitUsers.disabledAt), or(isNull(framekitUsers.lockedUntil), lte(framekitUsers.lockedUntil, new Date()))!);
+    }
+    const rows = await this.db.update(framekitUsers)
+      .set({ passwordHash: input.passwordHash, failedLoginAttempts: 0, lockedUntil: null, updatedAt: new Date() })
+      .where(and(...where))
+      .returning();
     return rows[0] ? rowToUser(rows[0]) : undefined;
   }
 
