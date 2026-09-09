@@ -1418,7 +1418,8 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
         }
       }
     });
-    const subscriber = new PostgresRealtimePublisher({ connectionString: connectionString! });
+    const subscriberConnection = createPostgresConnection({ connectionString: connectionString!, max: 2 });
+    const subscriber = new PostgresRealtimePublisher({ connectionString: connectionString!, connection: subscriberConnection });
     const channel = "tenant:pg_realtime_tenant:documents";
     await publisher.migrate();
     await sql`delete from framekit_realtime_events where channel = ${channel}`;
@@ -1443,11 +1444,18 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       releaseInsert.resolve();
       await Promise.all([held, follower]);
       await waitFor(() => received.length === 4);
-      await Promise.all(Array.from({ length: 50 }, (_, index) => publisher.publish({
-        channel,
-        type: "customer.updated",
-        payload: { id: `burst-${index}` }
-      })));
+      // Force one delivery batch across a decimal boundary (for example, 99 -> 100).
+      const sequence = await sql<{ cursor: string }[]>`select nextval(pg_get_serial_sequence('framekit_realtime_events', 'cursor'))::text as cursor`;
+      const boundary = 10n ** BigInt((BigInt(sequence[0]!.cursor) + 50n).toString().length);
+      await sql`select setval(pg_get_serial_sequence('framekit_realtime_events', 'cursor'), ${(boundary - 25n).toString()}::bigint, false)`;
+      const heldQuery = await subscriberConnection.sql.reserve();
+      try {
+        await Promise.all(Array.from({ length: 50 }, (_, index) => publisher.publish({
+          channel,
+          type: "customer.updated",
+          payload: { id: `burst-${index}` }
+        })));
+      } finally { heldQuery.release(); }
       await waitFor(() => received.length === 54);
       const cursors = received.map((event) => BigInt(event.cursor!));
       expect(cursors).toHaveLength(54);
@@ -1459,6 +1467,7 @@ describe.skipIf(!connectionString)("Postgres durable stores", () => {
       unsubscribe();
       await sql`delete from framekit_realtime_events where channel = ${channel}`;
       await Promise.all([publisher.close(), subscriber.close()]);
+      await subscriberConnection.close();
     }
   }, 10_000);
 });

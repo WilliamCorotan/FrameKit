@@ -22,8 +22,12 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: `pnpm --filter @framekit/example-crm exec nitro dev --host 127.0.0.1 --port ${apiPort}`,
+      command: "pnpm --filter @framekit/example-crm... build && pnpm --filter @framekit/example-crm exec node test/serve-built-server.mjs",
       env: {
+        NODE_ENV: "test",
+        FRAMEKIT_TEST_MEMORY_STORAGE: "true",
+        HOST: "127.0.0.1",
+        PORT: String(apiPort),
         FRAMEKIT_ALLOWED_ORIGINS: [
           ...templates.map(([, , port]) => `http://127.0.0.1:${port}`),
           `http://127.0.0.1:${crossOriginPort}`
