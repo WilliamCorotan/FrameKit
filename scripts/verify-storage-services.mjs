@@ -1,5 +1,9 @@
+import { loadLocalEnvironment, requireDatabaseUrl } from "./environment.mjs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+loadLocalEnvironment();
+requireDatabaseUrl();
 
 for (const name of ["DATABASE_URL", "FRAMEKIT_TEST_S3_ENDPOINT"]) {
   if (!process.env[name]) throw new Error(`${name} is required for storage integration verification.`);

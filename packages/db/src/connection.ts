@@ -18,6 +18,7 @@ export function createPostgresConnection(input: { connectionString: string; max:
   if (input.totalBudget !== undefined && (!Number.isInteger(input.totalBudget) || input.totalBudget < total)) {
     throw new Error("Postgres connection budget is smaller than the requested query and listener connections.");
   }
+  assertPostgresUrl(input.connectionString);
   let sql: Sql;
   let drizzleSql: Sql;
   try {
@@ -42,7 +43,9 @@ export function createPostgresConnection(input: { connectionString: string; max:
 }
 
 export function postgresForOptions(options: PostgresRepositoryOptions): Sql {
-  return options.connection?.sql ?? postgres(options.connectionString, { max: options.max ?? 5 });
+  if (options.connection) return options.connection.sql;
+  assertPostgresUrl(options.connectionString);
+  return postgres(options.connectionString, { max: options.max ?? 5 });
 }
 
 export async function closeAdapterSql(sql: Sql, timeout = 5): Promise<void> {
@@ -56,4 +59,20 @@ export async function runBootstrapMigrations(sql: Sql, ...statements: string[]):
     await tx`select pg_advisory_xact_lock(1718774644, 1)`;
     for (const statement of statements) await tx.unsafe(statement);
   });
+}
+
+/** Require an explicit host and database instead of allowing an absent URL to select driver defaults. */
+export function assertPostgresUrl(value: string): void {
+  try {
+    if (typeof value !== "string" || !value.trim()) throw new Error();
+    const parts = value.match(/^(postgres(?:ql)?:\/\/)([^/?#]+)(\/[^?#]+)(?:[?#].*)?$/);
+    if (!parts) throw new Error();
+    const authority = parts[2]!;
+    const credentialsEnd = authority.lastIndexOf("@") + 1;
+    const credentials = authority.slice(0, credentialsEnd);
+    for (const host of authority.slice(credentialsEnd).split(",")) {
+      const url = new URL(parts[1] + credentials + host + parts[3]);
+      if (!host || !url.hostname || url.pathname.length <= 1) throw new Error();
+    }
+  } catch { throw new Error("An explicit PostgreSQL connection URL with a host and database name is required."); }
 }

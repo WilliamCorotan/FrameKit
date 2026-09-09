@@ -138,6 +138,7 @@ const app = defineApp({
 });
 
 describe.skipIf(!connectionString)("Postgres durable stores", () => {
+  if (!connectionString) return;
   const sql = postgres(connectionString!, { max: 1 });
   let injectedStage: PostgresMutationStage | undefined;
   const stores = {

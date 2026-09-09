@@ -1,3 +1,4 @@
+import { configuredDatabaseUrl } from "./database.js";
 import { InMemoryMfaStore, InMemoryApiTokenStore, InMemoryOidcAuthorizationStateStore, InMemoryRoleStore, InMemoryUserStore } from "@framekit/auth";
 import {
   type PostgresConnection,
@@ -24,13 +25,13 @@ import { InMemoryEventBus } from "@framekit/realtime";
 import { createBootstrapAdmin } from "./bootstrap.js";
 
 export function storageMode(): "memory" | "postgres" {
-  return process.env.DATABASE_URL ? "postgres" : "memory";
+  return configuredDatabaseUrl() ? "postgres" : "memory";
 }
 
 type StoreOptions = { connection?: PostgresConnection; register?: (resource: { close(): Promise<void> }) => void };
 
 export async function createRuntimePersistence(options: StoreOptions = {}) {
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = configuredDatabaseUrl();
   if (!databaseUrl) return {};
   const repository = new PostgresDocumentRepository({ connectionString: databaseUrl, connection: options.connection });
   const audit = new PostgresAuditStore({ connectionString: databaseUrl, connection: options.connection });
@@ -53,7 +54,7 @@ export async function createRuntimePersistence(options: StoreOptions = {}) {
 }
 
 export async function createRealtimePublisher(options: StoreOptions = {}) {
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = configuredDatabaseUrl();
   if (!databaseUrl) return new InMemoryEventBus();
   const realtime = new PostgresRealtimePublisher({ connectionString: databaseUrl, connection: options.connection });
   options.register?.(realtime);
@@ -62,7 +63,7 @@ export async function createRealtimePublisher(options: StoreOptions = {}) {
 }
 
 export async function createAuthStores(email: string, password: string, options: StoreOptions = {}) {
-  const databaseUrl = process.env.DATABASE_URL;
+  const databaseUrl = configuredDatabaseUrl();
   const administrator = { id: "administrator", tenantId: "default", name: "Administrator", permissions: ["*"] };
   const admin = await createBootstrapAdmin(email, password);
   if (!databaseUrl) {

@@ -1,9 +1,13 @@
+import { loadLocalEnvironment, requireDatabaseUrl } from "./environment.mjs";
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { defineApp, defineDocType, defineModule } from "../packages/core/dist/index.js";
 import { createRuntime } from "../packages/runtime/dist/index.js";
 import { createPostgresConnection, PostgresDocumentRepository, PostgresAuditStore, PostgresOutboxStore, PostgresMutationUnitOfWork } from "../packages/db/dist/index.js";
+
+loadLocalEnvironment();
+requireDatabaseUrl();
 
 if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL must point to a disposable verification database.");
 const durationSeconds = positiveInteger("FRAMEKIT_SOAK_SECONDS", 30, 86400);

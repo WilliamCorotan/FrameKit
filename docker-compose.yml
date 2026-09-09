@@ -14,7 +14,7 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
-      DATABASE_URL: ${FRAMEKIT_POSTGRES_URL:-postgresql://framekit:framekit@postgres:5432/framekit}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
       REDIS_URL: redis://redis:6379
       FRAMEKIT_ALLOWED_ORIGINS: ${FRAMEKIT_ALLOWED_ORIGINS:?set FRAMEKIT_ALLOWED_ORIGINS}
       FRAMEKIT_TRUST_PROXY: ${FRAMEKIT_TRUST_PROXY:-false}
@@ -34,7 +34,7 @@ services:
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: framekit
-      POSTGRES_PASSWORD: ${FRAMEKIT_POSTGRES_PASSWORD:-framekit}
+      POSTGRES_PASSWORD: ${FRAMEKIT_POSTGRES_PASSWORD:?set FRAMEKIT_POSTGRES_PASSWORD in .env}
       POSTGRES_DB: framekit
     ports:
       - "127.0.0.1:5432:5432"

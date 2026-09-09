@@ -51,7 +51,7 @@ import { framekitAuditEvents, framekitCustomFields, framekitMigrations, framekit
 import type { PostgresMigrationStoreOptions, PostgresRealtimePublisherOptions, PostgresRepositoryOptions } from "./types.js";
 import { createAuditTableSql, createCustomFieldTableSql, createMigrationTableSql, createMutationTablesSql, createNamingSeriesTableSql, createOutboxTableSql, createPostgresMigrationStatements, createRealtimeTableSql, createSettingValueTableSql, createViewTableSql, executableStatements, validateExecutableMigration } from "./ddl.js";
 import { indexIdentifier, sqlLiteral } from "./migration-sql-helpers.js";
-import { closeAdapterSql, postgresForOptions, runBootstrapMigrations } from "./connection.js";
+import { assertPostgresUrl, closeAdapterSql, postgresForOptions, runBootstrapMigrations } from "./connection.js";
 
 export class PostgresAuditStore implements AuditStore {
   private readonly sql: Sql;
@@ -276,6 +276,7 @@ export class PostgresRealtimePublisher implements RealtimePublisher {
 
   constructor(options: PostgresRealtimePublisherOptions) {
     this.sql = postgresForOptions(options);
+    assertPostgresUrl(options.connectionString);
     this.listenerSql = postgres(options.connectionString, { max: 1 });
     this.faultInjector = options.faultInjector;
   }

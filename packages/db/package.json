@@ -18,7 +18,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run --root ../.. packages/db/src/index.test.ts",
-    "test:integration": "vitest run --root ../.. packages/db/src/index.integration.test.ts packages/db/src/schema-inspection.integration.test.ts packages/db/src/mfa-store.integration.test.ts packages/db/src/saga-store.integration.test.ts packages/db/src/auth-retention.integration.test.ts packages/db/src/bootstrap.integration.test.ts",
+    "test:integration": "node ../../scripts/with-env.mjs --database pnpm exec vitest run --root ../.. packages/db/src/index.integration.test.ts packages/db/src/schema-inspection.integration.test.ts packages/db/src/mfa-store.integration.test.ts packages/db/src/saga-store.integration.test.ts packages/db/src/auth-retention.integration.test.ts packages/db/src/bootstrap.integration.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepack": "pnpm build"
   },

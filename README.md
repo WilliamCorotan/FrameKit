@@ -285,9 +285,9 @@ The intended production target is a Nitro Node server with private or managed Po
 docker compose up --build
 ```
 
-`docker-compose.yml` is a local/reference stack, not a production deployment template. Its Postgres and Redis ports bind only to `127.0.0.1`. It defaults to the local `framekit` password. To override it, set both `FRAMEKIT_POSTGRES_PASSWORD` (the raw password used by Postgres) and `FRAMEKIT_POSTGRES_URL` (the CRM connection URL with its password percent-encoded); for example, `p@:/#ss` becomes `p%40%3A%2F%23ss` in the URL. For production, provision unique credentials through the platform secret manager and point `DATABASE_URL` and `REDIS_URL` at private or managed services rather than exposing the bundled stores.
+`docker-compose.yml` is a local/reference stack, not a production deployment template. Its Postgres and Redis ports bind only to `127.0.0.1`. Set `DATABASE_URL` and `FRAMEKIT_POSTGRES_PASSWORD` explicitly in `.env`; neither has a default. The URL must use the appropriate host (`postgres` inside Compose, your configured host for host-side commands) and a percent-encoded password. Production credentials belong in the platform secret manager. See [database configuration](docs/deployment.md#database-configuration).
 
-When `DATABASE_URL` is set, the CRM example uses Postgres for:
+CRM requires `DATABASE_URL` and uses Postgres for:
 
 - Documents
 - Users
@@ -315,7 +315,7 @@ cp .env.example .env
 Important variables:
 
 ```txt
-DATABASE_URL=postgresql://framekit:framekit@localhost:5432/framekit
+DATABASE_URL=
 REDIS_URL=redis://localhost:6379
 FRAMEKIT_AUTH_SECRET=<provision-at-least-32-random-characters>
 FRAMEKIT_ALLOWED_ORIGINS=https://desk.example.com

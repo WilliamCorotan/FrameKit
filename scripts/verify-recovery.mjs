@@ -1,3 +1,4 @@
+import { loadLocalEnvironment, requireDatabaseUrl } from "./environment.mjs";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -7,6 +8,9 @@ import { createRequire } from "node:module";
 import { createPostgresConnection, PostgresDocumentRepository, PostgresCustomizationStore } from "../packages/db/dist/index.js";
 import { createAesGcmSettingsSecrets, S3AttachmentStorage } from "../packages/storage/dist/index.js";
 import { defineDocType } from "../packages/core/dist/index.js";
+
+loadLocalEnvironment();
+requireDatabaseUrl();
 
 if (!process.env.DATABASE_URL || !process.env.FRAMEKIT_TEST_S3_ENDPOINT) throw new Error("Recovery verification requires a disposable admin DATABASE_URL and FRAMEKIT_TEST_S3_ENDPOINT.");
 const require = createRequire(new URL("../packages/storage/package.json", import.meta.url));

@@ -1,9 +1,9 @@
+import { configuredDatabaseUrl } from "./database.js";
 import { createAesGcmSettingsSecrets, decodeSecretKey } from "@framekit/storage";
 
 export function productionConfiguration(env: NodeJS.ProcessEnv) {
   const production = env.NODE_ENV === "production";
-  const databaseUrl = env.DATABASE_URL;
-  if (production && !databaseUrl) throw new Error("Production requires DATABASE_URL; in-memory persistence is for development and tests.");
+  const databaseUrl = configuredDatabaseUrl(env);
   const poolMax = integer(env.FRAMEKIT_DB_POOL_MAX, 10, "FRAMEKIT_DB_POOL_MAX");
   if (poolMax < 2) throw new Error("FRAMEKIT_DB_POOL_MAX must be at least two for raw and ORM codec profiles.");
   const connectionBudget = integer(env.FRAMEKIT_DB_CONNECTION_BUDGET, poolMax + 1, "FRAMEKIT_DB_CONNECTION_BUDGET");

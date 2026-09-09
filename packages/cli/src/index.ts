@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { realpathSync } from "node:fs";
+import { loadEnvFile } from "node:process";
+import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { runCli } from "./dispatch.js";
 
@@ -7,6 +8,7 @@ export { runCli } from "./dispatch.js";
 export { isValidSemVer } from "./paths.js";
 
 if (isMainModule()) {
+  if (!process.env.CI && existsSync(".env")) loadEnvFile(".env");
   runCli().catch((error: unknown) => { console.error(error instanceof Error ? error.message : error); process.exitCode = 1; });
 }
 function isMainModule(): boolean {
