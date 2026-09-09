@@ -20,7 +20,7 @@
     "test": "vitest run --root ../.. packages/nitro/src/index.test.ts packages/nitro/src/mfa.test.ts packages/nitro/src/oidc-mfa.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "prepack": "pnpm build",
-    "test:browser": "playwright test --config playwright.config.ts"
+    "test:browser": "pnpm --filter @framekit/nitro... build && playwright test --config playwright.config.ts"
   },
   "dependencies": {
     "@framekit/auth": "workspace:*",
