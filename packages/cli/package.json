@@ -30,7 +30,7 @@
     "@framekit/db": "workspace:*",
     "@framekit/runtime": "workspace:*",
     "@framekit/sdk": "workspace:*",
-    "tsx": "^4.23.1"
+    "tsx": "^4.23.13"
   },
   "description": "Framekit project and code generation CLI.",
   "files": [

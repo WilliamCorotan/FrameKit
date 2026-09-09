@@ -13,11 +13,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@vitejs/plugin-react": "^6.0.4",
-    "lucide-react": "^1.27.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "lucide-react": "^1.41.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "vite": "^8.1.5"
+    "vite": "^8.2.2"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.12.1",
